@@ -1,3 +1,56 @@
+# vserve 0.5.9 Release Notes
+
+`v0.5.9` is a hotfix for a context-sizing bug discovered after 0.5.8 shipped.
+
+## Fixed: llama.cpp per-slot context was divided by `--parallel`
+
+`llama-server`'s `-c / --ctx-size` is the *total* KV-cache size across all
+slots — per-slot window = `ctx_size / parallel`. vserve 0.5.8 wrote the
+user-facing per-slot context into `ctx_size` directly, so a request like
+`--context 32768 --slots 4` ended up serving with `n_ctx_seq = 8192`
+(32768 ÷ 4) per request. With 8 slots, a 24 k context shrank to 3 k.
+
+`build_config()` now multiplies the per-slot context by `parallel` when
+writing the JSON launch config:
+
+```python
+ctx_size      = per_slot_context * parallel     # llama-server -c value
+ctx_per_slot  = per_slot_context                # informational, what user asked for
+```
+
+`vserve status` and the `Starting with …` line now prefer `ctx_per_slot`
+so the displayed value matches the tune output and the user's intent.
+
+**Verified live on `gemma-4-26B-A4B-it-GGUF`** (4 slots, requested
+context 32 k):
+
+```
+exec llama-server … -c 131072 -np 4 -ctk q8_0 -ctv q8_0 -fa on -ot '.ffn_.*_exps.=CPU' --no-mmap
+journal:  slot load_model: id 0 | task -1 | new slot, n_ctx = 32768
+journal:  slot load_model: id 1 | task -1 | new slot, n_ctx = 32768
+journal:  slot load_model: id 2 | task -1 | new slot, n_ctx = 32768
+journal:  slot load_model: id 3 | task -1 | new slot, n_ctx = 32768
+```
+
+Each slot now has the full 32 k window the user asked for.
+
+## Tests
+
+- 3 new tests: `test_build_config_ctx_size_is_per_slot_times_parallel`,
+  `test_build_config_single_slot_ctx_size_equals_context`, and updated
+  `test_start_emits_ctk_ctv_b_ub_and_ot` to assert `-c 32768` (8192 × 4) +
+  `-np 4` end up in the launch script. The basic-config test also
+  updated to reflect the new dual `ctx_size` / `ctx_per_slot` shape.
+- 579 → **581 passed**; ruff + mypy clean.
+
+## Migration
+
+Profiles saved by 0.5.8 carry the wrong `ctx_size` (per-slot, not total).
+Re-run `vserve run … --save-profile <name>` to regenerate; or hand-edit
+the JSON to set `ctx_size = ctx_per_slot * parallel`.
+
+---
+
 # vserve 0.5.8 Release Notes
 
 `v0.5.8` is the first release on top of `v0.5.7`. It widens the supported

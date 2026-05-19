@@ -100,7 +100,10 @@ class TestLlamaCppBuildConfig:
             "tools": False,
         }
         cfg = b.build_config(m, choices)
-        assert cfg["ctx_size"] == 8192
+        # ctx_size is the llama-server -c value (total ctx across slots).
+        # Per-slot context (what the user asked for) lives in ctx_per_slot.
+        assert cfg["ctx_size"] == 8192 * 4
+        assert cfg["ctx_per_slot"] == 8192
         assert cfg["n_gpu_layers"] == 35
         assert cfg["parallel"] == 4
         assert cfg["flash_attn"] is True
@@ -1111,6 +1114,36 @@ class TestLlamaCppEmbedding:
         assert cfg["cache_type_k"] == "q8_0"
         assert cfg["cache_type_v"] == "q8_0"
 
+    def test_build_config_ctx_size_is_per_slot_times_parallel(self, fake_gguf_model_dir):
+        """Per-slot context × parallel = ctx_size (the -c value llama-server expects).
+
+        llama-server's -c is total KV-cache size across slots; per-slot
+        window = -c / -np. vserve's user-facing 'context' is per-slot, so
+        build_config has to multiply before writing the launch JSON.
+        """
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 32768, "n_gpu_layers": 30, "parallel": 4,
+            "port": 8888, "tools": False,
+        })
+        assert cfg["ctx_size"] == 32768 * 4  # 131072 — what llama-server's -c sees
+        assert cfg["ctx_per_slot"] == 32768  # what the user asked for
+        assert cfg["parallel"] == 4
+
+    def test_build_config_single_slot_ctx_size_equals_context(self, fake_gguf_model_dir):
+        """With parallel=1, ctx_size == per-slot context."""
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 8192, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        assert cfg["ctx_size"] == 8192
+        assert cfg["ctx_per_slot"] == 8192
+
     def test_build_config_emits_batch_and_ubatch(self, fake_gguf_model_dir):
         b = LlamaCppBackend()
         from vserve.models import detect_model
@@ -1167,6 +1200,10 @@ class TestLlamaCppEmbedding:
         # L7: --no-mmap is auto-added whenever -ot is set so the new llama.cpp
         # binary doesn't emit its "mmap + tensor override" perf warning.
         assert "--no-mmap" in script
+        # Context fix: per-slot 8192 × 4 slots = 32768 in the -c arg, so each
+        # slot ends up with the 8192 window the caller actually asked for.
+        assert "-c 32768" in script
+        assert "-np 4" in script
         assert run.called
 
     def test_start_omits_no_mmap_when_no_override_tensors(self, fake_gguf_model_dir, tmp_path, mocker):

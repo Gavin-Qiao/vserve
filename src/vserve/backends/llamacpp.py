@@ -947,6 +947,15 @@ class LlamaCppBackend:
             override_tensors         — list of patterns for -ot, e.g.
                                        [".ffn_.*_exps.=CPU"] for MoE expert
                                        CPU offloading.
+
+        Note on context semantics: `choices["context"]` is the per-slot
+        sequence length the user actually wants (matching the column header
+        in the tune output). llama-server's `-c / --ctx-size` is the *total*
+        KV-cache size across all slots — per-slot context = ctx_size /
+        parallel. We multiply here so each slot ends up with the requested
+        window and the analytic KV-byte math stays consistent (the same math
+        treats `context` as per-slot and multiplies by `parallel` for total
+        cost).
         """
         from vserve.config import cfg as vserve_cfg
 
@@ -955,13 +964,19 @@ class LlamaCppBackend:
             raise ValueError(f"No GGUF files in {model.path}")
         model_file = str(selected[0])
 
+        parallel = int(choices.get("parallel", 1) or 1)
+        per_slot_context = int(choices["context"])
         cfg: dict = {
             "model": model_file,
             "host": "0.0.0.0",
             "port": choices.get("port", 8888),
-            "ctx_size": choices["context"],
+            # ctx_size is the llama-server -c value: total context across slots.
+            "ctx_size": per_slot_context * parallel,
+            # Informational record of the per-slot window that vserve picked,
+            # so a human reading the JSON can see what they asked for.
+            "ctx_per_slot": per_slot_context,
             "n_gpu_layers": choices["n_gpu_layers"],
-            "parallel": choices.get("parallel", 1),
+            "parallel": parallel,
             "flash_attn": True,
             "gpu_index": int(getattr(vserve_cfg(), "gpu_index", 0) or 0),
         }

@@ -2448,7 +2448,15 @@ def _launch_backend(
                 console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
                 raise typer.Exit(1)
 
-        ctx = cfg.get("max-model-len") or cfg.get("ctx_size") or cfg.get("ctx-size", "?")
+        # llama.cpp profiles record both ctx_size (the -c value = total context
+        # across all slots) and ctx_per_slot (per-slot window the user asked
+        # for). Display the per-slot number so the line matches the tune output.
+        ctx = (
+            cfg.get("max-model-len")
+            or cfg.get("ctx_per_slot")
+            or cfg.get("ctx_size")
+            or cfg.get("ctx-size", "?")
+        )
         ctx_d = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
         launch_port = cfg.get("port", 8888)
         console.print(f"\n[bold]Starting[/bold] with [cyan]{label}[/cyan] ({backend.display_name})")
@@ -4313,15 +4321,25 @@ def status(
     console.print("  [bold]Serving config[/bold]")
 
     if running_backend.name == "llamacpp":
-        ctx = cfg.get("ctx_size", "?")
+        # Prefer ctx_per_slot (vserve 0.5.9+) so the displayed value matches
+        # the per-slot window the user picked. ctx_size is the llama-server
+        # `-c` value, which is total ctx across all slots.
+        ctx = cfg.get("ctx_per_slot") or cfg.get("ctx_size", "?")
         ctx_display = f"{ctx // 1024}k" if isinstance(ctx, int) else ctx
-        console.print(f"    Context window:    {ctx_display}")
+        console.print(f"    Context window:    {ctx_display}  (per-slot)")
         console.print(f"    Concurrent slots:  {cfg.get('parallel', '?')}  (max in-flight requests)")
         ngl = cfg.get("n_gpu_layers")
         if ngl is not None:
             console.print(f"    GPU layers:        {ngl}")
         if cfg.get("flash_attn"):
             console.print("    Flash attention:   on")
+        ctk = cfg.get("cache_type_k")
+        ctv = cfg.get("cache_type_v")
+        if ctk or ctv:
+            console.print(f"    KV cache dtype:    K={ctk or 'f16'} V={ctv or 'f16'}")
+        if cfg.get("override_tensors"):
+            ot = ", ".join(cfg["override_tensors"])
+            console.print(f"    Override tensors:  {ot}")
         if cfg.get("embedding"):
             pooling = cfg.get("pooling", "mean")
             console.print(f"    Mode:              embedding (pooling: {pooling})")
