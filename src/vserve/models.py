@@ -42,6 +42,27 @@ class ModelInfo:
             or "rerank" in name
         )
 
+    @property
+    def is_unsloth_ud(self) -> bool:
+        """True when this is an Unsloth Dynamic 2.0 (UD-) quantized GGUF.
+
+        Unsloth's UD- quants (Q4_K_XL, Q5_K_XL, IQ4_XS variants in the
+        unsloth/* repos) are imatrix-calibrated against calibration_v5,
+        documented at ~99.9% KL divergence vs FP16. Detection is filename-
+        based — the UD- prefix marks the calibrated build.
+        """
+        if not self.is_gguf or self.provider.lower() != "unsloth":
+            return False
+        # Match any GGUF file in the model dir whose name contains a
+        # `UD-` prefix on the quant tag (e.g. `model-UD-Q4_K_XL.gguf`).
+        try:
+            for path in self.path.iterdir():
+                if path.suffix.lower() == ".gguf" and "-UD-" in path.name:
+                    return True
+        except OSError:
+            return False
+        return False
+
 
 QUANT_FLAGS = {
     "gptq": "--quantization gptq_marlin",

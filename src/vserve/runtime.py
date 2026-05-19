@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -14,11 +15,15 @@ from packaging.version import InvalidVersion, Version
 
 from vserve.model_files import is_weight_file_name, iter_recursive_files_with_suffix
 
-SUPPORTED_VLLM_RANGE = ">=0.20,<0.21"
-PINNED_STABLE_VLLM = "0.20.0"
+SUPPORTED_VLLM_RANGE = ">=0.20,<0.22"
+PINNED_STABLE_VLLM = "0.21.0"
 DETECTOR_SCHEMA_VERSION = 2
 _VLLM_MIN = Version("0.20")
-_VLLM_MAX = Version("0.21")
+_VLLM_MAX = Version("0.22")
+
+RUNTIME_CACHE_DIR = Path.home() / ".cache" / "vserve" / "runtime"
+VLLM_RUNTIME_CACHE_FILE = RUNTIME_CACHE_DIR / "vllm.json"
+_RUNTIME_CACHE_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -91,8 +96,121 @@ def _parse_version_text(text: str) -> str | None:
     return match.group(1) if match else None
 
 
-def collect_vllm_runtime_info(config: Any | None = None) -> RuntimeInfo:
-    """Collect vLLM, Python package, and dependency-health facts from /opt/vllm."""
+def _vllm_runtime_cache_key(vllm_bin: Path, vllm_python: Path) -> str | None:
+    """Cache key derived from venv contents — any pip install changes it.
+
+    Uses the unresolved vllm_python path because resolving the symlink chain
+    (vllm_python → python3 → /usr/bin/python3.12) lands outside the venv. The
+    venv layout we care about is always `<venv>/bin/python` paired with
+    `<venv>/lib/pythonX.Y/site-packages`.
+    """
+    paths: list[Path] = [vllm_bin, vllm_python]
+    try:
+        venv_lib = vllm_python.parent.parent / "lib"
+        if venv_lib.exists():
+            for child in venv_lib.iterdir():
+                sp = child / "site-packages"
+                if sp.exists():
+                    paths.append(sp)
+                    break
+    except OSError:
+        pass
+    parts: list[str] = []
+    for path in paths:
+        try:
+            parts.append(f"{path}:{path.stat().st_mtime_ns}")
+        except OSError:
+            return None
+    return "|".join(parts)
+
+
+def _read_vllm_runtime_cache(cache_path: Path, *, expected_key: str) -> RuntimeInfo | None:
+    """Return a cached RuntimeInfo if the cache file matches expected_key."""
+    try:
+        text = cache_path.read_text()
+    except OSError:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("schema_version") != _RUNTIME_CACHE_SCHEMA_VERSION:
+        return None
+    if data.get("cache_key") != expected_key:
+        return None
+    executable = data.get("executable")
+    python = data.get("python")
+    errors_raw = data.get("errors") or []
+    errors = tuple(str(e) for e in errors_raw) if isinstance(errors_raw, (list, tuple)) else ()
+    return RuntimeInfo(
+        backend="vllm",
+        executable=Path(executable) if isinstance(executable, str) else None,
+        python=Path(python) if isinstance(python, str) else None,
+        vllm_version=data.get("vllm_version"),
+        torch_version=data.get("torch_version"),
+        torch_cuda=data.get("torch_cuda"),
+        transformers_version=data.get("transformers_version"),
+        huggingface_hub_version=data.get("huggingface_hub_version"),
+        # pip_check intentionally not cached — fresh probe is required when needed
+        pip_check_ok=None,
+        pip_check_output="",
+        errors=errors,
+    )
+
+
+def _write_vllm_runtime_cache(cache_path: Path, *, cache_key: str, info: RuntimeInfo) -> None:
+    """Best-effort write of the runtime cache. Never raises."""
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    payload = {
+        "schema_version": _RUNTIME_CACHE_SCHEMA_VERSION,
+        "cache_key": cache_key,
+        "executable": str(info.executable) if info.executable else None,
+        "python": str(info.python) if info.python else None,
+        "vllm_version": info.vllm_version,
+        "torch_version": info.torch_version,
+        "torch_cuda": info.torch_cuda,
+        "transformers_version": info.transformers_version,
+        "huggingface_hub_version": info.huggingface_hub_version,
+        "errors": list(info.errors),
+    }
+    try:
+        tmp = cache_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        os.replace(tmp, cache_path)
+    except OSError:
+        pass
+
+
+def invalidate_vllm_runtime_cache(cache_path: Path | None = None) -> None:
+    """Remove the cached vLLM runtime info. Safe if the file is missing."""
+    path = cache_path or VLLM_RUNTIME_CACHE_FILE
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def collect_vllm_runtime_info(
+    config: Any | None = None,
+    *,
+    prefer_cache: bool = False,
+    with_pip_check: bool = True,
+    cache_path: Path | None = None,
+) -> RuntimeInfo:
+    """Collect vLLM, Python package, and (optionally) dependency-health facts.
+
+    On the hot path (`vserve run`), pass `prefer_cache=True, with_pip_check=False`
+    — this serves a cached RuntimeInfo when the venv mtimes haven't changed and
+    skips the slow `pip check` step entirely. `vserve runtime check vllm` and
+    `vserve doctor` always run the full probe with `pip check`.
+    """
     if config is None:
         from vserve.config import cfg
 
@@ -100,6 +218,15 @@ def collect_vllm_runtime_info(config: Any | None = None) -> RuntimeInfo:
 
     vllm_bin = Path(config.vllm_bin)
     vllm_python = Path(config.vllm_python)
+    cache_file = cache_path or VLLM_RUNTIME_CACHE_FILE
+
+    if prefer_cache:
+        cache_key = _vllm_runtime_cache_key(vllm_bin, vllm_python)
+        if cache_key is not None:
+            cached = _read_vllm_runtime_cache(cache_file, expected_key=cache_key)
+            if cached is not None:
+                return cached
+
     errors: list[str] = []
     cli_version: str | None = None
     metadata: dict[str, Any] = {}
@@ -136,20 +263,21 @@ def collect_vllm_runtime_info(config: Any | None = None) -> RuntimeInfo:
     except Exception as exc:
         errors.append(f"{vllm_python} metadata probe failed: {exc}")
 
-    try:
-        result = subprocess.run(
-            [str(vllm_python), "-m", "pip", "check"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        pip_check_ok = result.returncode == 0
-        pip_check_output = result.stdout.strip() or result.stderr.strip()
-    except Exception as exc:
-        pip_check_ok = False
-        pip_check_output = str(exc)
+    if with_pip_check:
+        try:
+            result = subprocess.run(
+                [str(vllm_python), "-m", "pip", "check"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            pip_check_ok = result.returncode == 0
+            pip_check_output = result.stdout.strip() or result.stderr.strip()
+        except Exception as exc:
+            pip_check_ok = False
+            pip_check_output = str(exc)
 
-    return RuntimeInfo(
+    info = RuntimeInfo(
         backend="vllm",
         executable=vllm_bin,
         python=vllm_python,
@@ -162,6 +290,15 @@ def collect_vllm_runtime_info(config: Any | None = None) -> RuntimeInfo:
         pip_check_output=pip_check_output,
         errors=tuple(errors),
     )
+
+    # Refresh cache when we just probed live, even on the with_pip_check path —
+    # the cached fields (versions, executable) don't include pip_check state.
+    if not info.errors and info.vllm_version:
+        cache_key = _vllm_runtime_cache_key(vllm_bin, vllm_python)
+        if cache_key is not None:
+            _write_vllm_runtime_cache(cache_file, cache_key=cache_key, info=info)
+
+    return info
 
 
 def check_vllm_compatibility(info: RuntimeInfo) -> CompatibilityCheck:
@@ -232,6 +369,7 @@ def upgrade_vllm_stable(config: Any | None = None, *, timeout: int = 1800) -> su
     if result.returncode != 0:
         details = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(details or f"pip install vllm=={PINNED_STABLE_VLLM} failed")
+    invalidate_vllm_runtime_cache()
     return result
 
 

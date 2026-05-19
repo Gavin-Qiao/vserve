@@ -458,7 +458,9 @@ class TestLlamaCppTune:
 
         result = LlamaCppBackend().tune(m, gpu, gpu_mem_util=0.96)
 
-        assert result["limits"]["262144"] == 1
+        # 2D matrix (since 0.5.8): assert the f16 column matches the historical
+        # single-int answer. q8_0/q4_0/q4_1 columns are bonus capacity.
+        assert result["limits"]["262144"]["f16"] == 1
 
     def test_tune_gemma4_caps_swa_cache_by_sliding_window(self, tmp_path, mocker):
         mocker.patch.dict("sys.modules", {"gguf": None})
@@ -493,7 +495,7 @@ class TestLlamaCppTune:
 
         result = LlamaCppBackend().tune(m, gpu, gpu_mem_util=0.96)
 
-        assert result["limits"]["262144"] == 6
+        assert result["limits"]["262144"]["f16"] == 6
 
     def test_llamacpp_memory_counts_recurrent_state_bytes(self):
         metadata = {
@@ -513,6 +515,72 @@ class TestLlamaCppTune:
         attention_bytes = 2 * (2 * (8 + 8) * 2 * 128 * 3)
         recurrent_per_layer = ((4 - 1) * (16 + 2 * 2 * 8) + 8 * 16) * 4 * 3
         assert total == attention_bytes + 2 * recurrent_per_layer
+
+    def test_llamacpp_kv_cache_bytes_q8_halves_attention_bytes(self):
+        """q8_0 K and V should roughly halve KV memory vs f16 (recurrent state
+        stays fp32-sized in llama.cpp and is unaffected by --cache-type-k/v)."""
+        metadata = {
+            "num_layers": 2,
+            "num_kv_heads": 4,
+            "key_length": 64,
+            "value_length": 64,
+        }
+        f16_bytes = LlamaCppBackend._llamacpp_kv_cache_bytes(
+            metadata, context=4096, parallel=1, k_dtype="f16", v_dtype="f16"
+        )
+        q8_bytes = LlamaCppBackend._llamacpp_kv_cache_bytes(
+            metadata, context=4096, parallel=1, k_dtype="q8_0", v_dtype="q8_0"
+        )
+        # q8_0 is 1.0625 bytes/elem vs f16's 2.0 → 53.125% of f16 cost.
+        assert 0.50 < q8_bytes / f16_bytes < 0.55
+
+    def test_llamacpp_kv_cache_bytes_q4_smaller_than_q8(self):
+        metadata = {
+            "num_layers": 2,
+            "num_kv_heads": 4,
+            "key_length": 64,
+            "value_length": 64,
+        }
+        q8 = LlamaCppBackend._llamacpp_kv_cache_bytes(
+            metadata, context=4096, parallel=1, k_dtype="q8_0", v_dtype="q8_0"
+        )
+        q4 = LlamaCppBackend._llamacpp_kv_cache_bytes(
+            metadata, context=4096, parallel=1, k_dtype="q4_0", v_dtype="q4_0"
+        )
+        assert q4 < q8
+
+    def test_tune_emits_kv_dtype_matrix(self, fake_gguf_model_dir, mocker):
+        """Tune output should contain a {ctx: {dtype: slots}} matrix."""
+        self._mock_metadata(mocker)
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+        gpu = Mock()
+        gpu.vram_total_gb = 48.0
+
+        result = b.tune(m, gpu, gpu_mem_util=0.90)
+        limits = result["limits"]
+        # Every row is a dict with at least f16 and q8_0 columns.
+        for ctx_str, row in limits.items():
+            assert isinstance(row, dict), f"row at {ctx_str} should be a dict"
+            assert "f16" in row
+            assert "q8_0" in row
+        # The kv_cache_dtypes profile block is exposed for the renderer.
+        assert "kv_cache_dtypes" in result
+        assert set(result["kv_cache_dtypes"].keys()) >= {"f16", "q8_0", "q4_0", "q4_1"}
+
+    def test_tune_recommends_q8_when_strictly_more_slots(self, fake_gguf_model_dir, mocker):
+        self._mock_metadata(mocker)
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+        gpu = Mock()
+        gpu.vram_total_gb = 48.0
+        result = b.tune(m, gpu, gpu_mem_util=0.90)
+        # q8_0 has strictly smaller bytes/element than f16, so for any
+        # model that fits at f16, q8_0 will also fit and the recommendation
+        # should land on q8_0.
+        assert result["recommended_kv_dtype"] in ("q8_0", "f16")
 
     def test_tune_full_offload_with_tiny_model(self, fake_gguf_model_dir, mocker):
         """Tiny model fully fits on GPU."""
@@ -1029,6 +1097,171 @@ class TestLlamaCppEmbedding:
         assert "jinja" not in cfg
         assert "embedding" not in cfg
         assert "pooling" not in cfg
+
+    def test_build_config_emits_kv_cache_dtypes(self, fake_gguf_model_dir):
+        """When kv_cache_k/v are set, build_config records them in the JSON."""
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+            "kv_cache_k": "q8_0", "kv_cache_v": "q8_0",
+        })
+        assert cfg["cache_type_k"] == "q8_0"
+        assert cfg["cache_type_v"] == "q8_0"
+
+    def test_build_config_emits_batch_and_ubatch(self, fake_gguf_model_dir):
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+            "batch_size": 4096, "ubatch_size": 512,
+        })
+        assert cfg["batch_size"] == 4096
+        assert cfg["ubatch_size"] == 512
+
+    def test_build_config_records_override_tensors(self, fake_gguf_model_dir):
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+            "override_tensors": [".ffn_.*_exps.=CPU"],
+        })
+        assert cfg["override_tensors"] == [".ffn_.*_exps.=CPU"]
+
+    def test_start_emits_ctk_ctv_b_ub_and_ot(self, fake_gguf_model_dir, tmp_path, mocker):
+        """The generated launch script contains every new flag in canonical form."""
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 8192, "n_gpu_layers": 30, "parallel": 4,
+            "port": 8888, "tools": True,
+            "kv_cache_k": "q8_0", "kv_cache_v": "q8_0",
+            "batch_size": 4096, "ubatch_size": 512,
+            "override_tensors": [".ffn_.*_exps.=CPU"],
+        })
+        cfg_path = tmp_path / "test.json"
+        import json
+        cfg_path.write_text(json.dumps(cfg))
+        active = tmp_path / "active.sh"
+        active.parent.mkdir(parents=True, exist_ok=True)
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
+        run = mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                           return_value=Mock(returncode=0, stdout="", stderr=""))
+
+        b.start(cfg_path)
+
+        script = active.read_text()
+        assert "-ctk q8_0" in script
+        assert "-ctv q8_0" in script
+        assert "-b 4096" in script
+        assert "-ub 512" in script
+        assert "-ot '.ffn_.*_exps.=CPU'" in script or '-ot ".ffn_.*_exps.=CPU"' in script
+        # L7: --no-mmap is auto-added whenever -ot is set so the new llama.cpp
+        # binary doesn't emit its "mmap + tensor override" perf warning.
+        assert "--no-mmap" in script
+        assert run.called
+
+    def test_start_omits_no_mmap_when_no_override_tensors(self, fake_gguf_model_dir, tmp_path, mocker):
+        """--no-mmap is only auto-added when -ot is in play."""
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        cfg_path = tmp_path / "test.json"
+        import json
+        cfg_path.write_text(json.dumps(cfg))
+        active = tmp_path / "active.sh"
+        active.parent.mkdir(parents=True, exist_ok=True)
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+
+        b.start(cfg_path)
+
+        script = active.read_text()
+        assert "--no-mmap" not in script
+
+    def test_start_respects_explicit_mmap_true(self, fake_gguf_model_dir, tmp_path, mocker):
+        """Setting mmap=True in the cfg suppresses the auto --no-mmap even when -ot is on."""
+        b = LlamaCppBackend()
+        from vserve.models import detect_model
+        m = detect_model(fake_gguf_model_dir)
+        # build_config doesn't expose mmap directly today — write it into the
+        # JSON to simulate a user manually editing the profile.
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+            "override_tensors": [".ffn_.*_exps.=CPU"],
+        })
+        cfg["mmap"] = True
+        cfg_path = tmp_path / "test.json"
+        import json
+        cfg_path.write_text(json.dumps(cfg))
+        active = tmp_path / "active.sh"
+        active.parent.mkdir(parents=True, exist_ok=True)
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+
+        b.start(cfg_path)
+
+        script = active.read_text()
+        assert "--no-mmap" not in script
+        # -ot still emitted
+        assert "-ot" in script
+
+    def test_is_unsloth_ud_detects_UD_prefix(self, tmp_path):
+        """ModelInfo.is_unsloth_ud is True only when filename contains -UD-."""
+        from vserve.models import ModelInfo
+
+        model_dir = tmp_path / "models" / "unsloth" / "Qwen3-GGUF-Q4_K_XL"
+        model_dir.mkdir(parents=True)
+        (model_dir / "Qwen3-UD-Q4_K_XL.gguf").write_bytes(b"GGUF")
+        m = ModelInfo(
+            path=model_dir, provider="unsloth", model_name="Qwen3-GGUF-Q4_K_XL",
+            architecture="qwen3", model_type="gguf", quant_method=None,
+            max_position_embeddings=0, is_moe=False, model_size_gb=1.0, is_gguf=True,
+        )
+        assert m.is_unsloth_ud is True
+
+    def test_is_unsloth_ud_false_for_plain_quant(self, tmp_path):
+        from vserve.models import ModelInfo
+
+        model_dir = tmp_path / "models" / "unsloth" / "Qwen3-GGUF-Q4_K_M"
+        model_dir.mkdir(parents=True)
+        (model_dir / "Qwen3-Q4_K_M.gguf").write_bytes(b"GGUF")
+        m = ModelInfo(
+            path=model_dir, provider="unsloth", model_name="Qwen3-GGUF-Q4_K_M",
+            architecture="qwen3", model_type="gguf", quant_method=None,
+            max_position_embeddings=0, is_moe=False, model_size_gb=1.0, is_gguf=True,
+        )
+        assert m.is_unsloth_ud is False
+
+    def test_is_unsloth_ud_false_for_non_unsloth_provider(self, tmp_path):
+        from vserve.models import ModelInfo
+
+        model_dir = tmp_path / "models" / "other" / "Qwen3-UD-Q4_K_XL"
+        model_dir.mkdir(parents=True)
+        (model_dir / "Qwen3-UD-Q4_K_XL.gguf").write_bytes(b"GGUF")
+        m = ModelInfo(
+            path=model_dir, provider="other", model_name="Qwen3-UD-Q4_K_XL",
+            architecture="qwen3", model_type="gguf", quant_method=None,
+            max_position_embeddings=0, is_moe=False, model_size_gb=1.0, is_gguf=True,
+        )
+        assert m.is_unsloth_ud is False
 
     def test_guess_pooling_case_insensitive(self):
         assert LlamaCppBackend._guess_pooling("BGE-Large-EN-v1.5") == "cls"

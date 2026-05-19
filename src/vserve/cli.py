@@ -23,6 +23,7 @@ from vserve.lock import (
     SessionUnknown,
     notify_user,
     check_session,
+    read_session,
     write_session,
     clear_session,
 )
@@ -46,8 +47,15 @@ def _session_or_exit(
     *,
     fail_on_probe_uncertainty: bool = True,
     allow_unknown_owner: bool = False,
+    quiet: bool = False,
 ) -> None:
-    """Block if another user owns the active GPU session, DM the holder."""
+    """Block if another user owns the active GPU session, DM the holder.
+
+    When `allow_unknown_owner` is True and the owner is unknown, return silently
+    if `quiet=True`; otherwise emit a single yellow warning. The `quiet` flag is
+    intended for follow-up TOCTOU re-checks within a single command so we don't
+    repeat the warning every time we re-acquire the lock.
+    """
     import os
     try:
         check_session(fail_on_probe_uncertainty=fail_on_probe_uncertainty)
@@ -67,7 +75,14 @@ def _session_or_exit(
         raise typer.Exit(1) from None
     except SessionUnknown as exc:
         if allow_unknown_owner:
+            if quiet:
+                return
+            me = os.environ.get("USER", "?")
             console.print(f"[yellow]{exc.message()}[/yellow]")
+            console.print(
+                f"  [dim]Proceeding as {me}. "
+                "Claim future sessions by starting via `vserve run`.[/dim]"
+            )
             return
         console.print(Panel(
             f"[bold]{exc.message()}[/bold]"
@@ -135,7 +150,16 @@ def _record_backend_manifest(backend, cfg_path: pathlib.Path, *, label: str, sta
         pass
 
 
-def _check_backend_runtime_or_exit(backend, *, allow_unsupported_runtime: bool = False):
+def _check_backend_runtime_or_exit(
+    backend,
+    *,
+    allow_unsupported_runtime: bool = False,
+    prefer_cache: bool = False,
+):
+    """Validate the backend's runtime version. On `vserve run`, pass
+    `prefer_cache=True` to serve a cached RuntimeInfo and skip the slow
+    `pip check` step — diagnostic commands (doctor, runtime check) leave it
+    False to always re-probe in full."""
     if getattr(backend, "name", None) != "vllm":
         return None
     runtime_info = None
@@ -145,7 +169,14 @@ def _check_backend_runtime_or_exit(backend, *, allow_unsupported_runtime: bool =
         runtime_info_fn = getattr(backend, "runtime_info", None)
         if not callable(runtime_info_fn):
             raise RuntimeError("runtime_info is unavailable")
-        runtime_info = runtime_info_fn()
+        try:
+            runtime_info = runtime_info_fn(
+                prefer_cache=prefer_cache,
+                with_pip_check=not prefer_cache,
+            )
+        except TypeError:
+            # Older backend stubs (test doubles) may not accept the kwargs.
+            runtime_info = runtime_info_fn()
         from vserve.runtime import RuntimeInfo, check_vllm_compatibility
         if not isinstance(runtime_info, RuntimeInfo):
             raise RuntimeError("runtime_info did not return RuntimeInfo")
@@ -2099,37 +2130,40 @@ def _print_benchmark_summary(limits_data: dict) -> None:
 
 
 def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
-    """Print the context × concurrency limit table."""
+    """Print the context × concurrency limit table.
+
+    Both backends emit a 2D `{ctx: {dtype: slots}}` matrix today. llama.cpp
+    additionally exposes GPU layer offload, MoE expert-CPU offload, and a
+    recommended KV dtype; vLLM exposes scheduler profile recommendations.
+    """
     avail = limits_data.get("available_kv_gb")
     if avail is not None:
         console.print(f"  [dim]KV cache: {avail} GB available[/dim]")
 
-    # Detect format: llama.cpp uses flat int values, vLLM uses nested dicts
+    backend = limits_data.get("backend")
     limits = limits_data.get("limits", {})
-    is_flat = any(isinstance(v, (int, type(None))) for v in limits.values())
+    legacy_flat = any(isinstance(v, (int, type(None))) for v in limits.values())
 
-    if is_flat:
-        # llama.cpp format: {"4096": 8, "8192": 4, ...}
+    if backend == "llamacpp":
         n_layers = limits_data.get("n_gpu_layers")
         num_layers = limits_data.get("num_layers")
         if n_layers is not None and num_layers:
             offload = "full" if n_layers >= num_layers else f"{n_layers}/{num_layers} layers"
             console.print(f"  [dim]GPU offload: {offload}[/dim]")
 
+    if legacy_flat:
+        # Pre-0.5.8 llama.cpp cache shape: {"4096": 8, "8192": 4, ...}
         table = Table(show_header=True, box=None, padding=(0, 2))
         table.add_column("Context", style="bold")
         table.add_column("Parallel slots", justify="right")
-
         for ctx_str in sorted(limits, key=int):
             entry = limits[ctx_str]
             ctx_val = int(ctx_str)
-            ctx_label = f"{ctx_val:,}"
             slot_str = f"{entry} slots" if entry else "[dim]OOM[/dim]"
-            table.add_row(ctx_label, slot_str)
-
+            table.add_row(f"{ctx_val:,}", slot_str)
         console.print(table)
     else:
-        # vLLM format: {"4096": {"auto": 64, "fp8": 128, ...}, ...}
+        # 2D matrix: {"4096": {"f16": 89, "q8_0": 178, ...}, ...}
         table = Table(show_header=True, box=None, padding=(0, 2))
         table.add_column("Context", style="bold")
         dtype_order = _vllm_limit_dtype_order(limits_data, limits)
@@ -2139,32 +2173,156 @@ def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
         for ctx_str in sorted(limits, key=int):
             entry = limits[ctx_str]
             ctx_val = int(ctx_str)
-            ctx_label = f"{ctx_val:,}"
             choices = _vllm_limits_entry(entry)
-            row = [ctx_label]
+            row = [f"{ctx_val:,}"]
             for dtype in dtype_order:
                 value = choices.get(dtype)
                 row.append(f"{value} slots" if value else "[dim]OOM[/dim]")
-
             table.add_row(*row)
         console.print(table)
-        recommendations = limits_data.get("recommendations")
-        if isinstance(recommendations, dict) and recommendations:
-            rendered = []
-            for name in ("interactivity", "balanced", "throughput"):
-                rec = recommendations.get(name)
-                if not isinstance(rec, dict):
-                    continue
-                ctx = rec.get("context")
-                seqs = rec.get("max_num_seqs")
-                kv = rec.get("kv_cache_dtype")
-                bt = rec.get("max_num_batched_tokens")
-                if ctx and seqs and kv and bt:
-                    rendered.append(f"{name}: {int(ctx):,}/{kv}/{seqs} seqs/{int(bt):,} batch")
-            if rendered:
-                console.print(f"  [dim]Profiles: {'; '.join(rendered)}[/dim]")
+
+        if backend == "vllm":
+            recommendations = limits_data.get("recommendations")
+            if isinstance(recommendations, dict) and recommendations:
+                rendered = []
+                for name in ("interactivity", "balanced", "throughput"):
+                    rec = recommendations.get(name)
+                    if not isinstance(rec, dict):
+                        continue
+                    ctx = rec.get("context")
+                    seqs = rec.get("max_num_seqs")
+                    kv = rec.get("kv_cache_dtype")
+                    bt = rec.get("max_num_batched_tokens")
+                    if ctx and seqs and kv and bt:
+                        rendered.append(f"{name}: {int(ctx):,}/{kv}/{seqs} seqs/{int(bt):,} batch")
+                if rendered:
+                    console.print(f"  [dim]Profiles: {'; '.join(rendered)}[/dim]")
+        elif backend == "llamacpp":
+            rec_kv = limits_data.get("recommended_kv_dtype")
+            if rec_kv:
+                console.print(
+                    f"  [dim]Recommended KV: -ctk {rec_kv} -ctv {rec_kv} "
+                    "(symmetric pair → fused Flash-Attention path)[/dim]"
+                )
+            moe = limits_data.get("moe")
+            if isinstance(moe, dict) and moe.get("is_moe"):
+                _print_llamacpp_moe_block(moe, dtype_order)
+
     _print_benchmark_summary(limits_data)
     console.print()
+
+
+def _print_llamacpp_moe_block(moe: dict, dtype_order: list[str]) -> None:
+    """Render the MoE expert-CPU-offload (`-ot`) info block under the matrix."""
+    expert_count = moe.get("expert_count")
+    expert_used = moe.get("expert_used_count")
+    freed = moe.get("estimated_gpu_freed_gb")
+    gpu_resident = moe.get("estimated_gpu_resident_gb")
+    pattern = moe.get("ot_pattern")
+    header_bits = [f"MoE: {expert_count} experts"]
+    if expert_used:
+        header_bits.append(f"{expert_used} active per token")
+    if freed is not None:
+        header_bits.append(f"-ot would free ~{freed} GB")
+    if gpu_resident is not None:
+        header_bits.append(f"GPU resident ~{gpu_resident} GB")
+    console.print(f"  [dim]{' · '.join(header_bits)}[/dim]")
+    note = moe.get("note")
+    if note:
+        console.print(f"  [dim]({note})[/dim]")
+        return
+    limits_with_ot = moe.get("limits_with_ot")
+    if not isinstance(limits_with_ot, dict) or not limits_with_ot:
+        return
+    console.print(f"  [dim]With -ot \"{pattern}\":[/dim]")
+    ot_table = Table(show_header=True, box=None, padding=(0, 2))
+    ot_table.add_column("Context", style="bold")
+    for dtype in dtype_order:
+        ot_table.add_column(_vllm_kv_label(dtype), justify="right")
+    for ctx_str in sorted(limits_with_ot, key=int):
+        row_entry = limits_with_ot[ctx_str]
+        choices = _vllm_limits_entry(row_entry)
+        row = [f"{int(ctx_str):,}"]
+        for dtype in dtype_order:
+            value = choices.get(dtype)
+            row.append(f"{value} slots" if value else "[dim]OOM[/dim]")
+        ot_table.add_row(*row)
+    console.print(ot_table)
+
+
+def _wait_for_health(
+    *,
+    health_url: str,
+    timeout_s: int,
+    poll_s: int = 3,
+    log_tail_fn,
+    service_running_fn,
+    sleep_fn=None,
+    urlopen_fn=None,
+):
+    """Poll health_url until 200 / service dies / timeout, deduping log output.
+
+    Returns one of: "ready", "stopped", "timeout". The caller renders the
+    final-state banner so output is byte-stable across changes here.
+
+    Dedup rule: the journal tail is printed only when its hash changes, so the
+    user sees each fresh block once instead of every 3 s. Between unchanged
+    polls a single "." (no newline) prints to confirm liveness. A
+    "still starting (Ns)" line flushes every 30 s.
+    """
+    import hashlib
+    import time
+    from urllib.request import urlopen as _default_urlopen
+
+    sleep_fn = sleep_fn or time.sleep
+    urlopen_fn = urlopen_fn or _default_urlopen
+
+    iterations = max(1, (timeout_s + poll_s - 1) // poll_s)
+    last_tail_hash: str | None = None
+    dots_printed = 0
+
+    for i in range(iterations):
+        sleep_fn(poll_s)
+        elapsed_s = (i + 1) * poll_s
+
+        try:
+            with urlopen_fn(health_url, timeout=2) as resp:
+                if resp.status == 200:
+                    if dots_printed:
+                        console.print()
+                    return "ready"
+        except Exception:
+            pass
+
+        tail = log_tail_fn()
+        if tail:
+            tail_hash = hashlib.sha256(tail.encode("utf-8", errors="replace")).hexdigest()
+            if tail_hash != last_tail_hash:
+                if dots_printed:
+                    console.print()
+                    dots_printed = 0
+                console.print(f"  [dim]Latest service logs ({elapsed_s}s):[/dim]")
+                for line in tail.splitlines():
+                    console.print(f"    [dim]{line}[/dim]")
+                last_tail_hash = tail_hash
+            else:
+                console.print(".", end="")
+                dots_printed += 1
+
+        if elapsed_s > 10 and service_running_fn() is False:
+            if dots_printed:
+                console.print()
+            return "stopped"
+
+        if elapsed_s % 30 == 0:
+            if dots_printed:
+                console.print()
+                dots_printed = 0
+            console.print(f"  [dim]still starting... ({elapsed_s}s)[/dim]")
+
+    if dots_printed:
+        console.print()
+    return "timeout"
 
 
 def _launch_backend(
@@ -2319,48 +2477,35 @@ def _launch_backend(
 
         write_session(label)
 
-        from urllib.request import urlopen
         port = launch_port
         health = backend.health_url(port)
 
         console.print(f"  [dim]Waiting for {health} ...[/dim]")
-        for i in range(max(1, (resolved_health_timeout_s + health_poll_s - 1) // health_poll_s)):
-            time.sleep(health_poll_s)
-            elapsed_s = (i + 1) * health_poll_s
-            try:
-                with urlopen(health, timeout=2) as resp:
-                    if resp.status == 200:
-                        _record_backend_manifest(backend, cfg_path, label=label, status="ready", port=port)
-                        console.print(f"\n[bold green]{backend.display_name} is running[/bold green] at http://localhost:{port}/v1")
-                        console.print(f"  Config: {cfg_path}")
-                        console.print(f"  Logs:   sudo journalctl -u {backend.service_name} -f\n")
-                        return
-            except Exception:
-                pass
-
-            log_tail = _recent_service_log_tail()
-            if log_tail:
-                console.print("  [dim]Latest service logs:[/dim]")
-                for line in log_tail.splitlines():
-                    console.print(f"    [dim]{line}[/dim]")
-
-            if elapsed_s > 10:
-                service_running = _service_running_state()
-                if service_running is False:
-                    clear_session()
-                    _record_backend_manifest(
-                        backend,
-                        cfg_path,
-                        label=label,
-                        status="failed",
-                        port=port,
-                        error="service stopped before health endpoint became ready",
-                    )
-                    console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
-                    raise typer.Exit(1)
-
-            if elapsed_s % 30 == 0:
-                console.print(f"  [dim]still starting... ({elapsed_s}s)[/dim]")
+        outcome = _wait_for_health(
+            health_url=health,
+            timeout_s=resolved_health_timeout_s,
+            poll_s=health_poll_s,
+            log_tail_fn=_recent_service_log_tail,
+            service_running_fn=_service_running_state,
+        )
+        if outcome == "ready":
+            _record_backend_manifest(backend, cfg_path, label=label, status="ready", port=port)
+            console.print(f"\n[bold green]{backend.display_name} is running[/bold green] at http://localhost:{port}/v1")
+            console.print(f"  Config: {cfg_path}")
+            console.print(f"  Logs:   sudo journalctl -u {backend.service_name} -f\n")
+            return
+        if outcome == "stopped":
+            clear_session()
+            _record_backend_manifest(
+                backend,
+                cfg_path,
+                label=label,
+                status="failed",
+                port=port,
+                error="service stopped before health endpoint became ready",
+            )
+            console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
+            raise typer.Exit(1)
 
         service_running = _service_running_state()
 
@@ -2446,6 +2591,13 @@ def _scripted_config(
     save_profile: str | None,
     trust_remote_code: bool,
     runtime_info=None,
+    # llama.cpp-specific knobs (ignored by vLLM)
+    llamacpp_kv_cache_k: str | None = None,
+    llamacpp_kv_cache_v: str | None = None,
+    llamacpp_batch_size: int | None = None,
+    llamacpp_ubatch_size: int | None = None,
+    llamacpp_override_tensors: list[str] | None = None,
+    llamacpp_no_moe_offload: bool = False,
 ) -> "pathlib.Path":
     """Build a launch config from CLI flags without prompting."""
     from vserve import config as config_module
@@ -2476,18 +2628,52 @@ def _scripted_config(
 
     if backend.name == "llamacpp":
         if need_tuned_defaults:
-            chosen_context, chosen_slots, chosen_layers = _choose_llamacpp_scripted_defaults(
+            chosen_context, chosen_slots, chosen_layers, chosen_k, chosen_v = _choose_llamacpp_scripted_defaults(
                 m,
                 limits_data,
                 context=context,
                 slots=slots,
                 gpu_layers=gpu_layers,
+                kv_cache_k=llamacpp_kv_cache_k,
+                kv_cache_v=llamacpp_kv_cache_v,
             )
         else:
             assert context is not None
             assert slots is not None
             assert gpu_layers is not None
             chosen_context, chosen_slots, chosen_layers = context, slots, gpu_layers
+            chosen_k = llamacpp_kv_cache_k or limits_data.get("recommended_kv_dtype") or "f16"
+            chosen_v = llamacpp_kv_cache_v or chosen_k
+
+        # Warn on asymmetric K/V — fused FA path falls back to a slow
+        # non-fused implementation when types don't match.
+        if chosen_k != chosen_v:
+            console.print(
+                f"[yellow]Warning:[/yellow] asymmetric KV dtypes "
+                f"(-ctk {chosen_k} -ctv {chosen_v}) disable the fused "
+                "Flash-Attention path. Performance will degrade."
+            )
+
+        # MoE expert CPU offload (`-ot ".ffn_.*_exps.=CPU"`). Auto-include
+        # when limits_data flags MoE and the user did not opt out.
+        override_tensors: list[str] = list(llamacpp_override_tensors or [])
+        moe_info = limits_data.get("moe")
+        if (
+            not llamacpp_no_moe_offload
+            and not llamacpp_override_tensors
+            and isinstance(moe_info, dict)
+            and moe_info.get("is_moe")
+            and moe_info.get("ot_pattern")
+        ):
+            override_tensors.append(str(moe_info["ot_pattern"]))
+            freed = moe_info.get("estimated_gpu_freed_gb")
+            if freed:
+                console.print(
+                    f"  [dim]MoE detected: defaulting to "
+                    f"`-ot \"{moe_info['ot_pattern']}\"` "
+                    f"(frees ~{freed} GB VRAM). Pass --no-moe-offload to opt out.[/dim]"
+                )
+
         choices = {
             "context": chosen_context,
             "n_gpu_layers": chosen_layers,
@@ -2496,6 +2682,11 @@ def _scripted_config(
             "tools": tools,
             "embedding": embedding,
             "pooling": pooling,
+            "kv_cache_k": chosen_k,
+            "kv_cache_v": chosen_v,
+            "override_tensors": override_tensors,
+            "batch_size": llamacpp_batch_size,
+            "ubatch_size": llamacpp_ubatch_size,
         }
         cfg = backend.build_config(m, choices)
         profile_name = save_profile or "custom"
@@ -2765,6 +2956,17 @@ def _vllm_kv_label(dtype: str) -> str:
         "turboquant_4bit_nc": "TQ 4bit",
         "turboquant_k3v4_nc": "TQ k3v4",
         "turboquant_3bit_nc": "TQ 3bit",
+        # llama.cpp K/V dtypes — labels are intentionally symmetric since
+        # fused Flash-Attention requires K and V to match.
+        "f16": "F16 KV",
+        "bf16": "BF16 KV",
+        "f32": "F32 KV",
+        "q8_0": "Q8 KV",
+        "q5_1": "Q5_1 KV",
+        "q5_0": "Q5_0 KV",
+        "q4_1": "Q4_1 KV",
+        "q4_0": "Q4_0 KV",
+        "iq4_nl": "IQ4_NL KV",
     }
     return labels.get(dtype, dtype)
 
@@ -2892,7 +3094,16 @@ def _choose_llamacpp_scripted_defaults(
     context: int | None,
     slots: int | None,
     gpu_layers: int | None,
-) -> tuple[int, int, int]:
+    kv_cache_k: str | None = None,
+    kv_cache_v: str | None = None,
+) -> tuple[int, int, int, str, str]:
+    """Pick (context, slots, n_gpu_layers, kv_cache_k, kv_cache_v) for a
+    scripted llama.cpp run. KV dtype defaults to the tuner's recommendation
+    (f16 unless q8_0 strictly fits more slots — see
+    LlamaCppBackend._recommended_kv_dtype). The fused Flash-Attention path
+    requires K and V to match, so a single dtype is picked unless the user
+    explicitly passes asymmetric K and V values.
+    """
     limits = limits_data.get("limits", {})
     limits = limits if isinstance(limits, dict) else {}
     working_contexts: list[int] = []
@@ -2908,13 +3119,28 @@ def _choose_llamacpp_scripted_defaults(
     if context is not None and context not in working_contexts:
         raise ValueError(f"No tuned llama.cpp capacity for context {context}; run vserve tune {m.full_name} --recalc")
     chosen_context = context or max(working_contexts)
+
+    recommended_kv = limits_data.get("recommended_kv_dtype") or "f16"
+    chosen_k = kv_cache_k or recommended_kv
+    chosen_v = kv_cache_v or kv_cache_k or recommended_kv
+
     if slots is not None:
         chosen_slots = slots
     else:
-        tuned_slots = _llamacpp_slots_from_limits_entry(limits.get(str(chosen_context)))
+        entry = limits.get(str(chosen_context))
+        if isinstance(entry, dict):
+            tuned_slots: int | None = entry.get(chosen_k)
+            if tuned_slots is None:
+                # Fall back to f16 row then to max across dtypes.
+                tuned_slots = entry.get("f16")
+            if tuned_slots is None:
+                tuned_slots = _llamacpp_slots_from_limits_entry(entry)
+        else:
+            tuned_slots = _llamacpp_slots_from_limits_entry(entry)
         if tuned_slots is None:
             raise ValueError(f"No tuned llama.cpp slot count for context {chosen_context}")
         chosen_slots = int(tuned_slots)
+
     tuned_layers = limits_data.get("n_gpu_layers")
     if gpu_layers is not None:
         chosen_layers = gpu_layers
@@ -2922,7 +3148,7 @@ def _choose_llamacpp_scripted_defaults(
         if not isinstance(tuned_layers, int):
             raise ValueError(f"No tuned llama.cpp GPU layer count for {m.full_name}; run vserve tune {m.full_name}")
         chosen_layers = tuned_layers
-    return chosen_context, chosen_slots, chosen_layers
+    return chosen_context, chosen_slots, chosen_layers, chosen_k, chosen_v
 
 
 def _detect_capabilities_for_scripted_run(m: ModelInfo, backend) -> dict:
@@ -3298,6 +3524,12 @@ def run(
     embedding: bool = typer.Option(False, "--embedding", help="Run llama.cpp in embedding mode"),
     pooling: str | None = typer.Option(None, "--pooling", help="llama.cpp embedding pooling"),
     trust_remote_code: bool = typer.Option(False, "--trust-remote-code", help="Allow vLLM to execute model repository code"),
+    kv_cache_k: str | None = typer.Option(None, "--kv-cache-k", help="llama.cpp K-cache dtype (f16, q8_0, q4_1, q4_0, …); fused FA requires K=V"),
+    kv_cache_v: str | None = typer.Option(None, "--kv-cache-v", help="llama.cpp V-cache dtype; defaults to --kv-cache-k"),
+    batch_size_lc: int | None = typer.Option(None, "--batch-size", help="llama.cpp logical batch size (-b); default 2048"),
+    ubatch_size_lc: int | None = typer.Option(None, "--ubatch-size", help="llama.cpp physical batch size (-ub); default 512"),
+    override_tensor: list[str] = typer.Option([], "--override-tensor", "-ot", help="llama.cpp --override-tensor pattern (repeatable, e.g. '.ffn_.*_exps.=CPU')"),
+    no_moe_offload: bool = typer.Option(False, "--no-moe-offload", help="Disable the auto-applied MoE expert-CPU offload (-ot)"),
 ):
     """Start serving a model — interactive config picker."""
     from vserve.backends import get_backend, get_backend_by_name
@@ -3395,7 +3627,14 @@ def run(
         console.print(f"  {_backend_format_guidance(backend.name)}")
         raise typer.Exit(1)
 
-    runtime_info = _check_backend_runtime_or_exit(backend, allow_unsupported_runtime=allow_unsupported_runtime)
+    # Hot path: prefer the cached runtime info and skip `pip check`. The
+    # diagnostic commands (`vserve doctor`, `vserve runtime check vllm`) still
+    # invoke the full probe with pip check.
+    runtime_info = _check_backend_runtime_or_exit(
+        backend,
+        allow_unsupported_runtime=allow_unsupported_runtime,
+        prefer_cache=True,
+    )
 
     if tool_parser and not tools:
         tools = True
@@ -3410,8 +3649,12 @@ def run(
         cfg_path = resolved_profile_path
     elif yes or any(
         value is not None
-        for value in (context, slots, kv_cache_dtype, batched_tokens, gpu_util, save_profile, reasoning_parser, gpu_layers, pooling)
-    ) or embedding:
+        for value in (
+            context, slots, kv_cache_dtype, batched_tokens, gpu_util, save_profile,
+            reasoning_parser, gpu_layers, pooling,
+            kv_cache_k, kv_cache_v, batch_size_lc, ubatch_size_lc,
+        )
+    ) or embedding or override_tensor or no_moe_offload:
         if m is None:
             console.print("[red]A model query is required when building a profile from flags.[/red]")
             raise typer.Exit(1)
@@ -3433,6 +3676,12 @@ def run(
             save_profile=save_profile,
             trust_remote_code=trust_remote_code,
             runtime_info=runtime_info,
+            llamacpp_kv_cache_k=kv_cache_k,
+            llamacpp_kv_cache_v=kv_cache_v,
+            llamacpp_batch_size=batch_size_lc,
+            llamacpp_ubatch_size=ubatch_size_lc,
+            llamacpp_override_tensors=list(override_tensor) if override_tensor else None,
+            llamacpp_no_moe_offload=no_moe_offload,
         )
     else:
         if m is None:
@@ -3461,6 +3710,14 @@ def stop():
     from vserve.backends import _BACKENDS, probe_running_backends
 
     _session_or_exit(fail_on_probe_uncertainty=False, allow_unknown_owner=True)
+    # If the warning above fired (no marker existed), claim the orphan now so
+    # the TOCTOU re-checks below pass silently and a future stop/run from this
+    # user resolves cleanly.
+    if read_session() is None:
+        try:
+            write_session("orphan-claim")
+        except Exception:
+            pass
 
     running_backends, probe_failed = probe_running_backends()
     if not running_backends:
@@ -3469,7 +3726,11 @@ def stop():
 
             lock = _lock_or_exit("gpu", "stopping backend (probe uncertain)")
             try:
-                _session_or_exit(fail_on_probe_uncertainty=False, allow_unknown_owner=True)
+                _session_or_exit(
+                    fail_on_probe_uncertainty=False,
+                    allow_unknown_owner=True,
+                    quiet=True,
+                )
                 fallback_stop_errors: list[str] = []
                 for candidate in _BACKENDS:
                     try:
@@ -3504,7 +3765,11 @@ def stop():
     running_names = ", ".join(candidate.display_name for candidate in stop_candidates)
     lock = _lock_or_exit("gpu", f"stopping {running_names}")
     try:
-        _session_or_exit(fail_on_probe_uncertainty=False, allow_unknown_owner=True)  # re-check under flock (TOCTOU)
+        _session_or_exit(
+            fail_on_probe_uncertainty=False,
+            allow_unknown_owner=True,
+            quiet=True,
+        )  # re-check under flock (TOCTOU)
 
         stop_errors: list[str] = []
         for candidate in stop_candidates:

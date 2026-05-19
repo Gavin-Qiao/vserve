@@ -2299,6 +2299,272 @@ def test_stop_probe_failure_with_running_backend_stops_all_known_backends(mocker
     clear_session.assert_called_once()
 
 
+def _wait_for_health_inputs(mocker, *, urlopen_results, tails, service_running=None):
+    """Build (sleep_fn, urlopen_fn, log_tail_fn, service_running_fn) for tests."""
+    sleeps: list[float] = []
+
+    def sleep_fn(s):
+        sleeps.append(s)
+
+    url_iter = iter(urlopen_results)
+
+    def urlopen_fn(url, timeout=2):
+        outcome = next(url_iter)
+        if isinstance(outcome, Exception):
+            raise outcome
+        resp = mocker.MagicMock()
+        resp.status = outcome
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        return resp
+
+    tail_iter = iter(tails)
+
+    def log_tail_fn():
+        try:
+            return next(tail_iter)
+        except StopIteration:
+            return None
+
+    running_iter = iter(service_running or [])
+
+    def service_running_fn():
+        try:
+            return next(running_iter)
+        except StopIteration:
+            return True
+
+    return sleep_fn, urlopen_fn, log_tail_fn, service_running_fn, sleeps
+
+
+def test_wait_for_health_returns_ready_on_first_200(mocker):
+    from vserve.cli import _wait_for_health
+
+    sleep_fn, urlopen_fn, log_tail_fn, svc_fn, sleeps = _wait_for_health_inputs(
+        mocker, urlopen_results=[200], tails=[]
+    )
+
+    outcome = _wait_for_health(
+        health_url="http://h",
+        timeout_s=300,
+        poll_s=3,
+        log_tail_fn=log_tail_fn,
+        service_running_fn=svc_fn,
+        sleep_fn=sleep_fn,
+        urlopen_fn=urlopen_fn,
+    )
+
+    assert outcome == "ready"
+    assert sleeps == [3]
+
+
+def test_wait_for_health_deduplicates_log_block(capsys, mocker):
+    from vserve.cli import _wait_for_health
+
+    sleep_fn, urlopen_fn, log_tail_fn, svc_fn, _ = _wait_for_health_inputs(
+        mocker,
+        urlopen_results=[Exception("not ready"), Exception("not ready"), 200],
+        tails=["AAA\nBBB\nCCC", "AAA\nBBB\nCCC", "AAA\nBBB\nCCC"],
+    )
+
+    outcome = _wait_for_health(
+        health_url="http://h",
+        timeout_s=300,
+        poll_s=3,
+        log_tail_fn=log_tail_fn,
+        service_running_fn=svc_fn,
+        sleep_fn=sleep_fn,
+        urlopen_fn=urlopen_fn,
+    )
+
+    captured = capsys.readouterr().out
+    assert outcome == "ready"
+    occurrences = captured.count("Latest service logs")
+    assert occurrences == 1, f"expected 1 header, got {occurrences}: {captured!r}"
+
+
+def test_wait_for_health_prints_new_block_when_tail_changes(capsys, mocker):
+    from vserve.cli import _wait_for_health
+
+    # 4 polls: tail A, tail A (dedup), tail B, then 200. New tail prints again.
+    sleep_fn, urlopen_fn, log_tail_fn, svc_fn, _ = _wait_for_health_inputs(
+        mocker,
+        urlopen_results=[Exception("x"), Exception("x"), Exception("x"), 200],
+        tails=["AAA\nBBB", "AAA\nBBB", "CCC\nDDD"],
+    )
+
+    _wait_for_health(
+        health_url="http://h",
+        timeout_s=300,
+        poll_s=3,
+        log_tail_fn=log_tail_fn,
+        service_running_fn=svc_fn,
+        sleep_fn=sleep_fn,
+        urlopen_fn=urlopen_fn,
+    )
+
+    captured = capsys.readouterr().out
+    assert captured.count("Latest service logs") == 2
+
+
+def test_wait_for_health_returns_stopped_when_service_dies(mocker):
+    from vserve.cli import _wait_for_health
+
+    sleep_fn, urlopen_fn, log_tail_fn, svc_fn, _ = _wait_for_health_inputs(
+        mocker,
+        urlopen_results=[Exception("x"), Exception("x"), Exception("x"), Exception("x")],
+        tails=[None, None, None, None],
+        # elapsed_s only checks service after >10s, so set False on 4th poll (elapsed=12s)
+        service_running=[True, True, True, False],
+    )
+
+    outcome = _wait_for_health(
+        health_url="http://h",
+        timeout_s=300,
+        poll_s=3,
+        log_tail_fn=log_tail_fn,
+        service_running_fn=svc_fn,
+        sleep_fn=sleep_fn,
+        urlopen_fn=urlopen_fn,
+    )
+
+    assert outcome == "stopped"
+
+
+def test_wait_for_health_returns_timeout_after_budget(mocker):
+    from vserve.cli import _wait_for_health
+
+    fail = [Exception("nope")] * 5
+    sleep_fn, urlopen_fn, log_tail_fn, svc_fn, sleeps = _wait_for_health_inputs(
+        mocker,
+        urlopen_results=fail,
+        tails=[None] * 5,
+    )
+
+    outcome = _wait_for_health(
+        health_url="http://h",
+        timeout_s=12,  # ceil(12/3) = 4 iterations
+        poll_s=3,
+        log_tail_fn=log_tail_fn,
+        service_running_fn=svc_fn,
+        sleep_fn=sleep_fn,
+        urlopen_fn=urlopen_fn,
+    )
+
+    assert outcome == "timeout"
+    assert sleeps == [3, 3, 3, 3]
+
+
+def test_stop_warns_once_when_owner_unknown(mocker):
+    """The unknown-owner warning fires once, not on every TOCTOU re-check."""
+    from vserve.lock import SessionUnknown
+
+    backend = mocker.Mock()
+    backend.display_name = "vLLM"
+    lock = mocker.Mock()
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch(
+        "vserve.backends.probe_running_backends",
+        side_effect=[([backend], False), ([], False)],
+    )
+    # First call (loud) raises SessionUnknown. Subsequent calls (quiet TOCTOU
+    # re-check) also raise — without the quiet flag they'd print again.
+    mocker.patch(
+        "vserve.cli.check_session",
+        side_effect=SessionUnknown("vLLM is running, but no vserve session marker exists."),
+    )
+    # read_session() returns None so the orphan-claim path fires.
+    mocker.patch("vserve.cli.read_session", return_value=None)
+    write = mocker.patch("vserve.cli.write_session")
+    clear_session = mocker.patch("vserve.cli.clear_session")
+
+    result = runner.invoke(app, ["stop"])
+
+    assert result.exit_code == 0
+    occurrences = result.output.count("no vserve session marker exists")
+    assert occurrences == 1, f"expected 1 warning, got {occurrences}: {result.output!r}"
+    backend.stop.assert_called_once()
+    clear_session.assert_called_once()
+    write.assert_called_with("orphan-claim")
+
+
+def test_stop_claims_orphan_session_before_release(mocker):
+    """After warning, stop() auto-claims the orphan via write_session."""
+    from vserve.lock import SessionUnknown
+
+    backend = mocker.Mock()
+    backend.display_name = "vLLM"
+    lock = mocker.Mock()
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch(
+        "vserve.backends.probe_running_backends",
+        side_effect=[([backend], False), ([], False)],
+    )
+    mocker.patch("vserve.cli.check_session", side_effect=SessionUnknown())
+    mocker.patch("vserve.cli.read_session", return_value=None)
+    write = mocker.patch("vserve.cli.write_session")
+    mocker.patch("vserve.cli.clear_session")
+
+    result = runner.invoke(app, ["stop"])
+
+    assert result.exit_code == 0
+    write.assert_called_once_with("orphan-claim")
+
+
+def test_stop_does_not_claim_when_session_already_exists(mocker):
+    """When read_session returns a valid marker, don't overwrite it."""
+    from vserve.lock import SessionInfo
+
+    backend = mocker.Mock()
+    backend.display_name = "vLLM"
+    lock = mocker.Mock()
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch(
+        "vserve.backends.probe_running_backends",
+        side_effect=[([backend], False), ([], False)],
+    )
+    mocker.patch("vserve.cli.check_session")  # owner known, no exception
+    mocker.patch(
+        "vserve.cli.read_session",
+        return_value=SessionInfo(user="mohan", since="2026-05-19 12:00:00", model="x"),
+    )
+    write = mocker.patch("vserve.cli.write_session")
+    mocker.patch("vserve.cli.clear_session")
+
+    result = runner.invoke(app, ["stop"])
+
+    assert result.exit_code == 0
+    write.assert_not_called()
+
+
+def test_stop_warns_once_under_probe_failed_fallback(mocker):
+    """Probe-failed fallback path also warns once and runs fallback stop."""
+    from vserve.lock import SessionUnknown
+
+    first = mocker.Mock()
+    first.display_name = "vLLM"
+    lock = mocker.Mock()
+    mocker.patch("vserve.cli._lock_or_exit", return_value=lock)
+    mocker.patch(
+        "vserve.backends.probe_running_backends",
+        side_effect=[([], True), ([], False)],
+    )
+    mocker.patch("vserve.backends._BACKENDS", [first])
+    mocker.patch(
+        "vserve.cli.check_session",
+        side_effect=SessionUnknown("vLLM is running, but no vserve session marker exists."),
+    )
+    mocker.patch("vserve.cli.read_session", return_value=None)
+    mocker.patch("vserve.cli.write_session")
+    mocker.patch("vserve.cli.clear_session")
+
+    result = runner.invoke(app, ["stop"])
+
+    assert result.exit_code == 0
+    occurrences = result.output.count("no vserve session marker exists")
+    assert occurrences == 1, f"expected 1 warning, got {occurrences}: {result.output!r}"
+
+
 def test_stop_probe_failure_exits_when_state_remains_uncertain(mocker):
     first = mocker.Mock()
     first.display_name = "vLLM"

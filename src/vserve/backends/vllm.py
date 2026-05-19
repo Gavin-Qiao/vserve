@@ -53,15 +53,20 @@ class VllmBackend:
         vllm_bin = cfg().vllm_bin
         return vllm_bin if vllm_bin.exists() else None
 
-    def runtime_info(self):
+    def runtime_info(self, *, prefer_cache: bool = False, with_pip_check: bool = True):
         from vserve.runtime import collect_vllm_runtime_info
 
-        return collect_vllm_runtime_info()
+        return collect_vllm_runtime_info(
+            prefer_cache=prefer_cache,
+            with_pip_check=with_pip_check,
+        )
 
-    def compatibility(self):
+    def compatibility(self, *, prefer_cache: bool = False, with_pip_check: bool = True):
         from vserve.runtime import check_vllm_compatibility
 
-        return check_vllm_compatibility(self.runtime_info())
+        return check_vllm_compatibility(
+            self.runtime_info(prefer_cache=prefer_cache, with_pip_check=with_pip_check)
+        )
 
     def tune(self, model: ModelInfo, gpu: GpuInfo, *, gpu_mem_util: float = 0.90) -> dict:
         from vserve.probe import calculate_limits

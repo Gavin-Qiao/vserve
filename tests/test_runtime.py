@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from vserve.runtime import (
@@ -62,7 +63,49 @@ def test_check_vllm_compatibility_rejects_beta_and_wrong_minor():
     assert check_vllm_compatibility(beta).supported is False
     assert "pre-release" in " ".join(check_vllm_compatibility(beta).errors)
     assert check_vllm_compatibility(older).supported is False
-    assert ">=0.20,<0.21" in " ".join(check_vllm_compatibility(older).errors)
+    assert ">=0.20,<0.22" in " ".join(check_vllm_compatibility(older).errors)
+
+
+def test_check_vllm_compatibility_accepts_stable_021():
+    info = RuntimeInfo(
+        backend="vllm",
+        executable=Path("/opt/vllm/venv/bin/vllm"),
+        python=Path("/opt/vllm/venv/bin/python"),
+        vllm_version="0.21.0",
+        torch_version="2.11.0+cu130",
+        torch_cuda="13.0",
+        transformers_version="5.6.2",
+        huggingface_hub_version="1.12.0",
+        pip_check_ok=True,
+        pip_check_output="No broken requirements found",
+    )
+
+    result = check_vllm_compatibility(info)
+
+    assert result.supported is True
+    assert result.range == SUPPORTED_VLLM_RANGE
+    assert result.errors == []
+    assert any("0.21.0" in message for message in result.messages)
+
+
+def test_check_vllm_compatibility_rejects_022():
+    too_new = RuntimeInfo(
+        backend="vllm",
+        executable=Path("/opt/vllm/venv/bin/vllm"),
+        python=Path("/opt/vllm/venv/bin/python"),
+        vllm_version="0.22.0",
+        torch_version="2.12.0",
+        torch_cuda="13.1",
+        transformers_version="5.7.0",
+        huggingface_hub_version="1.13.0",
+        pip_check_ok=True,
+        pip_check_output="No broken requirements found",
+    )
+
+    result = check_vllm_compatibility(too_new)
+
+    assert result.supported is False
+    assert ">=0.20,<0.22" in " ".join(result.errors)
 
 
 def test_collect_vllm_runtime_info_uses_vllm_python(mocker, tmp_path):
@@ -105,6 +148,7 @@ def test_upgrade_vllm_stable_force_reinstalls_pinned_stable(mocker, tmp_path):
     vllm_python.touch()
     cfg = mocker.Mock(vllm_python=vllm_python)
     run = mocker.patch("vserve.runtime.subprocess.run", return_value=mocker.Mock(returncode=0, stdout="", stderr=""))
+    invalidate = mocker.patch("vserve.runtime.invalidate_vllm_runtime_cache")
 
     upgrade_vllm_stable(cfg)
 
@@ -112,7 +156,148 @@ def test_upgrade_vllm_stable_force_reinstalls_pinned_stable(mocker, tmp_path):
     cmd = run.call_args.args[0]
     assert cmd[:4] == [str(vllm_python), "-m", "pip", "install"]
     assert "--force-reinstall" in cmd
-    assert "vllm==0.20.0" in cmd
+    assert "vllm==0.21.0" in cmd
+    invalidate.assert_called_once()
+
+
+def _build_venv(tmp_path):
+    """Make a fake vLLM venv layout that satisfies the cache key probe."""
+    vllm_bin = tmp_path / "venv" / "bin" / "vllm"
+    vllm_python = tmp_path / "venv" / "bin" / "python"
+    site_packages = tmp_path / "venv" / "lib" / "python3.12" / "site-packages"
+    vllm_bin.parent.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    vllm_bin.touch()
+    vllm_python.touch()
+    return vllm_bin, vllm_python
+
+
+def test_collect_vllm_runtime_info_returns_cached_when_prefer_cache_and_key_matches(mocker, tmp_path):
+    from vserve.runtime import (
+        _vllm_runtime_cache_key,
+        _write_vllm_runtime_cache,
+        RuntimeInfo,
+    )
+
+    vllm_bin, vllm_python = _build_venv(tmp_path)
+    cfg = mocker.Mock(vllm_bin=vllm_bin, vllm_python=vllm_python)
+    cache_path = tmp_path / "cache.json"
+
+    key = _vllm_runtime_cache_key(vllm_bin, vllm_python)
+    assert key is not None
+    cached = RuntimeInfo(
+        backend="vllm",
+        executable=vllm_bin,
+        python=vllm_python,
+        vllm_version="0.21.0",
+        torch_version="2.11.0+cu130",
+        torch_cuda="13.0",
+        transformers_version="5.6.2",
+        huggingface_hub_version="1.12.0",
+        pip_check_ok=None,
+        pip_check_output="",
+    )
+    _write_vllm_runtime_cache(cache_path, cache_key=key, info=cached)
+    run = mocker.patch("vserve.runtime.subprocess.run")
+
+    info = collect_vllm_runtime_info(
+        cfg, prefer_cache=True, with_pip_check=False, cache_path=cache_path
+    )
+
+    assert info.vllm_version == "0.21.0"
+    assert info.torch_version == "2.11.0+cu130"
+    run.assert_not_called()
+
+
+def test_collect_vllm_runtime_info_repopulates_cache_on_key_drift(mocker, tmp_path):
+    from vserve.runtime import _write_vllm_runtime_cache, RuntimeInfo
+
+    vllm_bin, vllm_python = _build_venv(tmp_path)
+    cfg = mocker.Mock(vllm_bin=vllm_bin, vllm_python=vllm_python)
+    cache_path = tmp_path / "cache.json"
+
+    stale = RuntimeInfo(
+        backend="vllm",
+        executable=vllm_bin,
+        python=vllm_python,
+        vllm_version="0.19.0",
+        torch_version="2.10.0",
+        torch_cuda="12.8",
+        transformers_version="4.56.0",
+        huggingface_hub_version="0.36.0",
+        pip_check_ok=None,
+        pip_check_output="",
+    )
+    _write_vllm_runtime_cache(cache_path, cache_key="stale-key", info=stale)
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd == [str(vllm_bin), "--version"]:
+            return mocker.Mock(returncode=0, stdout="vLLM 0.21.0\n", stderr="")
+        if cmd[:3] == [str(vllm_python), "-c", mocker.ANY]:
+            return mocker.Mock(
+                returncode=0,
+                stdout='{"vllm":"0.21.0","torch":"2.11.0+cu130","torch_cuda":"13.0","transformers":"5.6.2","huggingface_hub":"1.12.0"}\n',
+                stderr="",
+            )
+        raise AssertionError(cmd)
+
+    mocker.patch("vserve.runtime.subprocess.run", side_effect=fake_run)
+
+    info = collect_vllm_runtime_info(
+        cfg, prefer_cache=True, with_pip_check=False, cache_path=cache_path
+    )
+
+    assert info.vllm_version == "0.21.0"
+    # Cache rewritten with fresh data.
+    rewritten = json.loads(cache_path.read_text())
+    assert rewritten["vllm_version"] == "0.21.0"
+    assert rewritten["cache_key"] != "stale-key"
+
+
+def test_collect_vllm_runtime_info_does_not_run_pip_check_on_cheap_path(mocker, tmp_path):
+    vllm_bin, vllm_python = _build_venv(tmp_path)
+    cfg = mocker.Mock(vllm_bin=vllm_bin, vllm_python=vllm_python)
+    cache_path = tmp_path / "cache.json"
+
+    pip_calls: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:3] == [str(vllm_python), "-m", "pip"]:
+            pip_calls.append(list(cmd))
+            return mocker.Mock(returncode=0, stdout="", stderr="")
+        if cmd == [str(vllm_bin), "--version"]:
+            return mocker.Mock(returncode=0, stdout="vLLM 0.21.0\n", stderr="")
+        if cmd[:3] == [str(vllm_python), "-c", mocker.ANY]:
+            return mocker.Mock(
+                returncode=0,
+                stdout='{"vllm":"0.21.0","torch":"2.11.0","torch_cuda":"13.0","transformers":"5.6.2","huggingface_hub":"1.12.0"}\n',
+                stderr="",
+            )
+        raise AssertionError(cmd)
+
+    mocker.patch("vserve.runtime.subprocess.run", side_effect=fake_run)
+
+    info = collect_vllm_runtime_info(
+        cfg, prefer_cache=True, with_pip_check=False, cache_path=cache_path
+    )
+
+    assert info.vllm_version == "0.21.0"
+    assert info.pip_check_ok is None
+    assert pip_calls == []
+
+
+def test_invalidate_vllm_runtime_cache_removes_file(tmp_path):
+    from vserve.runtime import invalidate_vllm_runtime_cache
+
+    path = tmp_path / "cache.json"
+    path.write_text('{"schema_version":1}')
+    assert path.exists()
+
+    invalidate_vllm_runtime_cache(path)
+
+    assert not path.exists()
+    # Calling again is a no-op.
+    invalidate_vllm_runtime_cache(path)
 
 
 def test_build_tuning_fingerprint_includes_template_detector_runtime_and_files(tmp_path):

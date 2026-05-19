@@ -15,6 +15,42 @@ if TYPE_CHECKING:
     from vserve.models import ModelInfo
 
 
+# llama.cpp KV-cache element sizes (bytes per element), computed from the
+# packed block layout in ggml-quants.h. Block size is 32 elements; the per-
+# block overhead (scale, min, packed weights) yields the fractional totals.
+#
+# - f16/bf16 = 2 bytes (default)
+# - q8_0     = 32 q8 weights + 1×fp16 scale  → 34 / 32 = 1.0625
+# - q5_1     = 32×5b packed (20) + 2×fp16     → 24 / 32 = 0.75
+# - q5_0     = 32×5b packed (20) + 1×fp16     → 22 / 32 = 0.6875
+# - q4_1     = 32×4b packed (16) + 2×fp16     → 20 / 32 = 0.625
+# - q4_0     = 32×4b packed (16) + 1×fp16     → 18 / 32 = 0.5625
+# - iq4_nl   ≈ q4_0
+_KV_DTYPE_BYTES_PER_ELEMENT: dict[str, float] = {
+    "f16": 2.0,
+    "bf16": 2.0,
+    "f32": 4.0,
+    "q8_0": 1.0625,
+    "q5_1": 0.75,
+    "q5_0": 0.6875,
+    "q4_1": 0.625,
+    "q4_0": 0.5625,
+    "iq4_nl": 0.5625,
+}
+
+# K/V dtype candidates surfaced in tune output. We restrict the matrix to
+# symmetric pairs because llama.cpp's fused Flash-Attention kernel falls back
+# to a much slower path when K and V types don't match.
+_DEFAULT_KV_DTYPES: tuple[str, ...] = ("f16", "q8_0", "q4_1", "q4_0")
+
+_LLAMACPP_KV_DTYPE_QUALITY: dict[str, str] = {
+    "f16": "native",
+    "q8_0": "lossy; widely documented as near-zero quality cost",
+    "q4_1": "lossy; aggressive — validate with eval before adopting",
+    "q4_0": "lossy; most aggressive — validate with eval before adopting",
+}
+
+
 class LlamaCppBackend:
     name = "llamacpp"
     display_name = "llama.cpp"
@@ -115,7 +151,14 @@ class LlamaCppBackend:
         }
 
     def tune(self, model: ModelInfo, gpu: GpuInfo, *, gpu_mem_util: float = 0.90) -> dict:
-        """Calculate n-gpu-layers, context sizes, and parallel slots."""
+        """Calculate n-gpu-layers, context sizes, and a context × KV-dtype matrix.
+
+        The matrix mirrors the vLLM tune output: rows = context steps, columns =
+        symmetric (K, V) dtype pairs from `_DEFAULT_KV_DTYPES`. q8_0 typically
+        halves KV memory at near-zero quality loss; q4_0/q4_1 cut further with
+        more risk. Fused Flash-Attention requires K and V dtypes to match, so
+        only symmetric pairs are surfaced.
+        """
         selected = self._select_gguf_model_files(model.path)
         if selected is None:
             raise ValueError(f"No GGUF files in {model.path}")
@@ -130,7 +173,7 @@ class LlamaCppBackend:
         usable_gb = gpu.vram_total_gb * gpu_mem_util
         layer_size_gb = model_size_gb / num_layers if num_layers > 0 else model_size_gb
 
-        # Calculate n-gpu-layers (with 10% buffer for embeddings/scratch)
+        # n-gpu-layers (with 10% scratch buffer for embeddings)
         available_for_layers = usable_gb * 0.9
         n_gpu_layers = min(num_layers, int(available_for_layers / layer_size_gb)) if layer_size_gb > 0 else num_layers
         full_offload = n_gpu_layers >= num_layers
@@ -141,10 +184,32 @@ class LlamaCppBackend:
 
         from vserve.probe import _context_steps
         steps = _context_steps(max_context) if max_context >= 4096 else [4096]
-        limits: dict[str, int | None] = {}
+
+        # 2D matrix: { "<ctx>": { "f16": slots, "q8_0": slots, ... } }
+        limits: dict[str, dict[str, int | None]] = {}
         for ctx in steps:
-            parallel = self._max_parallel_slots_for_context(metadata, remaining_bytes, ctx)
-            limits[str(ctx)] = parallel if parallel >= 1 else None
+            row: dict[str, int | None] = {}
+            for dtype in _DEFAULT_KV_DTYPES:
+                slots = self._max_parallel_slots_for_context(
+                    metadata, remaining_bytes, ctx, k_dtype=dtype, v_dtype=dtype
+                )
+                row[dtype] = slots if slots >= 1 else None
+            limits[str(ctx)] = row
+
+        kv_dtype_profiles = self._kv_dtype_profiles(metadata)
+        recommended_kv = self._recommended_kv_dtype(limits)
+
+        # MoE awareness — when the model has expert_count > 1, surface a
+        # second slot table computed with `-ot ".ffn_.*_exps.=CPU"` so the
+        # user can see how much additional KV space CPU-offloading the
+        # expert FFNs would free.
+        moe_block = self._moe_block(
+            metadata,
+            model_size_gb=model_size_gb,
+            num_layers=num_layers,
+            usable_gb=usable_gb,
+            steps=steps,
+        )
 
         # Embedding model detection
         is_embedding = model.is_embedding
@@ -155,7 +220,7 @@ class LlamaCppBackend:
         tool_info = self.detect_tools(model.path) if not is_embedding else {}
 
         from datetime import datetime, timezone
-        result = {
+        result: dict = {
             "backend": "llamacpp",
             "model_path": str(model.path),
             "calculated_at": datetime.now(timezone.utc).isoformat(),
@@ -168,14 +233,140 @@ class LlamaCppBackend:
             "max_context": max_context,
             "supports_tools": tool_info.get("supports_tools", False),
             "supports_reasoning": tool_info.get("supports_reasoning", False),
+            "kv_cache_dtypes": kv_dtype_profiles,
+            "recommended_kv_dtype": recommended_kv,
             "limits": limits,
         }
+        if moe_block is not None:
+            result["moe"] = moe_block
         if not metadata:
             result["metadata_estimated"] = True
         if is_embedding:
             result["is_embedding"] = True
             result["pooling"] = pooling or "mean"
         return result
+
+    def _moe_block(
+        self,
+        metadata: dict,
+        *,
+        model_size_gb: float,
+        num_layers: int,
+        usable_gb: float,
+        steps: list[int],
+    ) -> dict | None:
+        """Compute MoE expert-CPU-offload (`-ot`) capacity numbers.
+
+        Returns None for non-MoE models. For MoE models, returns:
+        - the recommended -ot pattern
+        - estimated GPU-resident model size with `-ot` applied
+        - estimated VRAM freed
+        - a second (context × kv_dtype) slot table assuming `-ot` is on
+
+        Math: per-layer GPU element count without -ot is approximated as
+        attention + shared FFN + (expert_count × expert FFN). With -ot, the
+        expert FFN block moves to CPU, leaving attention + shared FFN.
+        The ratio gives an estimate of the GPU-resident fraction.
+        """
+        expert_count = self._positive_int(metadata.get("expert_count")) or 0
+        if expert_count <= 1:
+            return None
+
+        embedding = self._positive_int(metadata.get("embedding_length")) or 0
+        expert_ffn = self._positive_int(metadata.get("expert_feed_forward_length")) or 0
+        shared_ffn = self._positive_int(metadata.get("feed_forward_length")) or 0
+        if embedding <= 0 or expert_ffn <= 0:
+            # Can't estimate without these — surface a degenerate MoE block
+            return {
+                "is_moe": True,
+                "expert_count": expert_count,
+                "expert_used_count": self._positive_int(metadata.get("expert_used_count")) or 0,
+                "ot_pattern": ".ffn_.*_exps.=CPU",
+                "estimated_gpu_freed_gb": None,
+                "limits_with_ot": None,
+                "note": "MoE detected but expert FFN dimensions missing — could not estimate -ot savings",
+            }
+
+        # Element counts per layer (SwiGLU uses 3 projections: gate, up, down).
+        attn_elements = 4 * embedding * embedding  # q,k,v,o
+        shared_ffn_elements = 3 * embedding * shared_ffn if shared_ffn else 0
+        expert_ffn_elements = expert_count * 3 * embedding * expert_ffn
+        non_expert_elements = attn_elements + shared_ffn_elements
+        total_layer_elements = non_expert_elements + expert_ffn_elements
+        if total_layer_elements <= 0:
+            return None
+
+        expert_fraction = expert_ffn_elements / total_layer_elements
+        non_expert_fraction = 1.0 - expert_fraction
+
+        # Approximate GPU-resident model size with `-ot` applied. We keep the
+        # non-layer overhead (embedding table, output projection) on GPU; that
+        # overhead is approximated as 5% of the file in the absence of a
+        # better signal.
+        non_layer_fraction = 0.05
+        gpu_resident_with_ot_gb = (
+            model_size_gb * non_layer_fraction
+            + model_size_gb * (1 - non_layer_fraction) * non_expert_fraction
+        )
+        freed_gb = model_size_gb - gpu_resident_with_ot_gb
+
+        # Recompute KV cache room with the freed VRAM.
+        with_ot_usable = usable_gb - gpu_resident_with_ot_gb
+        with_ot_remaining_gb = max(0.0, with_ot_usable - usable_gb * 0.1)  # keep 10% scratch
+        with_ot_remaining_bytes = int(with_ot_remaining_gb * (1024**3))
+
+        limits_with_ot: dict[str, dict[str, int | None]] = {}
+        for ctx in steps:
+            row: dict[str, int | None] = {}
+            for dtype in _DEFAULT_KV_DTYPES:
+                slots = self._max_parallel_slots_for_context(
+                    metadata, with_ot_remaining_bytes, ctx, k_dtype=dtype, v_dtype=dtype
+                )
+                row[dtype] = slots if slots >= 1 else None
+            limits_with_ot[str(ctx)] = row
+
+        return {
+            "is_moe": True,
+            "expert_count": expert_count,
+            "expert_used_count": self._positive_int(metadata.get("expert_used_count")) or 0,
+            "expert_ffn_fraction": round(expert_fraction, 3),
+            "ot_pattern": ".ffn_.*_exps.=CPU",
+            "estimated_gpu_resident_gb": round(gpu_resident_with_ot_gb, 1),
+            "estimated_gpu_freed_gb": round(freed_gb, 1),
+            "limits_with_ot": limits_with_ot,
+        }
+
+    @staticmethod
+    def _kv_dtype_profiles(metadata: dict) -> dict[str, dict[str, object]]:
+        """Per-dtype byte cost relative to f16, mirroring the vLLM tune block."""
+        out: dict[str, dict[str, object]] = {}
+        f16_bpe = _KV_DTYPE_BYTES_PER_ELEMENT["f16"]
+        for dtype in _DEFAULT_KV_DTYPES:
+            bpe = _KV_DTYPE_BYTES_PER_ELEMENT.get(dtype, 2.0)
+            out[dtype] = {
+                "bytes_per_element": bpe,
+                "compression_ratio_vs_f16": round(f16_bpe / bpe, 2) if bpe else None,
+                "quality": _LLAMACPP_KV_DTYPE_QUALITY[dtype],
+            }
+        return out
+
+    @staticmethod
+    def _recommended_kv_dtype(limits: dict[str, dict[str, int | None]]) -> str | None:
+        """Default to f16 for safety; prefer q8_0 if it strictly beats f16 at
+        the largest context that fits any dtype, since q8_0 KV is documented
+        as having near-zero quality cost and unlocks ~2× more slots."""
+        if not limits:
+            return None
+        # Pick the largest context where at least one dtype fits.
+        for ctx_str in sorted(limits, key=int, reverse=True):
+            row = limits[ctx_str]
+            f16 = row.get("f16")
+            q8 = row.get("q8_0")
+            if q8 is not None and (f16 is None or q8 > f16):
+                return "q8_0"
+            if f16 is not None:
+                return "f16"
+        return None
 
     @staticmethod
     def _select_gguf_model_files(model_path: Path) -> tuple[Path, list[Path]] | None:
@@ -239,10 +430,20 @@ class LlamaCppBackend:
         return default
 
     @classmethod
-    def _max_parallel_slots_for_context(cls, metadata: dict, remaining_bytes: int, context: int) -> int:
+    def _max_parallel_slots_for_context(
+        cls,
+        metadata: dict,
+        remaining_bytes: int,
+        context: int,
+        *,
+        k_dtype: str = "f16",
+        v_dtype: str = "f16",
+    ) -> int:
         if context <= 0 or remaining_bytes <= 0:
             return 0
-        first_slot_bytes = cls._llamacpp_kv_cache_bytes(metadata, context=context, parallel=1)
+        first_slot_bytes = cls._llamacpp_kv_cache_bytes(
+            metadata, context=context, parallel=1, k_dtype=k_dtype, v_dtype=v_dtype
+        )
         if first_slot_bytes <= 0 or first_slot_bytes > remaining_bytes:
             return 0
 
@@ -250,7 +451,9 @@ class LlamaCppBackend:
         high = 1
         while high < 4096:
             candidate = min(high * 2, 4096)
-            if cls._llamacpp_kv_cache_bytes(metadata, context=context, parallel=candidate) > remaining_bytes:
+            if cls._llamacpp_kv_cache_bytes(
+                metadata, context=context, parallel=candidate, k_dtype=k_dtype, v_dtype=v_dtype
+            ) > remaining_bytes:
                 high = candidate - 1
                 break
             high = candidate
@@ -259,33 +462,49 @@ class LlamaCppBackend:
 
         while low < high:
             mid = (low + high + 1) // 2
-            if cls._llamacpp_kv_cache_bytes(metadata, context=context, parallel=mid) <= remaining_bytes:
+            if cls._llamacpp_kv_cache_bytes(
+                metadata, context=context, parallel=mid, k_dtype=k_dtype, v_dtype=v_dtype
+            ) <= remaining_bytes:
                 low = mid
             else:
                 high = mid - 1
         return low
 
     @classmethod
-    def _llamacpp_kv_cache_bytes(cls, metadata: dict, *, context: int, parallel: int) -> int:
+    def _llamacpp_kv_cache_bytes(
+        cls,
+        metadata: dict,
+        *,
+        context: int,
+        parallel: int,
+        k_dtype: str = "f16",
+        v_dtype: str = "f16",
+    ) -> int:
         num_layers = cls._positive_int(metadata.get("num_layers")) or 32
         key_length = cls._positive_int(metadata.get("key_length")) or cls._positive_int(metadata.get("head_dim")) or 128
         value_length = cls._positive_int(metadata.get("value_length")) or cls._positive_int(metadata.get("head_dim")) or key_length
         key_length_swa = cls._positive_int(metadata.get("key_length_swa")) or key_length
         value_length_swa = cls._positive_int(metadata.get("value_length_swa")) or value_length
         num_kv_heads = metadata.get("num_kv_heads", 8)
+        k_bpe = _KV_DTYPE_BYTES_PER_ELEMENT.get(k_dtype, 2.0)
+        v_bpe = _KV_DTYPE_BYTES_PER_ELEMENT.get(v_dtype, 2.0)
 
-        total = 0
+        total_f = 0.0
         for layer_index in range(num_layers):
             if cls._is_recurrent_layer(metadata, layer_index):
                 continue
             heads = cls._kv_heads_for_layer(num_kv_heads, layer_index)
             if cls._is_swa_layer(metadata, layer_index):
                 cells = cls._swa_cache_cells(metadata, context)
-                total += heads * (key_length_swa + value_length_swa) * 2 * cells * parallel
+                total_f += heads * key_length_swa * k_bpe * cells * parallel
+                total_f += heads * value_length_swa * v_bpe * cells * parallel
             else:
-                total += heads * (key_length + value_length) * 2 * context * parallel
-        total += cls._llamacpp_recurrent_state_bytes(metadata, parallel=parallel)
-        return total
+                total_f += heads * key_length * k_bpe * context * parallel
+                total_f += heads * value_length * v_bpe * context * parallel
+        # Recurrent state size is fp32-sized in llama.cpp and does not honour
+        # --cache-type-k/v — keep it as the existing helper computes.
+        recurrent = cls._llamacpp_recurrent_state_bytes(metadata, parallel=parallel)
+        return int(total_f) + recurrent
 
     @classmethod
     def _kv_heads_for_layer(cls, value: object, layer_index: int) -> int:
@@ -486,6 +705,11 @@ class LlamaCppBackend:
             or key.endswith(".block_count")
             or key.endswith(".context_length")
             or key.endswith(".embedding_length")
+            or key.endswith(".feed_forward_length")
+            or key.endswith(".expert_count")
+            or key.endswith(".expert_used_count")
+            or key.endswith(".expert_feed_forward_length")
+            or key.endswith(".expert_shared_count")
             or key.endswith(".attention.head_count")
             or key.endswith(".attention.head_count_kv")
             or key.endswith(".attention.key_length")
@@ -568,6 +792,13 @@ class LlamaCppBackend:
             "num_layers": num_layers,
             "max_context": max_context,
             "embedding_length": embedding_length,
+            "feed_forward_length": cls._gguf_int(values.get(f"{arch}.feed_forward_length"), 0),
+            "expert_count": cls._gguf_int(values.get(f"{arch}.expert_count"), 0),
+            "expert_used_count": cls._gguf_int(values.get(f"{arch}.expert_used_count"), 0),
+            "expert_feed_forward_length": cls._gguf_int(
+                values.get(f"{arch}.expert_feed_forward_length"), 0
+            ),
+            "expert_shared_count": cls._gguf_int(values.get(f"{arch}.expert_shared_count"), 0),
             "num_attn_heads": num_attn_heads,
             "num_kv_heads": num_kv_heads,
             "head_dim": key_length,
@@ -706,7 +937,17 @@ class LlamaCppBackend:
         return "mean"
 
     def build_config(self, model: ModelInfo, choices: dict) -> dict:
-        """Build llama-server JSON config."""
+        """Build llama-server JSON config.
+
+        Accepted choices keys:
+            context, n_gpu_layers, parallel, port,
+            tools, embedding, pooling,
+            kv_cache_k, kv_cache_v   — symmetric pair recommended (fused FA)
+            batch_size, ubatch_size  — llama-server -b / -ub
+            override_tensors         — list of patterns for -ot, e.g.
+                                       [".ffn_.*_exps.=CPU"] for MoE expert
+                                       CPU offloading.
+        """
         from vserve.config import cfg as vserve_cfg
 
         selected = self._select_gguf_model_files(model.path)
@@ -724,6 +965,19 @@ class LlamaCppBackend:
             "flash_attn": True,
             "gpu_index": int(getattr(vserve_cfg(), "gpu_index", 0) or 0),
         }
+        k_dtype = choices.get("kv_cache_k")
+        v_dtype = choices.get("kv_cache_v")
+        if k_dtype:
+            cfg["cache_type_k"] = str(k_dtype)
+        if v_dtype:
+            cfg["cache_type_v"] = str(v_dtype)
+        if choices.get("batch_size") is not None:
+            cfg["batch_size"] = int(choices["batch_size"])
+        if choices.get("ubatch_size") is not None:
+            cfg["ubatch_size"] = int(choices["ubatch_size"])
+        override = choices.get("override_tensors")
+        if isinstance(override, list) and override:
+            cfg["override_tensors"] = [str(item) for item in override]
         if choices.get("embedding"):
             cfg["embedding"] = True
             if choices.get("pooling"):
@@ -756,6 +1010,10 @@ class LlamaCppBackend:
             "ctx_size": "-c",
             "n_gpu_layers": "-ngl",
             "parallel": "-np",
+            "batch_size": "-b",
+            "ubatch_size": "-ub",
+            "cache_type_k": "-ctk",
+            "cache_type_v": "-ctv",
         }
         for key, flag in flag_map.items():
             if key in cfg:
@@ -769,6 +1027,17 @@ class LlamaCppBackend:
             args.extend(["--pooling", str(cfg["pooling"])])
         if cfg.get("jinja"):
             args.append("--jinja")
+        # Repeatable: --override-tensor / -ot for MoE expert CPU offloading
+        # and other selective offload patterns.
+        override_tensors = cfg.get("override_tensors", []) or []
+        for pattern in override_tensors:
+            args.extend(["-ot", str(pattern)])
+        # llama.cpp 67ace02+ emits a perf warning when --override-tensor is
+        # combined with mmap-enabled loading. Auto-disable mmap so the
+        # MoE-offload path runs on the fast loader by default. Users who
+        # need mmap on can hand-edit the generated config.
+        if override_tensors and not cfg.get("mmap", False):
+            args.append("--no-mmap")
 
         # Write per-model launch script + JSON alongside the config,
         # then symlink active.sh/active.json to them.

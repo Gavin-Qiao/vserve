@@ -283,7 +283,7 @@ class SessionHeld(Exception):
 class SessionUnknown(Exception):
     """Raised when a backend is active but no reliable owner marker exists."""
 
-    def __init__(self, reason: str = "A backend is running, but the owning user is unknown.") -> None:
+    def __init__(self, reason: str = "A backend is running, but no vserve session marker exists.") -> None:
         self.reason = reason
         super().__init__(reason)
 
@@ -455,7 +455,7 @@ def check_session(*, fail_on_probe_uncertainty: bool = False) -> None:
         return
     if info is None:
         backend_name = getattr(running_backend, "display_name", "A backend")
-        raise SessionUnknown(f"{backend_name} is running, but the owning user is unknown.")
+        raise SessionUnknown(f"{backend_name} is running, but no vserve session marker exists.")
     if info.user == current_user:
         return
     raise SessionHeld(info)

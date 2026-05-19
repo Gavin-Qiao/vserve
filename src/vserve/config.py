@@ -189,7 +189,7 @@ def _read_yaml_mapping(path: Path, *, warn: bool, label: str) -> dict | None:
     return data
 
 CONFIG_FILE = Path.home() / ".config" / "vserve" / "config.yaml"
-LIMITS_SCHEMA_VERSION = 4
+LIMITS_SCHEMA_VERSION = 5
 ACTIVE_MANIFEST_SCHEMA_VERSION = 1
 
 # Hardcoded defaults — used only when discovery fails and no config file exists.
