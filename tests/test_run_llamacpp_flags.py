@@ -14,6 +14,7 @@ from __future__ import annotations
 import pytest
 from typer.testing import CliRunner
 
+from _helpers import strip_ansi
 from vserve.cli import app
 
 runner = CliRunner()
@@ -73,7 +74,7 @@ class TestRunHelpShowsLlamacppFlags:
     ])
     def test_help_lists_flag(self, flag):
         result = runner.invoke(app, ["run", "--help"])
-        assert flag in result.stdout, f"{flag} missing from --help output"
+        assert flag in strip_ansi(result.stdout), f"{flag} missing from --help output"
 
 
 class TestPromptCacheFlagsThreadIntoChoices:
@@ -202,7 +203,7 @@ def _setup_vllm_yes_path(mocker, fake_model_dir, tmp_path):
 class TestThinkingFlagHelp:
     def test_help_lists_thinking(self):
         result = runner.invoke(app, ["run", "--help"])
-        assert "--thinking" in result.stdout
+        assert "--thinking" in strip_ansi(result.stdout)
 
 
 class TestThinkingFlagLlamacpp:

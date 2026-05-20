@@ -327,10 +327,19 @@ The registry auto-detects the right backend from the model format. Runtime check
 git clone https://github.com/Gavin-Qiao/vserve.git
 cd vserve
 uv sync --dev
-uv run pytest tests/              # 547 tests
+./scripts/install-hooks.sh        # wire up .githooks/ pre-commit + pre-push
+uv run pytest tests/              # full suite
 uv run ruff check src/ tests/     # lint
 uv run mypy src/vserve/ --ignore-missing-imports --check-untyped-defs
 ```
+
+The `install-hooks.sh` step points `core.hooksPath` at the tracked
+`.githooks/` directory. Once set, every `git commit` runs the same
+gates CI runs (ruff + mypy + pytest under `CI=true GITHUB_ACTIONS=true`
+and `COLUMNS=80`, so that anything green locally is green in CI), and
+every `git push` re-runs those plus a version-sync check and an
+`uv build` dry-run. Bypass with `--no-verify` only when you've already
+verified CI separately.
 
 ---
 

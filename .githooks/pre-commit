@@ -1,15 +1,31 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+# vserve pre-commit gate — fast, mirrors CI exactly.
+#
+# This hook runs the SAME commands and SAME env as
+# `.github/workflows/ci.yml` so anything green here is green in CI.
+#
+# Bypass with `git commit --no-verify` — but only when you intend to
+# fix the failure in a follow-up commit. CI will still gate the push.
+set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-echo "=== ruff ==="
+# Mirror GitHub Actions' env so Rich/Typer renders help text the way CI
+# sees it. Without these, --help assertions can pass locally and fail in
+# CI (see v0.6.3b1 ship: 9 tests failed in CI, all green locally).
+export CI=true
+export GITHUB_ACTIONS=true
+# Force a narrow terminal so Rich panel rendering doesn't accidentally
+# pass on a wide terminal what would wrap/break in CI's 80-col runner.
+export COLUMNS=80
+
+echo "=== ruff (lint) ==="
 uv run ruff check src/ tests/
 
-echo "=== mypy ==="
-uv run mypy src/vserve/ --ignore-missing-imports
+echo "=== mypy (typecheck) ==="
+uv run mypy src/vserve/ --ignore-missing-imports --check-untyped-defs
 
-echo "=== pytest ==="
+echo "=== pytest (full suite, CI env) ==="
 uv run pytest tests/ -q --tb=short
 
-echo "=== all checks passed ==="
+echo "=== pre-commit: all checks passed ==="

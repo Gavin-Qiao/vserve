@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 from typer.testing import CliRunner
 
+from _helpers import strip_ansi
 from vserve.bench import BenchResult
 from vserve.cli import app
 
@@ -80,13 +81,14 @@ class TestBenchCommandHelp:
     def test_bench_command_registered(self):
         result = runner.invoke(app, ["bench", "--help"])
         assert result.exit_code == 0
-        assert "bench" in result.stdout.lower()
+        assert "bench" in strip_ansi(result.stdout).lower()
 
     def test_bench_help_shows_duration_concurrency(self):
         result = runner.invoke(app, ["bench", "--help"])
         assert result.exit_code == 0
-        assert "--duration-s" in result.stdout
-        assert "--concurrency" in result.stdout
+        clean = strip_ansi(result.stdout)
+        assert "--duration-s" in clean
+        assert "--concurrency" in clean
 
 
 class TestBenchCommandWithRunningBackend:

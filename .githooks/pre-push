@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# vserve pre-push gate — last line of defence before shipping.
+#
+# Runs the same checks as pre-commit plus a few release-readiness
+# probes that would be wasteful on every commit but cheap on push.
+#
+# Bypass with `git push --no-verify` only when you've already verified
+# CI separately (e.g., on a feature branch that you know is green).
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Mirror CI env (see .githooks/pre-commit for rationale).
+export CI=true
+export GITHUB_ACTIONS=true
+export COLUMNS=80
+
+echo "=== ruff (lint) ==="
+uv run ruff check src/ tests/
+
+echo "=== mypy (typecheck) ==="
+uv run mypy src/vserve/ --ignore-missing-imports --check-untyped-defs
+
+echo "=== pytest (full suite, CI env) ==="
+uv run pytest tests/ -q --tb=short
+
+echo "=== version sync (pyproject vs __init__) ==="
+pyproj_v=$(grep -E '^version = ' pyproject.toml | head -1 | sed -E 's/version = "([^"]+)"/\1/')
+init_v=$(grep -E '^__version__ = ' src/vserve/__init__.py | head -1 | sed -E 's/__version__ = "([^"]+)"/\1/')
+if [ "$pyproj_v" != "$init_v" ]; then
+    echo "ERROR: pyproject.toml version ($pyproj_v) != __init__.py version ($init_v)"
+    exit 1
+fi
+echo "  $pyproj_v"
+
+echo "=== build (sdist + wheel) ==="
+# Catches packaging errors (missing files, broken metadata) before CI does.
+rm -rf dist/
+uv build --quiet
+ls dist/
+
+echo "=== pre-push: all checks passed ==="

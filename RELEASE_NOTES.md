@@ -1,6 +1,6 @@
-# vserve 0.6.3b1 Release Notes (beta)
+# vserve 0.6.3b2 Release Notes (beta)
 
-> **Beta gate.** `0.6.3b1` ships as a **pre-release** because the original
+> **Beta gate.** `0.6.3b2` ships as a **pre-release** because the original
 > failing config — Qwen3.5-4B at 128k × 11 with `turboquant_3bit_nc`, the
 > crash that motivated the AA fix in 0.6.1 — has **not yet been re-run
 > against an idle GPU**. Static, lint, type, and unit-test gates are all
@@ -9,6 +9,34 @@
 > figures, NVFP4 routing, and TRITON_ATTN selection as **best-effort
 > until a `0.6.3` final** confirms them on hardware. Production deploys
 > should pin `0.6.0` and migrate after `0.6.3` final ships.
+
+## 0.6.3b2 — CI fix + hook hardening (since b1)
+
+The `0.6.3b1` ship surfaced a real CI gap: 9 `--help` tests passed
+locally and failed in GitHub Actions. Root cause was Rich/Typer
+emitting per-character style spans
+(`\x1b[1;36m-\x1b[0m\x1b[1;36m-flag\x1b[0m`) when `CI=true` +
+`GITHUB_ACTIONS=true` are set, which breaks naive
+`"--flag" in stdout` substring assertions.
+
+**Fixes:**
+- `tests/_helpers.py` adds `strip_ansi()`. The 9 affected
+  `--help` assertions in `tests/test_run_llamacpp_flags.py` and
+  `tests/test_bench_command.py` now run `strip_ansi(result.stdout)`
+  before substring checks. Regression verified: under
+  `CI=true GITHUB_ACTIONS=true COLUMNS=80`, all 951 tests pass.
+
+**Hook hardening (so this class of regression can't ship again):**
+- `.githooks/pre-commit` rewritten — mirrors the CI workflow exactly:
+  `ruff` + `mypy --check-untyped-defs` + full `pytest` (no `-x`) under
+  `CI=true GITHUB_ACTIONS=true COLUMNS=80`. What's green locally is
+  green in CI.
+- `.githooks/pre-push` (new) — same gates plus a `pyproject.toml` ↔
+  `__init__.py` version-sync check and an `uv build` dry-run, so a
+  packaging error can't make it onto the wire.
+- `scripts/install-hooks.sh` (new) — wires
+  `git config --local core.hooksPath .githooks`. README's Development
+  section documents the one-line install.
 
 `0.6.3b1` is the cumulative beta. It rolls in **0.6.1** (research bundle —
 21 items across vLLM 0.21+ / llama.cpp b9222+ / Unsloth Dynamic 2.0 /
