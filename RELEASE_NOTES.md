@@ -1,23 +1,79 @@
-# vserve 0.6.1b1 Release Notes (beta)
+# vserve 0.6.3b1 Release Notes (beta)
 
-> **Beta gate.** `0.6.1b1` ships as a **pre-release** because the original
+> **Beta gate.** `0.6.3b1` ships as a **pre-release** because the original
 > failing config — Qwen3.5-4B at 128k × 11 with `turboquant_3bit_nc`, the
-> crash that motivated the AA fix — has **not yet been re-run against an
-> idle GPU**. Static, lint, type, and unit-test gates are all green
-> (885/885), but live end-to-end verification of TurboQuant
-> workspace-lock pre-emption is deferred until the workstation GPU is
-> free. Treat tok/s figures, NVFP4 routing, and TRITON_ATTN selection as
-> **best-effort until a `0.6.1` final** confirms them on hardware.
-> Production deploys should pin `0.6.0` and migrate after `0.6.1` final
-> ships.
+> crash that motivated the AA fix in 0.6.1 — has **not yet been re-run
+> against an idle GPU**. Static, lint, type, and unit-test gates are all
+> green, but live end-to-end verification of TurboQuant workspace-lock
+> pre-emption is deferred until the workstation GPU is free. Treat tok/s
+> figures, NVFP4 routing, and TRITON_ATTN selection as **best-effort
+> until a `0.6.3` final** confirms them on hardware. Production deploys
+> should pin `0.6.0` and migrate after `0.6.3` final ships.
 
-`0.6.1b1` bundles the full output of a multi-stream best-practices research
-pass (vLLM 0.21+, llama.cpp b9222+, Unsloth Dynamic 2.0, Gemma 4 family).
-0.6.0 closed seven tuner-correctness defects discovered by live debugging;
-0.6.1 closes the structural gaps that 0.6.0's research surface revealed —
-twenty-one items across five areas. The release is bundled (one ship
-cycle, one CI run, one changelog) and organized below by area so users
-scanning for "what changed for my model" can find their section quickly.
+`0.6.3b1` is the cumulative beta. It rolls in **0.6.1** (research bundle —
+21 items across vLLM 0.21+ / llama.cpp b9222+ / Unsloth Dynamic 2.0 /
+Gemma 4 family), **0.6.2** (CLI plumbing for the 0.6.1 recipe modules),
+and the **0.6.3 de-spaghetti refactor** that consolidates patch sediment
+accumulated since 0.5.x.
+
+**Major changes since 0.6.0** (organised by phase):
+
+### 0.6.1 — research bundle
+21 structural items across five areas — see the corrections, vLLM-side,
+llama.cpp-side, tuning+bench, and measurement-layer sections below.
+
+### 0.6.2 — CLI plumbing for the recipe modules
+- `vserve bench` subcommand — drives the streaming benchmark (TTFT / TPOT /
+  ITL / E2E percentiles) against the live backend; writes to perf cache.
+- New CLI flags reach the 0.6.1 backend plumbing:
+  `--cache-reuse`, `--cram-mb`, `--slot-save-path`, `--swa-full`,
+  `--n-cpu-moe`, `--reasoning-budget`, `--thinking/--no-thinking`.
+- Five forward-looking research reports while the GPU was unavailable
+  (KV memory math, spec-decode acceptance, MoE offload economics, LoRA,
+  quant-aware sampling) — see `docs/research/2026-05-20-*.md`.
+
+### 0.6.3 — de-spaghetti refactor
+A 5-agent audit (`docs/audits/2026-05-20-*.md`) surfaced 4 real runtime
+bugs and structural cruft predating 0.6.1. The refactor plan is in
+`docs/plans/2026-05-20-v063-refactor-plan.md`. Highlights:
+
+**Bug fixes:**
+- `Qwen36MoeForCausalLM` was missing from the reasoning-parser registry —
+  `<think>` was leaking into `message.content` on Qwen 3.6 MoE.
+- `arch[:5]` family check collided Gemma3 / Gemma4 in spec-decode vocab
+  compatibility — replaced by a canonical `family_of()` helper in the
+  new `arch_registry.py`.
+- FlashInfer MoE FP4 env vars were emitted unconditionally; now gated on
+  `gpu.compute_cap >= 100`.
+- `GptOssMoeForCausalLM` was a typo in `SPEC_BLOCKLIST` (every other
+  registry uses `GptOssForCausalLM`); corrected.
+
+**Structural:**
+- New `src/vserve/arch_registry.py` — single canonical home for all
+  arch-keyed tables (tool-parser, reasoning-parser, forced-backend,
+  GGUF→HF arch mapping) plus `family_of(arch)` and `is_thinking_default(arch)`.
+- `cli.py` shrunk **6,136 → 5,089 lines (−17%)**. Domain logic moved to:
+  - `vserve.diagnostics` — engine-log failure pattern matching.
+  - `vserve.downloader` — pure HF-download helpers (~10 functions).
+  - `vserve.picker` — limits-table parsing + scripted-config default
+    chooser (vLLM + llama.cpp).
+  - `vserve.cli_doctor` — the entire `vserve doctor` body (514 lines
+    incl. 364-line nested helper closure).
+- Backends symmetrised:
+  - `vserve.systemd_helpers` — shared systemctl-call primitive and
+    unit-safety asserter; both backends use them.
+  - `llamacpp.runtime_info` / `compatibility` migrated from ad-hoc
+    dicts to the canonical `RuntimeIdentity` / `CompatibilityResult`
+    dataclasses.
+  - Protocol return types tightened (dropped `| Any` papering).
+  - New `Choices` TypedDict in `protocol.py` documents the per-backend
+    key-ownership split flagged by audit.
+- Helpers + Pattern cleanup:
+  - 5× repeated `read_limits(limits_path(...))` collapsed into a
+    `read_limits_for(provider, model_name)` helper in `config.py`.
+- Dead code removed: `compare.py`, `_is_multimodal_model()`,
+  `read_timing` / `write_timing` / `timing_path`, dead
+  `recipes/__init__.py` re-exports.
 
 The probe-based tune redesign (`docs/plans/2026-05-19-tune-redesign-probe.md`)
 stays separate as the next minor release — items below remove ~90% of the

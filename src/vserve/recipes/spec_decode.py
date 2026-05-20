@@ -42,7 +42,7 @@ SPEC_METHOD_BY_ARCH: dict[str, str] = {
 SPEC_BLOCKLIST: frozenset[str] = frozenset({
     "Qwen3A3BForCausalLM",
     "Qwen3MoeForCausalLM",
-    "GptOssMoeForCausalLM",
+    "GptOssForCausalLM",  # was misspelled as GptOssMoeForCausalLM — never matched any model
     "MixtralForCausalLM",
     "DeepseekV2ForCausalLM",
 })
@@ -65,12 +65,23 @@ def vocab_compatible(target_arch: str, target_bos: int | None, target_eos: int |
     """Spec-decode requires identical tokenizers. Compare BOS/EOS pair and
     architecture family. Architectures must match on the family root (e.g.
     Qwen3* with Qwen3*), tokenizer must match BOS+EOS exactly.
+
+    0.6.3 bug fix 2: previously this used ``arch[:5]`` for family matching,
+    which collided ``Gemma3`` and ``Gemma4`` (5-letter shared prefix). It
+    now uses :func:`vserve.arch_registry.family_of` so Gemma3 vs Gemma4
+    (different tokenizers, incompatible vocab for spec-decode) are
+    correctly distinguished.
     """
+    from vserve.arch_registry import family_of
+
     if not target_arch or not draft.architecture:
         return False
-    # Family match: shared prefix of "ForCausalLM" minus suffix; conservative
-    # check: first 5 characters must agree (Qwen3, Llama, Deeps, ...).
-    if target_arch[:5] != draft.architecture[:5]:
+    target_family = family_of(target_arch)
+    draft_family = family_of(draft.architecture)
+    if target_family is None or draft_family is None:
+        # Unknown arch — be conservative and refuse spec-decode.
+        return False
+    if target_family != draft_family:
         return False
     if target_bos is None or target_eos is None:
         return False

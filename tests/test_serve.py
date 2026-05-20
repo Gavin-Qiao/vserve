@@ -67,7 +67,7 @@ def test_start_vllm_with_config(mocker, tmp_path):
 
 def test_systemctl_start_noninteractive_uses_sudo_n(mocker):
     _mock_cfg(mocker)
-    mock_run = mocker.patch("vserve.serve.subprocess.run", return_value=Mock(returncode=0, stdout="", stderr=""))
+    mock_run = mocker.patch("vserve.systemd_helpers.subprocess.run", return_value=Mock(returncode=0, stdout="", stderr=""))
 
     ok, _out, _err = __import__("vserve.serve", fromlist=["_systemctl"])._systemctl(
         "start",
@@ -99,13 +99,18 @@ def test_systemctl_rejects_unit_that_does_not_belong_to_vserve(mocker, tmp_path)
     _mock_cfg(mocker, service_name="ssh")
     unit = tmp_path / "ssh.service"
     unit.write_text("[Service]\nExecStart=/usr/sbin/sshd -D\n")
-    mocker.patch("vserve.serve.find_systemd_unit_path", return_value=unit)
-    run = mocker.patch("vserve.serve.subprocess.run")
+    # 0.6.3: assert_unit_safe (called via systemd_helpers) imports
+    # find_systemd_unit_path from vserve.config directly, so we patch at
+    # the systemd_helpers namespace.
+    mocker.patch("vserve.systemd_helpers.find_systemd_unit_path", return_value=unit)
+    run = mocker.patch("vserve.systemd_helpers.subprocess.run")
 
     ok, _out, err = __import__("vserve.serve", fromlist=["_systemctl"])._systemctl("start")
 
     assert ok is False
-    assert "does not look like a vserve vLLM unit" in err
+    # Case-insensitive — 0.6.3 systemd_helpers refactor lowercased the
+    # backend label since `backend_name` is now passed as `"vllm"`.
+    assert "does not look like a vserve vllm unit" in err.lower()
     run.assert_not_called()
 
 
@@ -157,7 +162,7 @@ def test_start_vllm_rolls_back_active_link_on_systemctl_failure(mocker, tmp_path
 
 def test_systemctl_uses_service_name(mocker):
     _mock_cfg(mocker, service_name="my-vllm")
-    mock_run = mocker.patch("vserve.serve.subprocess.run", return_value=Mock(returncode=0, stdout="active", stderr=""))
+    mock_run = mocker.patch("vserve.systemd_helpers.subprocess.run", return_value=Mock(returncode=0, stdout="active", stderr=""))
     is_vllm_running()
     args = mock_run.call_args[0][0]
     assert "my-vllm" in args
@@ -165,7 +170,7 @@ def test_systemctl_uses_service_name(mocker):
 
 def test_systemctl_uses_timeout(mocker):
     _mock_cfg(mocker)
-    mock_run = mocker.patch("vserve.serve.subprocess.run", return_value=Mock(returncode=0, stdout="active", stderr=""))
+    mock_run = mocker.patch("vserve.systemd_helpers.subprocess.run", return_value=Mock(returncode=0, stdout="active", stderr=""))
     is_vllm_running()
     assert mock_run.call_args.kwargs["timeout"] == 5
 
@@ -187,7 +192,7 @@ def test_is_vllm_running_missing_unit_is_false(mocker):
 
 def test_systemctl_timeout_returns_error(mocker):
     _mock_cfg(mocker)
-    mocker.patch("vserve.serve.subprocess.run", side_effect=__import__("subprocess").TimeoutExpired(cmd="systemctl", timeout=5))
+    mocker.patch("vserve.systemd_helpers.subprocess.run", side_effect=__import__("subprocess").TimeoutExpired(cmd="systemctl", timeout=5))
     ok, out, err = __import__("vserve.serve", fromlist=["_systemctl"])._systemctl("start", timeout=5)
     assert ok is False
     assert out == ""
@@ -219,7 +224,8 @@ def test_stop_vllm_failure(mocker):
 
 
 def test_resolve_quant_envs_nvfp4(mocker, tmp_path):
-    """NVFP4-quantized model → emit FlashInfer envs into the env file."""
+    """NVFP4-quantized model on sm≥100 → emit FlashInfer envs into the env file."""
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=Mock(compute_cap=120))
     from vserve.serve import _resolve_quant_envs
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text("quantization: nvfp4\nmodel: /tmp/x\n")
@@ -228,13 +234,72 @@ def test_resolve_quant_envs_nvfp4(mocker, tmp_path):
     assert envs.get("VLLM_FLASHINFER_MOE_BACKEND") == "throughput"
 
 
-def test_resolve_quant_envs_modelopt_alias(tmp_path):
-    """ModelOpt-NVFP4 checkpoints also need FlashInfer envs."""
+def test_resolve_quant_envs_modelopt_alias(mocker, tmp_path):
+    """ModelOpt-NVFP4 checkpoints also need FlashInfer envs on sm≥100."""
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=Mock(compute_cap=120))
     from vserve.serve import _resolve_quant_envs
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text("quantization: modelopt\nmodel: /tmp/x\n")
     envs = _resolve_quant_envs(cfg_path)
     assert envs.get("VLLM_USE_FLASHINFER_MOE_FP4") == "1"
+
+
+# --- 0.6.3 bug fix 3: hardware-gate FlashInfer FP4 envs on sm≥100 ---
+
+
+def test_resolve_quant_envs_nvfp4_filtered_on_ada(mocker, tmp_path):
+    """0.6.3 bug fix 3: FlashInfer FP4 envs require sm≥100. On Ada (sm89)
+    the envs must be filtered out so vLLM falls back to the non-FlashInfer
+    path instead of setting flags the kernel won't honor."""
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=Mock(compute_cap=89))
+    from vserve.serve import _resolve_quant_envs
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("quantization: nvfp4\nmodel: /tmp/x\n")
+    envs = _resolve_quant_envs(cfg_path)
+    assert "VLLM_USE_FLASHINFER_MOE_FP4" not in envs
+    assert "VLLM_FLASHINFER_MOE_BACKEND" not in envs
+
+
+def test_resolve_quant_envs_nvfp4_filtered_on_hopper(mocker, tmp_path):
+    """Hopper (sm90) is also below the sm≥100 FlashInfer FP4 cutoff."""
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=Mock(compute_cap=90))
+    from vserve.serve import _resolve_quant_envs
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("quantization: nvfp4\nmodel: /tmp/x\n")
+    envs = _resolve_quant_envs(cfg_path)
+    assert "VLLM_USE_FLASHINFER_MOE_FP4" not in envs
+
+
+def test_resolve_quant_envs_nvfp4_allowed_on_dc_blackwell(mocker, tmp_path):
+    """Blackwell DC (B200, sm100) is exactly at the cutoff — must allow."""
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=Mock(compute_cap=100))
+    from vserve.serve import _resolve_quant_envs
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("quantization: nvfp4\nmodel: /tmp/x\n")
+    envs = _resolve_quant_envs(cfg_path)
+    assert envs.get("VLLM_USE_FLASHINFER_MOE_FP4") == "1"
+
+
+def test_resolve_quant_envs_nvfp4_filtered_when_compute_cap_unknown(mocker, tmp_path):
+    """Conservative: when compute_cap is None (older nvidia-smi or detection
+    failure), filter the FP4 envs to avoid silent kernel-version mismatch."""
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=Mock(compute_cap=None))
+    from vserve.serve import _resolve_quant_envs
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("quantization: nvfp4\nmodel: /tmp/x\n")
+    envs = _resolve_quant_envs(cfg_path)
+    assert "VLLM_USE_FLASHINFER_MOE_FP4" not in envs
+
+
+def test_resolve_quant_envs_nvfp4_filtered_when_gpu_info_raises(mocker, tmp_path):
+    """When get_gpu_info raises (e.g. no nvidia-smi available), filter
+    conservatively — better to lose a kernel optimization than crash."""
+    mocker.patch("vserve.gpu.get_gpu_info", side_effect=RuntimeError("nvidia-smi missing"))
+    from vserve.serve import _resolve_quant_envs
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("quantization: nvfp4\nmodel: /tmp/x\n")
+    envs = _resolve_quant_envs(cfg_path)
+    assert "VLLM_USE_FLASHINFER_MOE_FP4" not in envs
 
 
 def test_resolve_quant_envs_no_quant_returns_empty(tmp_path):

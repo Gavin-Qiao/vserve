@@ -1,6 +1,5 @@
 """Start/stop vLLM via systemd."""
 
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8,54 +7,38 @@ from vserve.config import (
     cfg,
     find_systemd_unit_path,
     read_profile_yaml,
-    unit_content_matches_backend,
     unit_uses_environment_file,
-    validate_systemd_service_name,
     write_active_manifest,
 )
 
 
 def _assert_vllm_unit_safe_for_privileged_action() -> None:
-    service_name = cfg().service_name
-    validate_systemd_service_name(service_name)
-    unit = find_systemd_unit_path(service_name)
-    if unit is None:
-        return
-    try:
-        content = unit.read_text()
-    except (OSError, UnicodeDecodeError) as exc:
-        raise RuntimeError(f"Cannot verify {service_name}.service before privileged systemctl action: {exc}") from None
-    if not unit_content_matches_backend(
-        content,
+    """vLLM-specific wrapper around the shared :func:`assert_unit_safe`."""
+    from vserve.systemd_helpers import assert_unit_safe
+
+    c = cfg()
+    assert_unit_safe(
+        service_name=c.service_name,
         backend_name="vllm",
-        root=cfg().vllm_root,
-        expected_paths=[cfg().active_yaml],
-    ):
-        raise RuntimeError(f"{service_name}.service does not look like a vserve vLLM unit")
+        root=c.vllm_root,
+        expected_paths=[c.active_yaml],
+    )
 
 
 def _systemctl(action: str, timeout: int = 30, *, non_interactive: bool = False) -> tuple[bool, str, str]:
-    command = ["systemctl", action, cfg().service_name]
-    if action in {"start", "stop", "restart", "reload"}:
-        try:
-            _assert_vllm_unit_safe_for_privileged_action()
-        except Exception as exc:
-            return False, "", str(exc)
-        if non_interactive:
-            command.insert(0, "-n")
-        command.insert(0, "sudo")
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "", f"systemctl {action} timed out after {timeout}s"
-    except Exception as exc:
-        return False, "", str(exc)
-    return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
+    """Thin wrapper over :func:`systemctl_call` pinned to vLLM's service name.
+
+    Extracted in 0.6.3 — see ``vserve.systemd_helpers``.
+    """
+    from vserve.systemd_helpers import systemctl_call
+
+    return systemctl_call(
+        cfg().service_name,
+        action,
+        timeout=timeout,
+        non_interactive=non_interactive,
+        asserter=_assert_vllm_unit_safe_for_privileged_action,
+    )
 
 
 def _update_active_symlink(config_path: Path) -> None:
@@ -158,6 +141,11 @@ def _resolve_quant_envs(config_path: Path) -> dict[str, str]:
     Used by ``start_vllm`` to write `VLLM_USE_FLASHINFER_MOE_FP4=1` etc. into
     the env file when the launched model uses NVFP4 / ModelOpt-NVFP4 / MXFP4.
     Silent fallthrough on read errors — env vars are advisory.
+
+    The FlashInfer FP4 MoE kernel requires sm≥100 (Blackwell DC or RTX).
+    When the active GPU's compute capability is below that, the FP4 envs are
+    silently filtered out — vLLM falls back to the non-FlashInfer path
+    instead of setting flags the kernel won't honor.
     """
     try:
         data = read_profile_yaml(config_path) or {}
@@ -169,9 +157,20 @@ def _resolve_quant_envs(config_path: Path) -> dict[str, str]:
     from vserve.models import QUANT_ENV_VARS
     # Map vLLM `--quantization` strings back to env-table keys.
     qkey = quant.lower()
-    if qkey in QUANT_ENV_VARS:
-        return dict(QUANT_ENV_VARS[qkey])
-    return {}
+    if qkey not in QUANT_ENV_VARS:
+        return {}
+    envs = dict(QUANT_ENV_VARS[qkey])
+    # Hardware-gate the FlashInfer FP4 MoE backend on sm≥100.
+    if "VLLM_USE_FLASHINFER_MOE_FP4" in envs:
+        try:
+            from vserve.gpu import get_gpu_info
+            cap = get_gpu_info().compute_cap
+        except Exception:
+            cap = None
+        if cap is None or cap < 100:
+            envs.pop("VLLM_USE_FLASHINFER_MOE_FP4", None)
+            envs.pop("VLLM_FLASHINFER_MOE_BACKEND", None)
+    return envs
 
 
 def _service_uses_env_file(env_path: Path) -> bool:

@@ -633,7 +633,7 @@ class TestLlamaCppTune:
 class TestLlamaCppLifecycle:
     def test_start_calls_systemctl(self, mocker, tmp_path):
         b = LlamaCppBackend()
-        mock_run = mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mock_run = mocker.patch("vserve.systemd_helpers.subprocess.run",
                                 return_value=Mock(returncode=0, stdout="", stderr=""))
         mocker.patch("vserve.backends.llamacpp.shutil.copy2")
 
@@ -661,14 +661,14 @@ class TestLlamaCppLifecycle:
 
     def test_stop_calls_systemctl(self, mocker):
         b = LlamaCppBackend()
-        mock_run = mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mock_run = mocker.patch("vserve.systemd_helpers.subprocess.run",
                                 return_value=Mock(returncode=0, stdout="", stderr=""))
         b.stop()
         assert mock_run.call_args[0][0][-1] == "llama-cpp"
 
     def test_is_running(self, mocker):
         b = LlamaCppBackend()
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="active", stderr=""))
         assert b.is_running() is True
 
@@ -677,7 +677,7 @@ class TestLlamaCppLifecycle:
 
         b = LlamaCppBackend()
         mocker.patch(
-            "vserve.backends.llamacpp.subprocess.run",
+            "vserve.systemd_helpers.subprocess.run",
             return_value=Mock(returncode=1, stdout="", stderr="dbus error"),
         )
         with pytest.raises(RuntimeError, match="systemctl is-active"):
@@ -686,7 +686,7 @@ class TestLlamaCppLifecycle:
     def test_is_running_missing_unit_is_false(self, mocker):
         b = LlamaCppBackend()
         mocker.patch(
-            "vserve.backends.llamacpp.subprocess.run",
+            "vserve.systemd_helpers.subprocess.run",
             return_value=Mock(returncode=1, stdout="", stderr="Unit llama-cpp.service could not be found."),
         )
         assert b.is_running() is False
@@ -696,7 +696,7 @@ class TestLlamaCppLifecycle:
 
         b = LlamaCppBackend()
         mocker.patch(
-            "vserve.backends.llamacpp.subprocess.run",
+            "vserve.systemd_helpers.subprocess.run",
             return_value=Mock(returncode=3, stdout="activating", stderr=""),
         )
         with pytest.raises(RuntimeError, match="is transitional"):
@@ -705,7 +705,7 @@ class TestLlamaCppLifecycle:
     def test_start_uses_configured_service_name(self, mocker, tmp_path):
         b = LlamaCppBackend()
         mock_run = mocker.patch(
-            "vserve.backends.llamacpp.subprocess.run",
+            "vserve.systemd_helpers.subprocess.run",
             return_value=Mock(returncode=0, stdout="", stderr=""),
         )
         mocker.patch(
@@ -731,7 +731,7 @@ class TestLlamaCppLifecycle:
 
     def test_is_not_running(self, mocker):
         b = LlamaCppBackend()
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=3, stdout="inactive", stderr=""))
         assert b.is_running() is False
 
@@ -759,13 +759,15 @@ class TestLlamaCppRuntimeInfo:
         exe.write_text("")
         mocker.patch.object(b, "find_entrypoint", return_value=exe)
         run = mocker.patch(
-            "vserve.backends.llamacpp.subprocess.run",
+            "vserve.systemd_helpers.subprocess.run",
             return_value=Mock(returncode=0, stdout="llama-server 2026\n", stderr=""),
         )
 
         info = b.runtime_info()
 
-        assert info["llama_server_version"] == "llama-server 2026"
+        # 0.6.3: runtime_info now returns RuntimeIdentity dataclass (was dict).
+        assert info.version == "llama-server 2026"
+        assert info.details["llama_server_version"] == "llama-server 2026"
         run.assert_called_once_with([str(exe), "--version"], capture_output=True, text=True, timeout=10)
 
     def test_compatibility_fails_without_entrypoint(self, mocker):
@@ -774,8 +776,9 @@ class TestLlamaCppRuntimeInfo:
 
         result = b.compatibility()
 
-        assert result["supported"] is False
-        assert "entrypoint not found" in result["errors"][0]
+        # 0.6.3: compatibility now returns CompatibilityResult dataclass (was dict).
+        assert result.supported is False
+        assert "entrypoint not found" in result.errors[0]
 
 
 class TestLlamaCppDoctorChecks:
@@ -792,7 +795,7 @@ class TestLlamaCppStartFailure:
     def test_start_raises_on_failure(self, mocker, tmp_path):
         import pytest
         b = LlamaCppBackend()
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=1, stdout="", stderr="Unit not found"))
         mocker.patch("vserve.backends.llamacpp.shutil.copy2")
         active = tmp_path / "active.sh"
@@ -811,7 +814,7 @@ class TestLlamaCppStartFailure:
 
         b = LlamaCppBackend()
         mocker.patch(
-            "vserve.backends.llamacpp.subprocess.run",
+            "vserve.systemd_helpers.subprocess.run",
             return_value=Mock(returncode=1, stdout="", stderr="Unit not found"),
         )
         mocker.patch.object(b, "find_entrypoint", return_value="/opt/llama-cpp/bin/llama-server")
@@ -850,7 +853,7 @@ class TestLlamaCppLaunchScript:
         """Launch script has correct flags and is shell-safe."""
         import json
         b = LlamaCppBackend()
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
 
         active = tmp_path / "configs" / "active.sh"
@@ -885,7 +888,7 @@ class TestLlamaCppLaunchScript:
     def test_script_exports_configured_gpu_index(self, mocker, tmp_path):
         import json
         b = LlamaCppBackend()
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
         mocker.patch("vserve.config.cfg", return_value=Mock(gpu_index=2))
 
@@ -912,7 +915,7 @@ class TestLlamaCppLaunchScript:
         """Model paths with spaces are properly quoted in script."""
         import json
         b = LlamaCppBackend()
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
 
         active = tmp_path / "configs" / "active.sh"
@@ -1019,7 +1022,7 @@ class TestLlamaCppEmbedding:
         """Launch script includes --embedding and --pooling flags."""
         import json
         b = LlamaCppBackend()
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
 
         active = tmp_path / "configs" / "active.sh"
@@ -1046,7 +1049,7 @@ class TestLlamaCppEmbedding:
         """Launch script respects cls pooling for BGE models."""
         import json
         b = LlamaCppBackend()
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
 
         active = tmp_path / "configs" / "active.sh"
@@ -1071,7 +1074,7 @@ class TestLlamaCppEmbedding:
         """No --pooling flag when pooling is not set."""
         import json
         b = LlamaCppBackend()
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
 
         active = tmp_path / "configs" / "active.sh"
@@ -1195,7 +1198,7 @@ class TestLlamaCppEmbedding:
         active.parent.mkdir(parents=True, exist_ok=True)
         mocker.patch.object(b, "_active_config_path", return_value=active)
         mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
-        run = mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        run = mocker.patch("vserve.systemd_helpers.subprocess.run",
                            return_value=Mock(returncode=0, stdout="", stderr=""))
 
         b.start(cfg_path)
@@ -1233,7 +1236,7 @@ class TestLlamaCppEmbedding:
         active.parent.mkdir(parents=True, exist_ok=True)
         mocker.patch.object(b, "_active_config_path", return_value=active)
         mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
 
         b.start(cfg_path)
@@ -1263,7 +1266,7 @@ class TestLlamaCppEmbedding:
         active.parent.mkdir(parents=True, exist_ok=True)
         mocker.patch.object(b, "_active_config_path", return_value=active)
         mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
 
         b.start(cfg_path)
@@ -1346,7 +1349,7 @@ class TestLlamaCppFitOff:
         active.parent.mkdir(parents=True, exist_ok=True)
         mocker.patch.object(b, "_active_config_path", return_value=active)
         mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
 
         b.start(cfg_path)
@@ -1451,7 +1454,7 @@ class TestLlamaCppSamplingDefaults:
         active.parent.mkdir(parents=True, exist_ok=True)
         mocker.patch.object(b, "_active_config_path", return_value=active)
         mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
         b.start(cfg_path)
         script = active.read_text()
@@ -1533,7 +1536,7 @@ class TestLlamaCppChatTemplateKwargs:
         active.parent.mkdir(parents=True, exist_ok=True)
         mocker.patch.object(b, "_active_config_path", return_value=active)
         mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
         b.start(cfg_path)
         script = active.read_text()
@@ -1561,7 +1564,7 @@ class TestLlamaCppChatTemplateKwargs:
         active.parent.mkdir(parents=True, exist_ok=True)
         mocker.patch.object(b, "_active_config_path", return_value=active)
         mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
         b.start(cfg_path)
         script = active.read_text()
@@ -1631,7 +1634,7 @@ class TestLlamaCppNCpuMoe:
         active.parent.mkdir(parents=True, exist_ok=True)
         mocker.patch.object(b, "_active_config_path", return_value=active)
         mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
         b.start(cfg_path)
         script = active.read_text()
@@ -1845,7 +1848,7 @@ class TestLlamaCppMmproj:
         active.parent.mkdir(parents=True, exist_ok=True)
         mocker.patch.object(b, "_active_config_path", return_value=active)
         mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
         b.start(cfg_path)
         script = active.read_text()
@@ -1987,7 +1990,7 @@ class TestLlamaCppReasoningFormat:
         active.parent.mkdir(parents=True, exist_ok=True)
         mocker.patch.object(b, "_active_config_path", return_value=active)
         mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
         b.start(cfg_path)
         script = active.read_text()
@@ -2101,7 +2104,7 @@ class TestLlamaCppPromptCaching:
         active.parent.mkdir(parents=True, exist_ok=True)
         mocker.patch.object(b, "_active_config_path", return_value=active)
         mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
-        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+        mocker.patch("vserve.systemd_helpers.subprocess.run",
                      return_value=Mock(returncode=0, stdout="", stderr=""))
         b.start(cfg_path)
         script = active.read_text()

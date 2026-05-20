@@ -23,7 +23,6 @@ def test_config_functions():
         limits_path, profile_path, active_yaml_path,
         read_limits, write_limits,
         read_profile_yaml, write_profile_yaml,
-        read_timing, write_timing,
         VserveConfig, CONFIG_FILE,
         _discover_vllm_root, _discover_cuda_home, _discover_service,
         _discover_port, _build_config,

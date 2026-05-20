@@ -7,6 +7,15 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+# Tables moved to `vserve.arch_registry` in 0.6.3 — see audit
+# `docs/audits/2026-05-20-registries-coherence.md`. Re-exported here so
+# external callers (and old tests) keep working without churn.
+from vserve.arch_registry import (
+    _ARCH_FORCES_BACKEND,
+    _ARCH_TO_REASONING_PARSER,
+    _ARCH_TO_TOOL_PARSER,
+)
+
 if TYPE_CHECKING:
     from vserve.gpu import GpuInfo
     from vserve.models import ModelInfo
@@ -29,92 +38,6 @@ _TRITON_ATTN_INCOMPATIBLE_KV_DTYPES: frozenset[str] = frozenset({
     "turboquant_k3v4_nc",
     "turboquant_3bit_nc",
 })
-
-
-# Architecture → tool-call parser name. The right-hand side must match a key
-# in vLLM's `_TOOL_PARSERS_TO_REGISTER` table. The mapping is intentionally
-# explicit (not derived from architecture string parsing) so that surprises
-# show up at code-review time rather than at deploy time.
-# Cross-checked against vLLM 0.21 tool_parsers/ directory.
-_ARCH_TO_TOOL_PARSER: dict[str, str] = {
-    # Gemma 3 / 4 family
-    "Gemma3ForCausalLM":              "gemma4",
-    "Gemma3ForConditionalGeneration": "gemma4",
-    "Gemma4ForCausalLM":              "gemma4",
-    "Gemma4ForConditionalGeneration": "gemma4",
-    # Llama 3.x / 4 — 3.1/3.2/3.3 use the JSON-style parser, 4 uses pythonic
-    "LlamaForCausalLM":               "llama3_json",
-    "Llama4ForCausalLM":              "llama4_pythonic",
-    "Llama4MoeForCausalLM":           "llama4_pythonic",
-    # Qwen3 family — Hermes-format on base, qwen3_coder for coder variants
-    "Qwen3ForCausalLM":               "hermes",
-    "Qwen35ForCausalLM":              "hermes",
-    "Qwen36ForCausalLM":              "hermes",
-    "Qwen3MoeForCausalLM":            "hermes",
-    "Qwen3A3BForCausalLM":            "hermes",
-    "Qwen36MoeForCausalLM":           "hermes",
-    "Qwen3CoderForCausalLM":          "qwen3_coder",
-    "Qwen3XmlForCausalLM":            "qwen3_xml",
-    # DeepSeek V-series — per-version parser
-    "DeepseekV3ForCausalLM":          "deepseek_v3",
-    "DeepseekV31ForCausalLM":         "deepseek_v31",
-    "DeepseekV32ForCausalLM":         "deepseek_v32",
-    "DeepseekV4ForCausalLM":          "deepseek_v4",
-    # Moonshot Kimi K2 (instruct + thinking)
-    "KimiK2ForCausalLM":              "kimi_k2",
-    "KimiK2ThinkingForCausalLM":      "kimi_k2",
-    # GLM 4 family (Z.ai)
-    "Glm4MoeForCausalLM":             "glm45",
-    "Glm47MoeForCausalLM":            "glm47",
-    # IBM Granite (text-only Granite-3 + Granite-4 with mixed schema)
-    "GraniteForCausalLM":             "granite",
-    "Granite4ForCausalLM":            "granite4",
-    # Cohere Command R/R+ (Command-4 parser supersedes Command-3)
-    "CohereForCausalLM":              "cohere_command4",
-    # Baidu ERNIE 4.5
-    "Ernie4ForCausalLM":              "ernie45",
-    # AI21 Jamba
-    "JambaForCausalLM":               "jamba",
-    # Salesforce xLAM
-    "XlamForCausalLM":                "xlam",
-    # Liquid LFM 2 / 2.5
-    "Lfm2ForCausalLM":                "lfm2",
-    "Lfm25ForCausalLM":               "lfm25",
-    # Mistral
-    "MistralForCausalLM":             "mistral",
-    "MistralThinkingForCausalLM":     "mistral",
-    # GPT-OSS (OpenAI Harmony)
-    "GptOssForCausalLM":              "openai",
-    # InternLM (2.x uses same parser)
-    "InternLMForCausalLM":            "internlm",
-    "InternLM2ForCausalLM":           "internlm",
-}
-
-
-# Architecture → reasoning-parser name (vLLM 0.21+). Reasoning parsers split
-# the thinking trace from the answer in OpenAI-format responses (so clients
-# see `message.reasoning_content` distinct from `message.content`). Names
-# must match the keys registered by `ReasoningParserManager` — verified
-# against https://docs.vllm.ai/en/latest/features/reasoning_outputs.html.
-_ARCH_TO_REASONING_PARSER: dict[str, str] = {
-    "Gemma3ForCausalLM":              "gemma4",
-    "Gemma3ForConditionalGeneration": "gemma4",
-    "Gemma4ForCausalLM":              "gemma4",
-    "Gemma4ForConditionalGeneration": "gemma4",
-    "DeepseekV3ForCausalLM":          "deepseek_r1",
-    "DeepseekV31ForCausalLM":         "deepseek_r1",
-    "DeepseekV32ForCausalLM":         "deepseek_r1",
-    "DeepseekV4ForCausalLM":          "deepseek_r1",
-    "Qwen3ForCausalLM":               "qwen3",
-    "Qwen35ForCausalLM":              "qwen3",
-    "Qwen36ForCausalLM":              "qwen3",
-    "Qwen3MoeForCausalLM":            "qwen3",
-    "Qwen3A3BForCausalLM":            "qwen3",
-    "KimiK2ThinkingForCausalLM":      "deepseek_r1",  # uses <think> markers
-    "MistralForCausalLM":             "mistral",
-    "MistralThinkingForCausalLM":     "mistral",
-    "GptOssForCausalLM":              "openai_gptoss",
-}
 
 
 def _read_model_config(model_path: Path) -> dict:
@@ -150,28 +73,10 @@ def _architecture_forces_triton_attn(model_path: Path) -> bool:
     return False
 
 
-# Item R: architecture → forced attention backend. MLA architectures (DeepSeek
-# V2/V3/V4, Kimi K2, LongCat-Flash) ship with their own attention layout — the
-# default backend auto-pick can mis-route. Heterogeneous head_dim still forces
-# TRITON_ATTN (handled by _architecture_forces_triton_attn above).
-_ARCH_FORCES_BACKEND: dict[str, str] = {
-    "DeepseekV2ForCausalLM":   "FLASHMLA",
-    "DeepseekV3ForCausalLM":   "FLASHMLA",
-    "DeepseekV31ForCausalLM":  "FLASHMLA",
-    "DeepseekV32ForCausalLM":  "FLASHMLA",
-    "DeepseekV4ForCausalLM":   "FLASHMLA",
-    "KimiK2ForCausalLM":       "FLASHMLA",
-    "KimiK2ThinkingForCausalLM": "FLASHMLA",
-    "LongcatFlashForCausalLM": "FLASHMLA",
-    # GPT-OSS on SM120 (Blackwell RTX) forces TRITON_ATTN because FlashInfer
-    # doesn't support attention sinks on that compute capability (vllm#40153).
-    # Conditional — handled in _forced_attention_backend below.
-    "GptOssForCausalLM":       "TRITON_ATTN",
-    # Gemma-4 already forces TRITON_ATTN via the heterogeneous-head_dim path.
-    # Keep explicit here so the table is the single source of truth.
-    "Gemma4ForCausalLM":              "TRITON_ATTN",
-    "Gemma4ForConditionalGeneration": "TRITON_ATTN",
-}
+# `_ARCH_FORCES_BACKEND` moved to vserve.arch_registry in 0.6.3 (imported
+# at the top of this module). Compute-cap-conditioned routing — FLASHMLA →
+# TOKENSPEED_MLA on sm≥100, GptOss + sm120 → TRITON_ATTN per vllm#40153 —
+# lives in `_forced_attention_backend` below.
 
 # Per-backend KV dtypes that aren't supported on that backend.
 BACKEND_INCOMPATIBLE_KV_DTYPES: dict[str, frozenset[str]] = {
@@ -211,15 +116,6 @@ def _forced_attention_backend(model_path: Path, gpu_compute_cap: int) -> str | N
             return None
         return base
     return None
-
-
-def _is_multimodal_model(model_path: Path) -> bool:
-    """True when the model has a vision/audio encoder, as evidenced by the
-    presence of `vision_config` / `audio_config` in `config.json`."""
-    cfg = _read_model_config(model_path)
-    if not cfg:
-        return False
-    return bool(cfg.get("vision_config") or cfg.get("audio_config"))
 
 
 def _mm_batched_tokens_floor(model_path: Path) -> int | None:

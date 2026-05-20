@@ -16,6 +16,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# `_GGUF_ARCH_TO_HF_ARCH` moved to vserve.arch_registry in 0.6.3 — the
+# audit (`docs/audits/2026-05-20-registries-coherence.md`) consolidated
+# all arch-keyed tables into one canonical home. Re-exported here so
+# external callers keep working without churn.
+from vserve.arch_registry import _GGUF_ARCH_TO_HF_ARCH
+
 
 @dataclass(frozen=True)
 class SamplingDefaults:
@@ -73,29 +79,6 @@ def get_sampling_defaults(architecture: str | None) -> SamplingDefaults | None:
     if not architecture:
         return None
     return SAMPLING_DEFAULTS.get(architecture)
-
-
-# GGUF stores `general.architecture` as a lowercase short name (e.g.
-# "gemma3", "qwen3", "deepseek2"). Map to the same SamplingDefaults rows.
-# Order matches the HF mapping above — keep these in sync when adding rows.
-_GGUF_ARCH_TO_HF_ARCH: dict[str, str] = {
-    "gemma3":     "Gemma3ForCausalLM",
-    "gemma4":     "Gemma4ForCausalLM",
-    "qwen3":      "Qwen3ForCausalLM",
-    "qwen3coder": "Qwen3CoderForCausalLM",
-    "qwen3moe":   "Qwen3MoeForCausalLM",
-    "qwen3a3b":   "Qwen3A3BForCausalLM",
-    "qwen35":     "Qwen35ForCausalLM",
-    "qwen36":     "Qwen36ForCausalLM",
-    "qwen36moe":  "Qwen36MoeForCausalLM",
-    "deepseek3":  "DeepseekV3ForCausalLM",  # llama.cpp short name for V3
-    "deepseek2":  "DeepseekV3ForCausalLM",  # V3 inherits V2 arch in some GGUFs
-    "deepseekv31":"DeepseekV31ForCausalLM",
-    "deepseekv32":"DeepseekV32ForCausalLM",
-    "deepseekv4": "DeepseekV4ForCausalLM",
-    "llama4":     "Llama4ForCausalLM",
-    "kimik2":     "KimiK2ForCausalLM",
-}
 
 
 def get_sampling_defaults_from_gguf_arch(gguf_arch: str | None) -> SamplingDefaults | None:

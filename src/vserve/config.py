@@ -568,6 +568,15 @@ def write_limits(path: Path, data: dict) -> None:
     _atomic_write_text(path, json.dumps(out, indent=2) + "\n")
 
 
+def read_limits_for(provider: str, model_name: str) -> dict | None:
+    """One-call helper: ``read_limits(limits_path(provider, model_name))``.
+
+    0.6.3: collapses the 5+ inline call sites flagged by audit
+    `docs/audits/2026-05-20-cli-sprawl.md`.
+    """
+    return read_limits(limits_path(provider, model_name))
+
+
 def limits_cache_matches(data: dict | None, *, backend: str, fingerprint: dict) -> bool:
     if not data:
         return False
@@ -579,22 +588,6 @@ def limits_cache_matches(data: dict | None, *, backend: str, fingerprint: dict) 
     if not isinstance(cached_fingerprint, dict):
         return False
     return cached_fingerprint == fingerprint
-
-
-def timing_path(provider: str, model_name: str) -> Path:
-    return cfg().configs_dir / f"{provider}--{model_name}.timing.json"
-
-
-def read_timing(provider: str, model_name: str) -> dict:
-    p = timing_path(provider, model_name)
-    return _read_json_mapping(p, warn=True, label="timing") or {}
-
-
-def write_timing(provider: str, model_name: str, phase: str, seconds: float) -> None:
-    p = timing_path(provider, model_name)
-    data = read_timing(provider, model_name)
-    data[phase] = round(seconds, 1)
-    _atomic_write_text(p, json.dumps(data, indent=2) + "\n")
 
 
 def read_profile_yaml(path: Path) -> dict | None:

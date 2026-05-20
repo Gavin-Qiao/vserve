@@ -218,7 +218,7 @@ class TestLaunchTimeMeasurement:
         }
 
         mocker.patch(
-            "vserve.bench.run_streaming_benchmark",
+            "vserve.cli.run_streaming_benchmark",
             return_value=BenchResult(
                 ttft_ms_p50=180.0, ttft_ms_p99=210.0,
                 tpot_ms_p50=12.0, tpot_ms_p99=15.0,
@@ -255,7 +255,7 @@ class TestLaunchTimeMeasurement:
         cfg = {"model": "/m", "served-model-name": ["m"],
                "max-model-len": 8192, "max-num-seqs": 4, "kv-cache-dtype": "fp8"}
         mocker.patch(
-            "vserve.bench.run_streaming_benchmark",
+            "vserve.cli.run_streaming_benchmark",
             return_value=BenchResult(
                 ttft_ms_p50=None, ttft_ms_p99=None,
                 tpot_ms_p50=None, tpot_ms_p99=None,

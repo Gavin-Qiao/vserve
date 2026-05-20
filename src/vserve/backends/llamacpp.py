@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, Callable
 from vserve.model_files import iter_top_level_files_with_suffix
 
 if TYPE_CHECKING:
+    from vserve.backends.protocol import CompatibilityResult, RuntimeIdentity
     from vserve.gpu import GpuInfo
     from vserve.models import ModelInfo
 
@@ -93,31 +94,27 @@ class LlamaCppBackend:
         return Path(found) if found else None
 
     def _assert_unit_safe_for_privileged_action(self) -> None:
-        from vserve.config import (
-            find_systemd_unit_path,
-            unit_content_matches_backend,
-            validate_systemd_service_name,
-        )
+        """llama.cpp-specific wrapper around the shared safety asserter.
 
-        validate_systemd_service_name(self.service_name)
-        unit = find_systemd_unit_path(self.service_name)
-        if unit is None:
-            return
-        try:
-            content = unit.read_text()
-        except (OSError, UnicodeDecodeError) as exc:
-            raise RuntimeError(
-                f"Cannot verify {self.service_name}.service before privileged systemctl action: {exc}"
-            ) from None
-        if not unit_content_matches_backend(
-            content,
+        Extracted in 0.6.3 — see ``vserve.systemd_helpers.assert_unit_safe``.
+        """
+        from vserve.systemd_helpers import assert_unit_safe
+
+        assert_unit_safe(
+            service_name=self.service_name,
             backend_name=self.name,
             root=self.root_dir,
             expected_paths=[self.root_dir / "configs" / "active.sh"],
-        ):
-            raise RuntimeError(f"{self.service_name}.service does not look like a vserve llama.cpp unit")
+        )
 
-    def runtime_info(self) -> dict:
+    def runtime_info(self) -> "RuntimeIdentity":
+        """Return the canonical RuntimeIdentity dataclass (0.6.3: was dict).
+
+        ``details["errors"]`` exposes parse/probe errors so callers can
+        surface them without reaching into the dict shape.
+        """
+        from vserve.backends.protocol import RuntimeIdentity
+
         entrypoint = self.find_entrypoint()
         errors: list[str] = []
         version: str | None = None
@@ -138,23 +135,29 @@ class LlamaCppBackend:
                     errors.append(output or f"{entrypoint} --version failed")
             except Exception as exc:
                 errors.append(f"{entrypoint} --version failed: {exc}")
-        return {
-            "backend": self.name,
-            "executable": str(entrypoint or ""),
-            "llama_server_version": version,
-            "errors": errors,
-        }
+        return RuntimeIdentity(
+            backend=self.name,
+            executable=entrypoint,
+            version=version,
+            details={"errors": tuple(errors), "llama_server_version": version},
+        )
 
-    def compatibility(self) -> dict:
+    def compatibility(self) -> "CompatibilityResult":
+        """Return the canonical CompatibilityResult dataclass (0.6.3: was dict)."""
+        from vserve.backends.protocol import CompatibilityResult
+
         info = self.runtime_info()
-        errors = list(info.get("errors") or [])
-        return {
-            "backend": self.name,
-            "supported": not errors,
-            "messages": ["llama.cpp runtime is available."] if not errors else [],
-            "warnings": [],
-            "errors": errors,
-        }
+        errors = tuple(info.details.get("errors") or ())
+        messages: tuple[str, ...] = (
+            ("llama.cpp runtime is available.",) if not errors else ()
+        )
+        return CompatibilityResult(
+            backend=self.name,
+            supported=not errors,
+            messages=messages,
+            warnings=(),
+            errors=errors,
+        )
 
     def _candidate_kv_dtypes(self) -> tuple[str, ...]:
         """Return the KV-cache dtype candidates surfaced in tune output,
@@ -1360,33 +1363,43 @@ class LlamaCppBackend:
             raise RuntimeError(f"systemctl start {self.service_name} failed: {result.stderr}")
 
     def stop(self, *, non_interactive: bool = False) -> None:
-        self._assert_unit_safe_for_privileged_action()
-        command = ["sudo", "systemctl", "stop", self.service_name]
-        if non_interactive:
-            command.insert(1, "-n")
-        result = subprocess.run(
-            command,
-            capture_output=True, text=True, timeout=30,
+        """Stop the llama.cpp systemd unit.
+
+        0.6.3: now uses the shared :func:`systemctl_call` primitive.
+        Safety assertion runs inside ``systemctl_call`` via the
+        ``asserter`` parameter.
+        """
+        from vserve.systemd_helpers import systemctl_call
+
+        ok, _out, err = systemctl_call(
+            self.service_name,
+            "stop",
+            non_interactive=non_interactive,
+            asserter=self._assert_unit_safe_for_privileged_action,
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"systemctl stop {self.service_name} failed: {result.stderr}")
+        if not ok:
+            raise RuntimeError(f"systemctl stop {self.service_name} failed: {err}")
 
     def is_running(self) -> bool:
-        result = subprocess.run(
-            ["systemctl", "is-active", self.service_name],
-            capture_output=True, text=True, timeout=10,
-        )
-        status = result.stdout.strip().lower()
-        if result.returncode == 0 and status == "active":
+        """Check whether the llama.cpp systemd unit is active.
+
+        0.6.3: shares the systemctl-call primitive with vLLM via
+        :func:`vserve.systemd_helpers.systemctl_call`.
+        """
+        from vserve.systemd_helpers import systemctl_call
+
+        ok, stdout, stderr = systemctl_call(self.service_name, "is-active", timeout=10)
+        status = stdout.strip().lower()
+        if ok and status == "active":
             return True
         if status in {"inactive", "failed"}:
             return False
         if status in {"activating", "deactivating", "reloading"}:
             raise RuntimeError(f"systemctl is-active {self.service_name} is transitional: {status}")
-        if "could not be found" in result.stderr.lower():
+        if "could not be found" in stderr.lower():
             return False
-        if result.stderr.strip():
-            raise RuntimeError(f"systemctl is-active {self.service_name} failed: {result.stderr.strip()}")
+        if stderr.strip():
+            raise RuntimeError(f"systemctl is-active {self.service_name} failed: {stderr.strip()}")
         return False
 
     def health_url(self, port: int) -> str:

@@ -1,9 +1,6 @@
-"""Per-architecture serving recipes (sampling, spec-decode, benchmarks)."""
+"""Per-architecture serving recipes (sampling, spec-decode, benchmarks).
 
-from vserve.recipes.sampling import (
-    SAMPLING_DEFAULTS,
-    SamplingDefaults,
-    get_sampling_defaults,
-)
-
-__all__ = ["SAMPLING_DEFAULTS", "SamplingDefaults", "get_sampling_defaults"]
+Sub-modules import explicitly — no package-level re-exports (the previous
+ones had no external consumer and were flagged by the 0.6.3 dead-code
+audit).
+"""

@@ -98,9 +98,17 @@ class TestReasoningParserTable:
         from vserve.backends.vllm import _ARCH_TO_REASONING_PARSER
         for arch in (
             "Qwen3ForCausalLM", "Qwen35ForCausalLM", "Qwen36ForCausalLM",
-            "Qwen3MoeForCausalLM", "Qwen3A3BForCausalLM",
+            "Qwen3MoeForCausalLM", "Qwen36MoeForCausalLM", "Qwen3A3BForCausalLM",
         ):
             assert _ARCH_TO_REASONING_PARSER[arch] == "qwen3"
+
+    def test_qwen36moe_routes_to_qwen3_reasoning_parser(self):
+        """0.6.3 bug fix 1: Qwen36MoeForCausalLM was missing from the table;
+        sibling registries (sampling, spec_decode, tool-parser) all include it,
+        so its absence here caused <think> to leak into message.content for
+        Qwen 3.6 MoE."""
+        from vserve.backends.vllm import _ARCH_TO_REASONING_PARSER
+        assert _ARCH_TO_REASONING_PARSER["Qwen36MoeForCausalLM"] == "qwen3"
 
     def test_deepseek_family_uses_deepseek_r1_parser(self):
         from vserve.backends.vllm import _ARCH_TO_REASONING_PARSER

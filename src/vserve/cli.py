@@ -14,6 +14,7 @@ from vserve.config import (
     limits_path,
     profile_path,
     read_limits,
+    read_limits_for,
 )
 from vserve.models import scan_models, fuzzy_match, ModelInfo
 from vserve.lock import (
@@ -29,6 +30,43 @@ from vserve.lock import (
 )
 
 from vserve import __version__
+from vserve.bench import BenchResult, run_streaming_benchmark
+# Engine-failure diagnosis was extracted to `vserve.diagnostics` in 0.6.3
+# (audit `docs/audits/2026-05-20-cli-sprawl.md`). These re-exports preserve
+# the legacy `cli._diagnose_engine_failure` / `cli._fetch_engine_log_for_diagnosis`
+# import paths for older callers and tests.
+from vserve.diagnostics import (
+    diagnose_engine_failure as _diagnose_engine_failure,  # noqa: F401 — re-export for legacy callers
+    fetch_engine_log as _fetch_engine_log_for_diagnosis,  # noqa: F401 — re-export for legacy callers
+)
+# Download-flow pure helpers extracted to `vserve.downloader` in 0.6.3.
+# Legacy `_name` aliases preserve old import paths for tests.
+from vserve.downloader import (  # noqa: F401 — re-exports for legacy callers
+    clear_stale_gguf_files as _clear_stale_gguf_files,
+    download_roots_ready as _download_roots_ready,
+    expected_download_roots as _expected_download_roots,
+    gguf_variant_root as _gguf_variant_root,
+    materialize_subdirectory_variants as _materialize_subdirectory_variants,
+    root_has_top_level_weights as _root_has_top_level_weights,
+    safe_variant_label as _safe_variant_label,
+    strip_downloaded_file_prefix as _strip_downloaded_file_prefix,
+    variant_common_prefix as _variant_common_prefix,
+    variant_contains_gguf as _variant_contains_gguf,
+)
+from vserve.cli_doctor import doctor_summary_label as _doctor_summary_label  # noqa: F401 — legacy import path
+# Picker-data helpers extracted to `vserve.picker` in 0.6.3.
+from vserve.picker import (  # noqa: F401 — re-exports for legacy callers
+    VLLM_AUTOMATIC_KV_DTYPES as _VLLM_AUTOMATIC_KV_DTYPES,
+    choose_llamacpp_scripted_defaults as _choose_llamacpp_scripted_defaults,
+    choose_vllm_scripted_defaults as _choose_vllm_scripted_defaults,
+    llamacpp_interactive_runtime_defaults as _llamacpp_interactive_runtime_defaults,
+    llamacpp_interactive_slot_ceiling as _llamacpp_interactive_slot_ceiling,
+    llamacpp_needs_moe_offload as _llamacpp_needs_moe_offload,
+    llamacpp_slots_from_limits_entry as _llamacpp_slots_from_limits_entry,
+    vllm_kv_label as _vllm_kv_label,
+    vllm_limit_dtype_order as _vllm_limit_dtype_order,
+    vllm_limits_entry as _vllm_limits_entry,
+)
 
 app = typer.Typer(help="LLM inference manager")
 cache_app = typer.Typer(help="Cache management")
@@ -327,7 +365,7 @@ def dashboard(ctx: typer.Context):
     """Show status dashboard when called with no subcommand."""
     if ctx.invoked_subcommand is not None:
         import sys
-        if "--json" in sys.argv or ctx.invoked_subcommand in {"status", "doctor"}:
+        if "--json" in sys.argv or ctx.invoked_subcommand in {"status", "doctor", "bench"}:
             return
         from vserve.version import background_refresh
         background_refresh()
@@ -361,7 +399,7 @@ def dashboard(ctx: typer.Context):
 
     models = _all_models()
     probed = sum(
-        1 for m in models if read_limits(limits_path(m.provider, m.model_name))
+        1 for m in models if read_limits_for(m.provider, m.model_name)
     )
 
     serving_line = "[dim]not running[/dim]"
@@ -684,7 +722,7 @@ def list_models(model_terms: list[str] = typer.Argument(None, help="Model name t
     table.add_column("Reasoning", style="green")
 
     for m in all_models:
-        lim = read_limits(limits_path(m.provider, m.model_name))
+        lim = read_limits_for(m.provider, m.model_name)
 
         # Detect backend
         backend_name = "\u2014"
@@ -736,7 +774,7 @@ def ls(model_terms: list[str] = typer.Argument(None, help="Model name terms for 
 
 
 def _show_model_detail(m: ModelInfo):
-    lim = read_limits(limits_path(m.provider, m.model_name))
+    lim = read_limits_for(m.provider, m.model_name)
 
     console.print(f"\n[bold]{m.full_name}[/bold]")
     console.print(f"  Arch: {m.architecture}  Quant: {m.quant_method or 'none'}  MoE: {m.is_moe}")
@@ -1098,178 +1136,6 @@ def _materialize_subdirectory_variant(
         shared=shared,
     )
     return materialized[0] if materialized else local_dir
-
-
-def _root_has_top_level_weights(path: pathlib.Path) -> bool:
-    from vserve.model_files import iter_top_level_files_with_suffix
-
-    return (
-        bool(iter_top_level_files_with_suffix(path, ".safetensors"))
-        or bool(iter_top_level_files_with_suffix(path, ".bin"))
-        or bool(iter_top_level_files_with_suffix(path, ".gguf"))
-    )
-
-
-def _variant_common_prefix(files: list[str]) -> str | None:
-    split_paths = [pathlib.PurePosixPath(name).parts for name in files]
-    if not split_paths or not all(len(parts) > 1 for parts in split_paths):
-        return None
-    prefix = split_paths[0][0]
-    if not all(parts[0] == prefix for parts in split_paths):
-        return None
-    return prefix
-
-
-def _materialize_subdirectory_variants(
-    local_dir: pathlib.Path,
-    *,
-    model_name: str,
-    selected_variants: list,
-    shared: dict[str, int],
-) -> list[pathlib.Path]:
-    """Expose each selected subdirectory HF variant as a separate runnable model root."""
-    if not selected_variants:
-        return [local_dir]
-    if len(selected_variants) == 1 and _root_has_top_level_weights(local_dir):
-        ignore = local_dir / ".vserve-ignore"
-        if ignore.exists():
-            ignore.unlink()
-        return [local_dir]
-
-    import re
-    import shutil
-
-    def link_or_copy(src: pathlib.Path, dest: pathlib.Path) -> None:
-        if not src.exists():
-            return
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            if dest.is_symlink() or dest.exists():
-                dest.unlink()
-        except OSError:
-            return
-        try:
-            dest.symlink_to(src.resolve())
-        except OSError:
-            shutil.copy2(src, dest)
-
-    roots: list[pathlib.Path] = []
-    materialized_any = False
-    materialize_top_level = len(selected_variants) > 1
-    for variant in selected_variants:
-        variant_files = list(getattr(variant, "files", {}).keys())
-        prefix = _variant_common_prefix(variant_files)
-        safe_label = re.sub(r"[^A-Za-z0-9._-]+", "-", str(getattr(variant, "label", prefix or "variant"))).strip("-") or (prefix or "variant")
-        if prefix is None and not materialize_top_level:
-            roots.append(local_dir)
-            continue
-
-        materialized = local_dir.parent / f"{model_name}-{safe_label}"
-        materialized.mkdir(parents=True, exist_ok=True)
-        materialized_any = True
-
-        for name in shared:
-            rel = pathlib.PurePosixPath(name)
-            dest_rel = (
-                pathlib.PurePosixPath(*rel.parts[1:])
-                if prefix is not None and rel.parts and rel.parts[0] == prefix and len(rel.parts) > 1
-                else rel
-            )
-            link_or_copy(local_dir.joinpath(*rel.parts), materialized.joinpath(*dest_rel.parts))
-
-        for name in variant_files:
-            rel = pathlib.PurePosixPath(name)
-            stripped = pathlib.PurePosixPath(*rel.parts[1:]) if prefix is not None else rel
-            link_or_copy(local_dir.joinpath(*rel.parts), materialized.joinpath(*stripped.parts))
-
-        roots.append(materialized)
-
-    ignore = local_dir / ".vserve-ignore"
-    if materialized_any and (materialize_top_level or not _root_has_top_level_weights(local_dir)):
-        ignore.write_text("materialized variants live in sibling model roots\n")
-    elif ignore.exists() and _root_has_top_level_weights(local_dir):
-        ignore.unlink()
-    return roots or [local_dir]
-
-
-def _safe_variant_label(label: str) -> str:
-    import re
-
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-") or "variant"
-
-
-def _gguf_variant_root(base_dir: pathlib.Path, *, model_name: str, variant) -> pathlib.Path:
-    label = _safe_variant_label(str(getattr(variant, "label", "variant")))
-    suffix = label if label.lower() not in model_name.lower() else "variant"
-    return base_dir.parent / f"{model_name}-{suffix}"
-
-
-def _variant_contains_gguf(variant) -> bool:
-    from vserve.model_files import is_gguf_name
-
-    return any(is_gguf_name(filename) for filename in getattr(variant, "files", {}))
-
-
-def _expected_download_roots(
-    local_dir: pathlib.Path,
-    *,
-    model_name: str,
-    selected_variants: list,
-    is_gguf_download: bool,
-) -> list[pathlib.Path]:
-    if is_gguf_download:
-        return [
-            _gguf_variant_root(local_dir, model_name=model_name, variant=variant)
-            for variant in selected_variants
-        ]
-    return [local_dir]
-
-
-def _download_roots_ready(roots: list[pathlib.Path]) -> bool:
-    if not roots:
-        return False
-    from vserve.model_files import iter_recursive_weight_files
-
-    for root in roots:
-        try:
-            if not root.exists() or not iter_recursive_weight_files(root):
-                return False
-        except OSError:
-            return False
-    return True
-
-
-def _strip_downloaded_file_prefix(downloaded: pathlib.Path, root: pathlib.Path, filename: str) -> pathlib.Path:
-    """Move a downloaded repo subpath to the runnable root with only its basename."""
-    dest = root / pathlib.PurePosixPath(filename).name
-    if downloaded.resolve(strict=False) == dest.resolve(strict=False):
-        return dest
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists() or dest.is_symlink():
-        dest.unlink()
-    import shutil
-
-    shutil.move(str(downloaded), str(dest))
-    parent = downloaded.parent
-    while parent != root and root in parent.parents:
-        try:
-            parent.rmdir()
-        except OSError:
-            break
-        parent = parent.parent
-    return dest
-
-
-def _clear_stale_gguf_files(root: pathlib.Path) -> None:
-    if not root.exists():
-        return
-    from vserve.model_files import iter_recursive_files_with_suffix
-
-    for stale in iter_recursive_files_with_suffix(root, ".gguf"):
-        try:
-            stale.unlink()
-        except OSError:
-            pass
 
 
 def _download_model(model_id: str, models_dir: "pathlib.Path", snapshot_download: object, api: object) -> bool:
@@ -2361,161 +2227,9 @@ def _print_llamacpp_moe_block(moe: dict, dtype_order: list[str]) -> None:
     console.print(ot_table)
 
 
-def _diagnose_engine_failure(log_text: str, backend_name: str) -> list[tuple[str, str]]:
-    """Scan engine logs for known failure signatures and return one or more
-    `(cause, suggestion)` pairs the CLI can print.
-
-    Empty list means "no recognized pattern" — caller should fall back to the
-    generic "Check: sudo journalctl ..." hint. Patterns reflect failure modes
-    seen in the 2026-05-19 debugging session; each one was previously left to
-    the user to grep out of journalctl / vllm.log by hand.
-    """
-    if not log_text:
-        return []
-    findings: list[tuple[str, str]] = []
-    seen: set[str] = set()
-
-    def _add(cause: str, suggestion: str) -> None:
-        key = cause
-        if key in seen:
-            return
-        seen.add(key)
-        findings.append((cause, suggestion))
-
-    # vLLM-side patterns
-    if backend_name == "vllm":
-        if "Selected backend" in log_text and "is not valid for this configuration" in log_text \
-                and "kv_cache_dtype not supported" in log_text:
-            _add(
-                "vLLM forced an attention backend that does not accept the requested kv-cache-dtype.",
-                "Re-run with --kv-cache-dtype fp8 (or auto). Architectures like Gemma-4 force "
-                "TRITON_ATTN which rejects every turboquant_* dtype.",
-            )
-        if "Workspace is locked but allocation" in log_text and "turboquant" in log_text:
-            _add(
-                "TurboQuant decode kernel needed more workspace than CUDA-graph capture sized.",
-                "Add `compilation-config: {cudagraph_mode: NONE}` to the YAML "
-                "(keeps torch.compile fusions, only skips graph capture — the "
-                "maintainer-canonical fix per vllm#40807/41403). Alternative: drop "
-                "--kv-cache-dtype to fp8. --enforce-eager also works but unnecessarily "
-                "disables torch.compile (vserve auto-emits cudagraph_mode: NONE for "
-                "turboquant_* dtypes starting in 0.6.1).",
-            )
-        if "Chunked MM input disabled" in log_text and "max_tokens_per_mm_item" in log_text:
-            _add(
-                "Multimodal model: one image/audio item is larger than max-num-batched-tokens.",
-                "Set --batched-tokens 4096 (or higher). vserve 0.6.0+ does this automatically "
-                "for any model with vision_config / audio_config.",
-            )
-        if "auto" in log_text and "tool choice requires --enable-auto-tool-choice" in log_text:
-            _add(
-                "Tool calling was requested but vLLM is not configured with a tool-call parser.",
-                "Pass --tools and re-run; vserve 0.6.0+ auto-maps known architectures (gemma4, "
-                "qwen3_coder, etc.) to a parser. Older configs need both "
-                "enable-auto-tool-choice and tool-call-parser in the YAML.",
-            )
-        if "CUDA out of memory" in log_text or "torch.cuda.OutOfMemoryError" in log_text:
-            _add(
-                "Engine ran out of GPU memory while allocating buffers.",
-                "Reduce --slots, --context, or use a smaller-bytes KV dtype (fp8). "
-                "Re-run `vserve tune <model> --recalc` to refresh the limits cache.",
-            )
-
-    # llama.cpp patterns (failure surface is in journal, not vllm.log)
-    if backend_name == "llamacpp":
-        if "cudaMalloc failed: out of memory" in log_text \
-                or "failed to allocate buffer for kv cache" in log_text:
-            _add(
-                "llama.cpp ran out of GPU memory allocating the KV cache.",
-                "Reduce --slots or --context. The product (slots × context) drives KV size. "
-                "vserve 0.6.0+ reserves more compute headroom in tune to prevent this.",
-            )
-        if "common_fit_params: failed to fit params to free device memory" in log_text \
-                and "n_gpu_layers already set by user" in log_text:
-            _add(
-                "llama.cpp's auto-fitter wanted to spill layers to CPU but --n-gpu-layers was "
-                "explicit; engine aborts.",
-                "Either reduce --n-gpu-layers below the model's total, OR enable MoE expert "
-                "CPU offload via --override-tensor '.ffn_.*_exps.=CPU' (vserve auto-applies "
-                "this in 0.6.0+ only when needed).",
-            )
-        if "core-dump" in log_text or "SIGSEGV" in log_text or "status=11/SEGV" in log_text:
-            _add(
-                "llama-server segfaulted (typically a model/runtime mismatch or KV alloc failure).",
-                "Check `journalctl -u llama-cpp.service -n 200` for the preceding error. "
-                "Common cause is requesting more KV than fits; try smaller --slots or --context.",
-            )
-        if "n_ctx_seq" in log_text and "n_ctx_train" in log_text:
-            # Informational — not a fatal warning, but worth surfacing when paired with a crash.
-            pass
-
-    return findings
-
-
-def _fetch_engine_log_for_diagnosis(backend, *, max_lines: int = 400) -> str:
-    """Read enough engine log to feed `_diagnose_engine_failure`.
-
-    For vLLM the engine writes stdout/stderr to `<logs_dir>/vllm.log` via the
-    systemd unit's `StandardOutput=append:` redirect (journal only contains
-    systemd state-change lines). For llama.cpp logs land in the journal.
-    """
-    import subprocess
-    from vserve.config import cfg as _cfg
-
-    if backend.name == "vllm":
-        log_path = _cfg().logs_dir / "vllm.log"
-        try:
-            # `sudo tail` reads the vllm-owned file; readable for the
-            # vserve-running user since the directory permissions allow it
-            # on the supported install. Fall back to journalctl if not.
-            result = subprocess.run(
-                ["sudo", "-n", "tail", "-n", str(max_lines), str(log_path)],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0 and result.stdout:
-                return result.stdout
-        except Exception:
-            pass
-
-    try:
-        result = subprocess.run(
-            [
-                "journalctl",
-                "-u",
-                backend.service_name,
-                "--no-pager",
-                "-n",
-                str(max_lines),
-                "-o",
-                "cat",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            return result.stdout or ""
-    except Exception:
-        pass
-    return ""
-
-
 def _print_engine_diagnosis(backend, *, header: str | None = None) -> bool:
-    """Run diagnosis on the recent engine log and print findings. Returns True
-    if at least one finding was surfaced (caller can suppress the generic
-    journalctl hint when we already gave a precise answer)."""
-    log_text = _fetch_engine_log_for_diagnosis(backend)
-    findings = _diagnose_engine_failure(log_text, backend.name)
-    if not findings:
-        return False
-    if header:
-        console.print(header)
-    for cause, suggestion in findings:
-        console.print(f"  [bold]Cause:[/bold] {cause}")
-        console.print(f"  [bold]Try:[/bold]   {suggestion}\n")
-    return True
+    from vserve.diagnostics import print_engine_diagnosis
+    return print_engine_diagnosis(backend, console, header=header)
 
 
 def _wait_for_health(
@@ -2633,23 +2347,14 @@ def _build_id_for_backend(backend) -> str:
     return "unknown"
 
 
-def _measure_and_cache(backend, cfg: dict, cfg_path, port: int):
-    """Run a short streaming probe against the just-started backend and
-    persist the result to the perf cache. Returns the PerfEntry on success
-    or None on any soft failure (so the launch path is unaffected)."""
-    from vserve.bench import run_streaming_benchmark
+def _write_bench_to_perf_cache(backend, cfg: dict, cfg_path, served: str, result: BenchResult):
+    """Convert a BenchResult into a PerfEntry and persist to the perf cache.
+    Returns the PerfEntry or None on soft failure."""
     from vserve.gpu import get_gpu_info
     from vserve.perf_cache import (
         PerfEntry, config_hash_from_cfg, gpu_uuid_or_index, write_entry,
     )
 
-    served = _resolve_probe_model_name(backend, cfg)
-    if served is None:
-        return None
-    base_url = f"http://localhost:{port}"
-    result = run_streaming_benchmark(
-        base_url, model=served, concurrency=1, duration_s=5.0, max_tokens=128,
-    )
     if result.requests_completed == 0:
         return None
 
@@ -2689,6 +2394,20 @@ def _measure_and_cache(backend, cfg: dict, cfg_path, port: int):
     )
     write_entry(entry)
     return entry
+
+
+def _measure_and_cache(backend, cfg: dict, cfg_path, port: int):
+    """Run a short streaming probe against the just-started backend and
+    persist the result to the perf cache. Returns the PerfEntry on success
+    or None on any soft failure (so the launch path is unaffected)."""
+    served = _resolve_probe_model_name(backend, cfg)
+    if served is None:
+        return None
+    base_url = f"http://localhost:{port}"
+    result = run_streaming_benchmark(
+        base_url, model=served, concurrency=1, duration_s=5.0, max_tokens=128,
+    )
+    return _write_bench_to_perf_cache(backend, cfg, cfg_path, served, result)
 
 
 def _launch_backend(
@@ -3022,6 +2741,13 @@ def _scripted_config(
     llamacpp_ubatch_size: int | None = None,
     llamacpp_override_tensors: list[str] | None = None,
     llamacpp_no_moe_offload: bool = False,
+    llamacpp_cache_reuse: int | None = None,
+    llamacpp_cram_mb: int | None = None,
+    llamacpp_slot_save_path: str | None = None,
+    llamacpp_swa_full: bool = False,
+    llamacpp_n_cpu_moe: int | None = None,
+    llamacpp_reasoning_budget: int | None = None,
+    thinking: bool | None = None,
 ) -> "pathlib.Path":
     """Build a launch config from CLI flags without prompting."""
     from vserve import config as config_module
@@ -3117,6 +2843,13 @@ def _scripted_config(
             "override_tensors": override_tensors,
             "batch_size": llamacpp_batch_size,
             "ubatch_size": llamacpp_ubatch_size,
+            "cache_reuse": llamacpp_cache_reuse,
+            "cram_mb": llamacpp_cram_mb,
+            "slot_save_path": llamacpp_slot_save_path,
+            "swa_full": llamacpp_swa_full,
+            "n_cpu_moe": llamacpp_n_cpu_moe,
+            "reasoning_budget": llamacpp_reasoning_budget,
+            "thinking": thinking,
         }
         cfg = backend.build_config(m, choices)
         profile_name = save_profile or "custom"
@@ -3192,6 +2925,7 @@ def _scripted_config(
         "optimization_level": recommended_scheduler.get("optimization_level"),
         "block_size": recommended_scheduler.get("block_size"),
         "enable_prefix_caching": True,
+        "thinking": thinking,
     }
     cfg = backend.build_config(m, vllm_choices)
     profile_name = save_profile or "custom"
@@ -3336,140 +3070,6 @@ def profile_rm(
     console.print(f"[green]Deleted[/green] {path}")
 
 
-def _llamacpp_slots_from_limits_entry(entry: object) -> int | None:
-    if isinstance(entry, dict):
-        values = [v for v in entry.values() if v is not None]
-        return max(values) if values else None
-    if entry is None or isinstance(entry, bool) or not isinstance(entry, int):
-        return None
-    return entry
-
-
-def _llamacpp_needs_moe_offload(
-    limits_data: dict, chosen_context: int, chosen_slots: int, effective_kv: str
-) -> bool:
-    """True only when the chosen (context, slots, kv) can't fit on GPU without
-    `-ot`. Auto-applying `-ot` when the model already fits on GPU pushes hot
-    expert weights to system RAM — every lookup then traverses PCIe and
-    tokens/s collapses. Use this gate before auto-enabling the pattern."""
-    moe = limits_data.get("moe")
-    if not isinstance(moe, dict) or not moe.get("is_moe") or not moe.get("ot_pattern"):
-        return False
-    if not limits_data.get("full_offload", True):
-        # Model is already partially on CPU; `-ot` gives a cleaner partition
-        # (move whole expert FFN blocks instead of arbitrary tail layers).
-        return True
-    base = limits_data.get("limits")
-    if not isinstance(base, dict):
-        return False
-    entry = base.get(str(chosen_context))
-    if not isinstance(entry, dict):
-        return False
-    cap = entry.get(effective_kv)
-    if not isinstance(cap, int):
-        cap = entry.get("f16")
-    if not isinstance(cap, int):
-        return False
-    return chosen_slots > cap
-
-
-def _llamacpp_interactive_runtime_defaults(lim: dict) -> tuple[str, dict]:
-    """Return (effective_kv_dtype, effective_limits_table).
-
-    Mirrors the scripted-CLI defaults so the interactive picker advertises
-    slot ceilings that match the run the user will actually get:
-      * KV dtype defaults to `recommended_kv_dtype` (q8_0 if it strictly beats
-        f16 in the matrix, else f16). Without this the picker showed the max
-        across *every* KV-dtype column — including q4_0 — even though the run
-        defaults to f16, producing wildly inflated ceilings.
-
-    Note: this no longer auto-promotes the MoE `limits_with_ot` table. `-ot`
-    sacrifices throughput for KV-cache headroom and is only worth applying
-    when the model can't fit on GPU; that decision happens later via
-    `_llamacpp_needs_moe_offload` once the slot/context choice is known.
-    """
-    recommended_kv = lim.get("recommended_kv_dtype") or "f16"
-    base = lim.get("limits")
-    effective_limits = base if isinstance(base, dict) else {}
-    return recommended_kv, effective_limits
-
-
-def _llamacpp_interactive_slot_ceiling(
-    effective_limits: dict, chosen_ctx: int, effective_kv: str
-) -> int | None:
-    """Slot ceiling for the (context, dtype) the interactive flow will actually
-    run with. Falls back to f16 (the in-library default), then to any value in
-    the row, so legacy / partial caches still produce a usable number."""
-    entry = effective_limits.get(str(chosen_ctx))
-    if not isinstance(entry, dict):
-        return _llamacpp_slots_from_limits_entry(entry)
-    slots = entry.get(effective_kv)
-    if not isinstance(slots, int) or isinstance(slots, bool):
-        slots = entry.get("f16")
-    if not isinstance(slots, int) or isinstance(slots, bool):
-        slots = _llamacpp_slots_from_limits_entry(entry)
-    return slots if isinstance(slots, int) and slots >= 1 else None
-
-
-def _vllm_limits_entry(entry: object) -> dict[str, int | None]:
-    if isinstance(entry, dict):
-        cleaned: dict[str, int | None] = {}
-        for key, value in entry.items():
-            if not isinstance(key, str):
-                continue
-            if value is None or (isinstance(value, int) and not isinstance(value, bool)):
-                cleaned[key] = value
-        return cleaned
-    if entry is None or isinstance(entry, bool) or not isinstance(entry, int):
-        return {}
-    return {"auto": entry}
-
-
-def _vllm_limit_dtype_order(limits_data: dict, limits: dict) -> list[str]:
-    dtypes_obj = limits_data.get("kv_cache_dtypes")
-    if isinstance(dtypes_obj, dict):
-        ordered = [key for key in dtypes_obj if isinstance(key, str)]
-        if ordered:
-            return ordered
-    seen: list[str] = []
-    for _ctx, entry in sorted(limits.items(), key=lambda item: int(str(item[0]))):
-        for dtype in _vllm_limits_entry(entry):
-            if dtype not in seen:
-                seen.append(dtype)
-    preferred = ["auto", "fp8"]
-    return [dtype for dtype in preferred if dtype in seen] + [
-        dtype for dtype in seen if dtype not in preferred
-    ]
-
-
-def _vllm_kv_label(dtype: str) -> str:
-    labels = {
-        "auto": "Auto KV",
-        "fp8": "FP8 KV",
-        "fp8_e4m3": "FP8 e4m3",
-        "fp8_e5m2": "FP8 e5m2",
-        "turboquant_k8v4": "TQ k8v4",
-        "turboquant_4bit_nc": "TQ 4bit",
-        "turboquant_k3v4_nc": "TQ k3v4",
-        "turboquant_3bit_nc": "TQ 3bit",
-        # llama.cpp K/V dtypes — labels are intentionally symmetric since
-        # fused Flash-Attention requires K and V to match.
-        "f16": "F16 KV",
-        "bf16": "BF16 KV",
-        "f32": "F32 KV",
-        "q8_0": "Q8 KV",
-        "q5_1": "Q5_1 KV",
-        "q5_0": "Q5_0 KV",
-        "q4_1": "Q4_1 KV",
-        "q4_0": "Q4_0 KV",
-        "iq4_nl": "IQ4_NL KV",
-    }
-    return labels.get(dtype, dtype)
-
-
-_VLLM_AUTOMATIC_KV_DTYPES = ("auto", "fp8", "fp8_e4m3", "fp8_e5m2", "fp8_inc")
-
-
 def _build_current_tuning_fingerprint(m: ModelInfo, backend, *, gpu, gpu_mem_util: float, runtime_info=None) -> dict:
     from vserve.runtime import build_tuning_fingerprint
 
@@ -3516,135 +3116,6 @@ def _ensure_scripted_limits(m: ModelInfo, backend, *, gpu, gpu_mem_util: float, 
         return lim
     raise RuntimeError(f"{backend.display_name} did not return valid tuning limits")
 
-
-def _choose_vllm_scripted_defaults(
-    m: ModelInfo,
-    limits_data: dict,
-    *,
-    context: int | None,
-    slots: int | None,
-    kv_cache_dtype: str | None,
-) -> tuple[int, str, int, dict]:
-    limits = limits_data.get("limits", {})
-    limits = limits if isinstance(limits, dict) else {}
-    recommendation: dict = {}
-    if context is None and slots is None and kv_cache_dtype is None:
-        recommendations = limits_data.get("recommendations")
-        if isinstance(recommendations, dict):
-            balanced = recommendations.get("balanced")
-            if isinstance(balanced, dict):
-                rec_context = balanced.get("context")
-                rec_kv = balanced.get("kv_cache_dtype")
-                rec_slots = balanced.get("max_num_seqs")
-                if (
-                    isinstance(rec_context, int)
-                    and isinstance(rec_kv, str)
-                    and isinstance(rec_slots, int)
-                    and _vllm_limits_entry(limits.get(str(rec_context), {})).get(rec_kv) is not None
-                ):
-                    return rec_context, rec_kv, rec_slots, dict(balanced)
-
-    working_contexts: list[int] = []
-    for ctx_str, entry in limits.items():
-        try:
-            ctx = int(str(ctx_str))
-        except ValueError:
-            continue
-        choices = _vllm_limits_entry(entry)
-        if kv_cache_dtype is not None:
-            if choices.get(kv_cache_dtype) is not None:
-                working_contexts.append(ctx)
-        elif any(choices.get(dtype) is not None for dtype in _VLLM_AUTOMATIC_KV_DTYPES):
-            working_contexts.append(ctx)
-
-    if not working_contexts:
-        raise ValueError(f"No tuned vLLM capacity is available for {m.full_name}; run vserve tune {m.full_name}")
-    if context is not None and context not in working_contexts:
-        raise ValueError(f"No tuned vLLM capacity for context {context}; run vserve tune {m.full_name} --recalc")
-    chosen_context = context or max(working_contexts)
-    ctx_entry = _vllm_limits_entry(limits.get(str(chosen_context), {}))
-    if kv_cache_dtype is not None:
-        if ctx_entry.get(kv_cache_dtype) is None:
-            raise ValueError(f"No tuned vLLM capacity for context {chosen_context} with KV dtype {kv_cache_dtype}")
-        chosen_kv = kv_cache_dtype
-    else:
-        candidate_kv = next((dtype for dtype in _VLLM_AUTOMATIC_KV_DTYPES if ctx_entry.get(dtype) is not None), None)
-        if candidate_kv is None:
-            raise ValueError(f"No tuned vLLM capacity for context {chosen_context}")
-        chosen_kv = candidate_kv
-
-    if slots is not None:
-        chosen_slots = slots
-    else:
-        tuned_slots = ctx_entry.get(chosen_kv)
-        if tuned_slots is None:
-            raise ValueError(f"No tuned vLLM slot count for context {chosen_context} with KV dtype {chosen_kv}")
-        chosen_slots = int(tuned_slots)
-    return chosen_context, chosen_kv, chosen_slots, recommendation
-
-
-def _choose_llamacpp_scripted_defaults(
-    m: ModelInfo,
-    limits_data: dict,
-    *,
-    context: int | None,
-    slots: int | None,
-    gpu_layers: int | None,
-    kv_cache_k: str | None = None,
-    kv_cache_v: str | None = None,
-) -> tuple[int, int, int, str, str]:
-    """Pick (context, slots, n_gpu_layers, kv_cache_k, kv_cache_v) for a
-    scripted llama.cpp run. KV dtype defaults to the tuner's recommendation
-    (f16 unless q8_0 strictly fits more slots — see
-    LlamaCppBackend._recommended_kv_dtype). The fused Flash-Attention path
-    requires K and V to match, so a single dtype is picked unless the user
-    explicitly passes asymmetric K and V values.
-    """
-    limits = limits_data.get("limits", {})
-    limits = limits if isinstance(limits, dict) else {}
-    working_contexts: list[int] = []
-    for ctx_str, entry in limits.items():
-        try:
-            ctx = int(str(ctx_str))
-        except ValueError:
-            continue
-        if _llamacpp_slots_from_limits_entry(entry) is not None:
-            working_contexts.append(ctx)
-    if not working_contexts:
-        raise ValueError(f"No tuned llama.cpp capacity is available for {m.full_name}; run vserve tune {m.full_name}")
-    if context is not None and context not in working_contexts:
-        raise ValueError(f"No tuned llama.cpp capacity for context {context}; run vserve tune {m.full_name} --recalc")
-    chosen_context = context or max(working_contexts)
-
-    recommended_kv = limits_data.get("recommended_kv_dtype") or "f16"
-    chosen_k = kv_cache_k or recommended_kv
-    chosen_v = kv_cache_v or kv_cache_k or recommended_kv
-
-    if slots is not None:
-        chosen_slots = slots
-    else:
-        entry = limits.get(str(chosen_context))
-        if isinstance(entry, dict):
-            tuned_slots: int | None = entry.get(chosen_k)
-            if tuned_slots is None:
-                # Fall back to f16 row then to max across dtypes.
-                tuned_slots = entry.get("f16")
-            if tuned_slots is None:
-                tuned_slots = _llamacpp_slots_from_limits_entry(entry)
-        else:
-            tuned_slots = _llamacpp_slots_from_limits_entry(entry)
-        if tuned_slots is None:
-            raise ValueError(f"No tuned llama.cpp slot count for context {chosen_context}")
-        chosen_slots = int(tuned_slots)
-
-    tuned_layers = limits_data.get("n_gpu_layers")
-    if gpu_layers is not None:
-        chosen_layers = gpu_layers
-    else:
-        if not isinstance(tuned_layers, int):
-            raise ValueError(f"No tuned llama.cpp GPU layer count for {m.full_name}; run vserve tune {m.full_name}")
-        chosen_layers = tuned_layers
-    return chosen_context, chosen_slots, chosen_layers, chosen_k, chosen_v
 
 
 def _detect_capabilities_for_scripted_run(m: ModelInfo, backend) -> dict:
@@ -4047,6 +3518,13 @@ def run(
     ubatch_size_lc: int | None = typer.Option(None, "--ubatch-size", help="llama.cpp physical batch size (-ub); default 512"),
     override_tensor: list[str] = typer.Option([], "--override-tensor", "-ot", help="llama.cpp --override-tensor pattern (repeatable, e.g. '.ffn_.*_exps.=CPU')"),
     no_moe_offload: bool = typer.Option(False, "--no-moe-offload", help="Disable the auto-applied MoE expert-CPU offload (-ot)"),
+    thinking: bool | None = typer.Option(None, "--thinking/--no-thinking", help="Enable/disable model thinking-mode (chat-template-kwargs: enable_thinking or thinking, depending on family)"),
+    cache_reuse: int | None = typer.Option(None, "--cache-reuse", help="llama.cpp --cache-reuse N: enable prefix cache reuse with N-token min run"),
+    cram_mb: int | None = typer.Option(None, "--cram-mb", help="llama.cpp --cram MB: swap-to-host limit for inactive slots (MB)"),
+    slot_save_path: str | None = typer.Option(None, "--slot-save-path", help="llama.cpp --slot-save-path: persist slot KV-cache to this directory"),
+    swa_full: bool = typer.Option(False, "--swa-full", help="llama.cpp --swa-full: enable full-attention before sliding-window (required with --cache-reuse on Gemma-4)"),
+    n_cpu_moe: int | None = typer.Option(None, "--n-cpu-moe", help="llama.cpp --n-cpu-moe N: number of MoE experts to keep on CPU (use 99 for all)"),
+    reasoning_budget: int | None = typer.Option(None, "--reasoning-budget", help="llama.cpp --reasoning-budget N: max tokens for the reasoning channel"),
 ):
     """Start serving a model — interactive config picker."""
     from vserve.backends import get_backend, get_backend_by_name
@@ -4073,7 +3551,7 @@ def run(
         size_w = max(len(f"{m.model_size_gb} GB") for m in all_models)
         items = []
         for m in all_models:
-            lim = read_limits(limits_path(m.provider, m.model_name))
+            lim = read_limits_for(m.provider, m.model_name)
             size = f"{m.model_size_gb} GB"
 
             # Capability tags
@@ -4199,6 +3677,13 @@ def run(
             llamacpp_ubatch_size=ubatch_size_lc,
             llamacpp_override_tensors=list(override_tensor) if override_tensor else None,
             llamacpp_no_moe_offload=no_moe_offload,
+            llamacpp_cache_reuse=cache_reuse,
+            llamacpp_cram_mb=cram_mb,
+            llamacpp_slot_save_path=slot_save_path,
+            llamacpp_swa_full=swa_full,
+            llamacpp_n_cpu_moe=n_cpu_moe,
+            llamacpp_reasoning_budget=reasoning_budget,
+            thinking=thinking,
         )
     else:
         if m is None:
@@ -4595,6 +4080,148 @@ def fan(
 
     _start_daemon(qs, qe, qm)
     console.print(f"  Quiet {qs:02d}:00-{qe:02d}:00 (max {qm}%), otherwise 100%")
+
+
+def _find_running_backend_and_cfg():
+    """Locate the currently running backend, its config dict, port, and config-path.
+
+    Returns (backend, cfg, cfg_path, port) tuple. Returns None on the first
+    field if no backend is running.
+    """
+    import json as _json
+    from vserve.backends import _BACKENDS
+    from vserve.config import read_active_manifest
+
+    for backend in _BACKENDS:
+        try:
+            is_up = bool(backend.is_running())
+        except Exception:
+            continue
+        if not is_up:
+            continue
+        # Backend is up — pull port + cfg path from the active manifest.
+        manifest = None
+        manifest_path_fn = getattr(backend, "active_manifest_path", None)
+        if callable(manifest_path_fn):
+            try:
+                mpath = manifest_path_fn()
+                if isinstance(mpath, (str, pathlib.Path)):
+                    manifest = read_active_manifest(pathlib.Path(mpath))
+            except Exception:
+                manifest = None
+        if not isinstance(manifest, dict):
+            return backend, None, None, None
+        port = manifest.get("port")
+        cfg_path_str = manifest.get("config_path")
+        cfg: dict = {}
+        cfg_path = None
+        if isinstance(cfg_path_str, str) and cfg_path_str:
+            candidate = pathlib.Path(cfg_path_str)
+            if candidate.exists():
+                try:
+                    data = _json.loads(candidate.read_text())
+                    if isinstance(data, dict):
+                        cfg = data
+                        cfg_path = candidate
+                except Exception:
+                    cfg = {}
+        return backend, cfg, cfg_path, port if isinstance(port, int) else None
+    return None, None, None, None
+
+
+@app.command()
+def bench(
+    duration_s: float = typer.Option(30.0, "--duration-s", help="How long to drive load (seconds)"),
+    concurrency: int = typer.Option(1, "--concurrency", help="Number of parallel streaming requests"),
+    max_tokens: int = typer.Option(256, "--max-tokens", help="Cap per-request generation length"),
+    max_latency_ms: float | None = typer.Option(None, "--max-latency-ms", help="Abort early if any request E2E exceeds this"),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Don't write the result to the perf cache"),
+    json_output: bool = typer.Option(False, "--json", help="Emit raw BenchResult fields as JSON"),
+    prompt: str = typer.Option(
+        "Write one paragraph about GPU inference tuning.",
+        "--prompt", help="Prompt to send for each request",
+    ),
+):
+    """Benchmark the currently running backend (TTFT / TPOT / ITL / E2E percentiles)."""
+    import json as _json
+
+    backend, cfg, cfg_path, port = _find_running_backend_and_cfg()
+    if backend is None or not isinstance(port, int):
+        console.print(
+            "[red]No vserve backend is currently running.[/red] "
+            "Start one with `vserve run`, then retry."
+        )
+        raise typer.Exit(1)
+
+    if cfg is None:
+        cfg = {}
+    served = _resolve_probe_model_name(backend, cfg)
+    if not served:
+        console.print(
+            "[red]Could not resolve served-model name from the running backend.[/red] "
+            "Try `vserve status` to inspect the active config."
+        )
+        raise typer.Exit(1)
+
+    base_url = f"http://localhost:{port}"
+    try:
+        result = run_streaming_benchmark(
+            base_url,
+            model=served,
+            concurrency=concurrency,
+            duration_s=duration_s,
+            max_tokens=max_tokens,
+            max_latency_ms=max_latency_ms,
+            prompt=prompt,
+        )
+    except Exception as exc:
+        console.print(f"[red]Benchmark error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    if json_output:
+        from dataclasses import asdict
+        print(_json.dumps(asdict(result), indent=2))
+    else:
+        _print_bench_result(backend, served, port, result)
+
+    if not no_cache and result.requests_completed > 0:
+        try:
+            _write_bench_to_perf_cache(backend, cfg, cfg_path, served, result)
+        except Exception:
+            pass
+
+
+def _print_bench_result(backend, served: str, port: int, result: BenchResult) -> None:
+    """Pretty-print a BenchResult for the `vserve bench` command."""
+    console.print(
+        f"\n[bold]{backend.display_name}[/bold] · {served} · "
+        f"http://localhost:{port}    "
+        f"[dim]({result.requests_completed}/{result.requests_total} requests in "
+        f"{result.total_seconds:.1f}s)[/dim]"
+    )
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("metric", justify="left", style="dim")
+    table.add_column("p50", justify="right")
+    table.add_column("p99", justify="right")
+
+    def _fmt_ms(value: float | None) -> str:
+        return f"{value:.1f} ms" if value is not None else "—"
+
+    table.add_row("TTFT", _fmt_ms(result.ttft_ms_p50), _fmt_ms(result.ttft_ms_p99))
+    table.add_row("TPOT", _fmt_ms(result.tpot_ms_p50), _fmt_ms(result.tpot_ms_p99))
+    table.add_row("ITL  (p99)", "—", _fmt_ms(result.itl_ms_p99))
+    table.add_row("E2E  (p99)", "—", _fmt_ms(result.e2e_p99_ms))
+    console.print(table)
+
+    console.print(
+        f"  Throughput: [bold]{result.throughput_tokens_per_sec:.1f} tok/s[/bold]"
+        f"    {result.throughput_requests_per_sec:.2f} req/s"
+    )
+
+    if result.errors:
+        console.print(f"\n  [yellow]Errors ({len(result.errors)} shown):[/yellow]")
+        for err in result.errors:
+            console.print(f"    [dim]·[/dim] {err}")
 
 
 @app.command()
@@ -5232,525 +4859,28 @@ def init():
     console.print()
 
 
-def _doctor_summary_label(warn_count: int, fail_count: int) -> str:
-    if fail_count == 0 and warn_count == 0:
-        return "All clear"
-    if fail_count == 0:
-        return f"{warn_count} warning(s) found"
-    if warn_count == 0:
-        return f"{fail_count} issue(s) found"
-    return f"{fail_count} issue(s) and {warn_count} warning(s) found"
-
-
 @app.command()
 def doctor(
     strict: bool = typer.Option(False, "--strict", help="Exit nonzero if any check fails"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ):
-    """Check system readiness."""
-    import json
-    import os
-    import subprocess
-    import socket
-    from pathlib import Path
+    """Check system readiness.
 
-    from vserve.config import (
-        VLLM_BIN,
-        VLLM_ROOT,
-        active_yaml_path,
-        try_read_profile_yaml,
-        LOGS_DIR,
-        find_systemd_unit_path,
-        unit_uses_environment_file,
+    Body extracted to `vserve.cli_doctor.run_doctor` in 0.6.3 (audit
+    `docs/audits/2026-05-20-cli-sprawl.md` — was 513 lines incl. a
+    364-line nested helper closure).
+    """
+    from vserve.cli_doctor import run_doctor
+
+    return run_doctor(
+        console,
+        strict=strict,
+        json_output=json_output,
+        safe_path_exists=_safe_path_exists,
+        safe_resolve_path=_safe_resolve_path,
+        all_models_fn=_all_models,
+        read_limits_for_fn=read_limits_for,
     )
-    from vserve.backends import running_backend as _running_backend
-
-    ok_count = 0
-    warn_count = 0
-    fail_count = 0
-    checks: list[dict[str, str]] = []
-
-    def _emit(*args, **kwargs) -> None:
-        if not json_output:
-            console.print(*args, **kwargs)
-
-    def _ok(msg: str) -> None:
-        nonlocal ok_count
-        checks.append({"status": "ok", "message": msg, "fix": ""})
-        _emit(f"  [green]OK[/green]    {msg}")
-        ok_count += 1
-
-    def _fail(msg: str, fix: str = "") -> None:
-        nonlocal fail_count
-        checks.append({"status": "fail", "message": msg, "fix": fix})
-        _emit(f"  [red]FAIL[/red]  {msg}")
-        if fix:
-            _emit(f"          Fix: {fix}")
-        fail_count += 1
-
-    def _warn(msg: str, fix: str = "") -> None:
-        nonlocal warn_count
-        checks.append({"status": "warn", "message": msg, "fix": fix})
-        _emit(f"  [yellow]WARN[/yellow]  {msg}")
-        if fix:
-            _emit(f"          Fix: {fix}")
-        warn_count += 1
-
-    def _fail_or_warn(required: bool, msg: str, fix: str = "") -> None:
-        if required:
-            _fail(msg, fix)
-        else:
-            _warn(msg, fix)
-
-    _emit("\n[bold]vserve doctor[/bold]\n")
-
-    from vserve.config import cfg as _cfg
-    _c = _cfg()
-    vllm_runtime_present = VLLM_BIN.exists()
-    vllm_required = vllm_runtime_present or _c.llamacpp_root is None
-
-    # -- Environment --
-    _emit("  [bold]Environment[/bold]")
-
-    # nvcc
-    try:
-        r = subprocess.run(["nvcc", "--version"], capture_output=True, text=True, timeout=5,
-                           env={**os.environ, "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", "")})
-        if r.returncode == 0:
-            nvcc_lines = [ln for ln in r.stdout.splitlines() if "release" in ln]
-            _ok(f"nvcc {nvcc_lines[0].split('release')[-1].strip().rstrip(',') if nvcc_lines else 'found'}")
-        else:
-            _fail("nvcc not working", "Install CUDA toolkit or check /usr/local/cuda/bin/nvcc")
-    except Exception:
-        _fail("nvcc not found", "Install: sudo apt install nvidia-cuda-toolkit  OR  https://developer.nvidia.com/cuda-downloads")
-
-    # vLLM
-    if vllm_required:
-        try:
-            r = subprocess.run([str(VLLM_BIN), "--version"], capture_output=True, text=True, timeout=10)
-            if r.returncode == 0:
-                ver = r.stdout.strip() or r.stderr.strip() or "found"
-                _ok(f"vLLM {ver}")
-            else:
-                details = r.stderr.strip() or r.stdout.strip()
-                _fail(f"vLLM not working at {VLLM_BIN}", details or "Check the vLLM installation and environment")
-        except Exception:
-            _fail(f"vLLM not found at {VLLM_BIN}")
-    else:
-        _warn("vLLM not configured (skipped — llama.cpp-only setup)")
-
-    # GPU
-    try:
-        from vserve.gpu import get_gpu_info
-        gpu = get_gpu_info()
-        mem_used = 0
-        try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"], timeout=5)
-            mem_used = int(out.decode().strip().split("\n")[0])
-        except Exception:
-            pass
-        _ok(f"{gpu.name} ({gpu.vram_total_gb:.0f} GB, {mem_used} MiB used)")
-    except Exception:
-        _fail("GPU not accessible", "Install NVIDIA drivers: https://www.nvidia.com/drivers  then check: nvidia-smi")
-
-    # -- Backends --
-    _emit("\n  [bold]Backends[/bold]")
-    from vserve.backends import _BACKENDS
-    for b in _BACKENDS:
-        for desc, check_fn in b.doctor_checks():
-            try:
-                if check_fn():
-                    _ok(desc)
-                else:
-                    _warn(desc)
-            except Exception:
-                _warn(f"{desc} (check error)")
-
-    # -- Per-backend checks --
-    # ── vLLM ──
-    _emit("\n  [bold]vLLM[/bold]")
-
-    # Runtime compatibility
-    if not vllm_required:
-        _warn("vLLM checks skipped (llama.cpp-only setup)")
-    else:
-        try:
-            from vserve.runtime import check_vllm_compatibility, collect_vllm_runtime_info
-
-            runtime_info = collect_vllm_runtime_info(_c)
-            runtime_check = check_vllm_compatibility(runtime_info)
-            if runtime_check.supported:
-                _ok(f"Runtime supported ({runtime_info.vllm_version}, {runtime_check.range})")
-            else:
-                _fail("Unsupported vLLM runtime", "; ".join(runtime_check.errors))
-            for warning in runtime_check.warnings:
-                _warn(warning)
-        except Exception as exc:
-            _warn("Could not complete vLLM runtime compatibility check", str(exc))
-
-    # Service user
-    try:
-        r = subprocess.run(["id", _c.service_user], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            _ok(f"Service user '{_c.service_user}' exists")
-        else:
-            _fail_or_warn(vllm_required, f"Service user '{_c.service_user}' not found")
-    except Exception:
-        _fail_or_warn(vllm_required, "Cannot check service user")
-
-    # systemd unit
-    svc_path = find_systemd_unit_path(_c.service_name)
-    if svc_path is not None:
-        try:
-            svc_content = svc_path.read_text()
-        except (OSError, UnicodeDecodeError) as exc:
-            _warn(f"Could not read systemd unit: {svc_path.name}", str(exc))
-        else:
-            unit_failed = False
-            if "ProtectSystem=strict" in svc_content:
-                _fail_or_warn(
-                    vllm_required,
-                    "systemd unit has ProtectSystem=strict",
-                    "Remove it — breaks nvcc JIT compilation",
-                )
-                unit_failed = vllm_required
-            if "TimeoutStartSec" not in svc_content:
-                _warn("No TimeoutStartSec in service — default 90s may be too short for JIT",
-                      "Add TimeoutStartSec=600")
-            env_path = VLLM_ROOT / "configs" / ".env"
-            if not unit_uses_environment_file(svc_content, env_path):
-                _fail_or_warn(
-                    vllm_required,
-                    "systemd unit does not load vserve configs/.env",
-                    f"Add EnvironmentFile={env_path} so CUDA_VISIBLE_DEVICES is enforced",
-                )
-                unit_failed = vllm_required
-            if not unit_failed:
-                _ok("systemd unit configured correctly")
-    else:
-        _fail_or_warn(
-            vllm_required,
-            f"No systemd unit found for {_c.service_name}.service",
-            "Create one: https://docs.vllm.ai  or see vserve docs/troubleshooting.md",
-        )
-
-    # .env
-    env_path = VLLM_ROOT / "configs" / ".env"
-    if env_path.exists():
-        try:
-            env_content = env_path.read_text()
-            missing = [v for v in ["CUDA_HOME", "TMPDIR", "VLLM_RPC_BASE_PATH", "CUDA_VISIBLE_DEVICES"] if v not in env_content]
-            if missing:
-                _warn(f".env missing: {', '.join(missing)}")
-            else:
-                _ok(".env has required variables")
-        except PermissionError:
-            _ok(".env exists (not readable — OK, contains secrets)")
-        except (OSError, UnicodeDecodeError) as exc:
-            _warn(f".env unreadable: {env_path}", str(exc))
-    else:
-        _fail_or_warn(vllm_required, f"No .env at {env_path}")
-
-    # Models directory
-    vllm_models = VLLM_ROOT / "models"
-    if vllm_models.exists():
-        try:
-            vllm_mc = sum(1 for p in vllm_models.glob("*/*/config.json"))
-        except OSError as exc:
-            _warn(f"Models dir unreadable: {vllm_models}", str(exc))
-        else:
-            _ok(f"Models dir: {vllm_models} ({vllm_mc} models)")
-    else:
-        _warn(f"Models dir {vllm_models} does not exist")
-
-    # Caches
-    cache_checks = [
-        (VLLM_ROOT / ".cache" / "flashinfer", "FlashInfer JIT"),
-        (VLLM_ROOT / ".cache" / "vllm" / "torch_compile_cache", "torch.compile"),
-    ]
-    for cdir, label in cache_checks:
-        if not cdir.exists():
-            _warn(f"{label} cache missing — first start will JIT compile (2-10 min)")
-            continue
-        try:
-            files = []
-            for f in cdir.rglob("*"):
-                try:
-                    if f.is_file():
-                        files.append(f)
-                except OSError:
-                    continue
-        except OSError as exc:
-            _warn(f"{label} cache unreadable", str(exc))
-            continue
-        if not files:
-            _warn(f"{label} cache dir exists but is empty — first start may be slow")
-            continue
-        size_bytes = 0
-        for f in files:
-            try:
-                size_bytes += f.stat().st_size
-            except OSError:
-                continue
-        _ok(f"{label} cache ({size_bytes / (1024 * 1024):.0f} MB)")
-
-    # Active config
-    active = active_yaml_path()
-    active_is_symlink = active.is_symlink()
-    if active_is_symlink:
-        target = _safe_resolve_path(active)
-        if target is None:
-            _warn("active.yaml symlink is unreadable or recursive")
-        elif _safe_path_exists(target):
-            cfg_data = try_read_profile_yaml(active)
-            if cfg_data is None:
-                _warn(f"active.yaml unreadable: {target.name}")
-            else:
-                model_path = cfg_data.get("model", "")
-                if isinstance(model_path, (str, os.PathLike)) and model_path and Path(model_path).exists():
-                    _ok(f"active.yaml → {target.name}")
-                else:
-                    _fail_or_warn(vllm_required, f"active.yaml model path missing: {model_path}")
-        else:
-            _fail_or_warn(vllm_required, f"active.yaml → broken symlink: {target}")
-    elif _safe_path_exists(active):
-        _ok("active.yaml exists (not a symlink)")
-    else:
-        _ok("No active.yaml (clean — will be created on vserve run)")
-
-    # TMPDIR
-    tmp_dir = VLLM_ROOT / "tmp"
-    if tmp_dir.exists() and tmp_dir.is_dir():
-        _ok(f"TMPDIR at {tmp_dir}")
-        try:
-            sockets = list(tmp_dir.rglob("*"))
-            stale = [s for s in sockets if s.is_socket()]
-        except OSError as exc:
-            _warn(f"Could not inspect TMPDIR sockets: {tmp_dir}", str(exc))
-        else:
-            if len(stale) > 10:
-                _warn(f"{len(stale)} stale sockets in {tmp_dir}", f"sudo find {tmp_dir} -type s -delete")
-    else:
-        _fail_or_warn(
-            vllm_required,
-            f"TMPDIR {tmp_dir} does not exist",
-            f"sudo mkdir -p {tmp_dir} && sudo chown vllm:llm {tmp_dir}",
-        )
-
-    # ── llama.cpp ──
-    _emit("\n  [bold]llama.cpp[/bold]")
-
-    lc_root = _c.llamacpp_root
-    if lc_root is None:
-        _warn("llama.cpp not configured (run vserve init to detect)")
-    else:
-        _ok(f"Root: {lc_root}")
-
-        # Binary
-        lc_bin = lc_root / "bin" / "llama-server"
-        if lc_bin.exists():
-            try:
-                r = subprocess.run([str(lc_bin), "--version"], capture_output=True, text=True, timeout=5)
-                if r.returncode == 0:
-                    ver_line = ""
-                    for ln in (r.stdout + r.stderr).splitlines():
-                        if "version" in ln.lower() or ln.startswith("b"):
-                            ver_line = ln.strip()
-                            break
-                    _ok(f"llama-server {ver_line}" if ver_line else f"llama-server at {lc_bin}")
-                else:
-                    details = r.stderr.strip() or r.stdout.strip()
-                    _fail(f"llama-server at {lc_bin} is not working",
-                          details or "Build or reinstall llama.cpp")
-            except Exception:
-                _fail(f"llama-server at {lc_bin} is not working")
-        elif __import__("shutil").which("llama-server"):
-            _ok("llama-server found on PATH")
-        else:
-            _fail("llama-server not found",
-                  "Build: cmake -B build -DGGML_CUDA=ON && cmake --build build -t llama-server")
-
-        # Service user
-        lc_user = _c.llamacpp_service_user
-        try:
-            r = subprocess.run(["id", lc_user], capture_output=True, text=True, timeout=5)
-            if r.returncode == 0:
-                _ok(f"Service user '{lc_user}' exists")
-            else:
-                _fail(f"Service user '{lc_user}' not found",
-                      f"sudo useradd -r -s /usr/sbin/nologin -g llm {lc_user}")
-        except Exception:
-            _fail("Cannot check llama-cpp service user")
-
-        # systemd unit (deep inspection, matching vLLM)
-        lc_svc = _c.llamacpp_service_name
-        lc_svc_path = find_systemd_unit_path(lc_svc)
-        if lc_svc_path is not None:
-            try:
-                lc_svc_content = lc_svc_path.read_text()
-            except (OSError, UnicodeDecodeError) as exc:
-                _warn(f"Could not read {lc_svc}.service", str(exc))
-            else:
-                issues = []
-                active_sh = lc_root / "configs" / "active.sh"
-                active_sh_has_cuda = False
-                try:
-                    active_sh_has_cuda = active_sh.exists() and "CUDA_VISIBLE_DEVICES" in active_sh.read_text()
-                except (OSError, UnicodeDecodeError):
-                    active_sh_has_cuda = False
-                if "CUDA_VISIBLE_DEVICES" not in lc_svc_content and not active_sh_has_cuda:
-                    issues.append("missing CUDA_VISIBLE_DEVICES (may use wrong GPU)")
-                if "TimeoutStartSec" not in lc_svc_content:
-                    issues.append("no TimeoutStartSec (large models need time)")
-                if issues:
-                    _warn(f"{lc_svc}.service: {'; '.join(issues)}")
-                else:
-                    _ok(f"{lc_svc}.service unit configured correctly")
-        else:
-            _fail(f"No systemd unit found for {lc_svc}.service",
-                  f"Create /etc/systemd/system/{lc_svc}.service with ExecStart={lc_root}/configs/active.sh")
-
-        # Models directory
-        lc_models = lc_root / "models"
-        if lc_models.exists():
-            try:
-                from vserve.model_files import iter_recursive_files_with_suffix
-                model_count = len(iter_recursive_files_with_suffix(lc_models, ".gguf"))
-            except OSError as exc:
-                _warn(f"Models dir unreadable: {lc_models}", str(exc))
-            else:
-                _ok(f"Models dir: {lc_models} ({model_count} GGUF files)")
-        else:
-            _warn(f"Models dir {lc_models} does not exist",
-                  f"sudo mkdir -p {lc_models} && sudo chown {lc_user}:llm {lc_models}")
-
-        # Configs directory + active config
-        lc_configs = lc_root / "configs"
-        if lc_configs.exists():
-            active_sh = lc_configs / "active.sh"
-            active_json = lc_configs / "active.json"
-            if active_sh.exists():
-                _ok("active.sh launch script present")
-            else:
-                _ok(f"Configs dir: {lc_configs} (no active config yet)")
-            if active_json.exists():
-                try:
-                    import json as _json2
-                    lc_cfg = _json2.loads(active_json.read_text())
-                    lc_model = lc_cfg.get("model", "")
-                    if isinstance(lc_model, (str, os.PathLike)) and lc_model and Path(lc_model).exists():
-                        _ok(f"active.json → {Path(lc_model).name}")
-                    elif lc_model:
-                        _fail(f"active.json model path missing: {lc_model}")
-                except Exception:
-                    _warn("active.json exists but unreadable")
-        else:
-            _warn(f"Configs dir {lc_configs} does not exist",
-                  f"sudo mkdir -p {lc_configs} && sudo chown {lc_user}:llm {lc_configs}")
-
-        # gguf package
-        try:
-            import gguf  # type: ignore[import-not-found, import-untyped]  # noqa: F401
-            _ok("gguf package installed")
-        except ImportError:
-            _warn("gguf package not installed — needed for GGUF metadata reading",
-                  "pip install 'vserve\\[llamacpp]'")
-
-    # -- Shared --
-    _emit("\n  [bold]Shared[/bold]")
-
-    def _port_open(port: int) -> bool:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            return s.connect_ex(("127.0.0.1", port)) == 0
-
-    def _health_ok(backend, port: int) -> bool:
-        try:
-            from urllib.request import urlopen
-            with urlopen(backend.health_url(port), timeout=1) as resp:
-                return resp.status == 200
-        except Exception:
-            return False
-
-    def _active_backend_port(backend) -> int:
-        try:
-            if backend.name == "llamacpp":
-                active_config_path_fn = getattr(backend, "_active_config_path", None)
-                active_json = active_config_path_fn().with_suffix(".json") if callable(active_config_path_fn) else None
-                if active_json is not None and active_json.exists():
-                    data = json.loads(active_json.read_text())
-                    if isinstance(data, dict):
-                        return int(data.get("port", _c.port))
-            active_cfg = try_read_profile_yaml(active_yaml_path()) or {}
-            return int(active_cfg.get("port", _c.port))
-        except Exception:
-            return int(_c.port)
-
-    # Port
-    _port = _c.port
-    port_in_use = _port_open(_port)
-    active_backend = _running_backend()
-    if active_backend is not None:
-        active_port = _active_backend_port(active_backend)
-        active_port_open = _port_open(active_port)
-        active_health_ok = _health_ok(active_backend, active_port)
-        if active_port_open or active_health_ok:
-            _ok(f"{active_backend.display_name} serving on port {active_port}")
-            if active_port != _port:
-                _warn(f"Configured default port is {_port}, active backend uses {active_port}")
-        else:
-            _fail(
-                f"{active_backend.display_name} appears active but port {active_port} is not open",
-                f"Check: sudo journalctl -u {active_backend.service_name} --no-pager -n 50",
-            )
-    elif port_in_use:
-        _fail(f"Port {_port} in use but no backend running — something else is bound",
-              f"Check: sudo lsof -i :{_port}  then stop the other service or change port in ~/.config/vserve/config.yaml")
-    else:
-        _ok(f"Port {_port} available")
-
-    # Log size
-    log_file = LOGS_DIR / "vllm.log"
-    if log_file.exists():
-        try:
-            size_mb = log_file.stat().st_size / (1024 * 1024)
-        except OSError as exc:
-            _warn(f"Could not read log metadata: {log_file}", str(exc))
-        else:
-            if size_mb > 100:
-                _warn(f"vllm.log is {size_mb:.0f} MB", "Consider truncating or adding log rotation")
-            else:
-                _ok(f"vllm.log ({size_mb:.0f} MB)")
-
-    # Multi-user messaging
-    import grp
-    try:
-        tty_members = grp.getgrnam("tty").gr_mem
-        import os
-        me = os.environ.get("USER", "")
-        if me in tty_members:
-            _ok("tty group (terminal messaging between users)")
-        else:
-            _warn(f"'{me}' not in tty group — vserve can't DM other users",
-                  f"sudo usermod -aG tty {me}  (then re-login)")
-    except KeyError:
-        _warn("tty group not found")
-
-    # Models
-    all_models = _all_models()
-    probed = sum(1 for m in all_models if read_limits(limits_path(m.provider, m.model_name)))
-    _ok(f"{len(all_models)} models downloaded, {probed} probed")
-
-    summary = {"ok": ok_count, "warn": warn_count, "fail": fail_count}
-    if json_output:
-        typer.echo(json.dumps({"summary": summary, "checks": checks}, sort_keys=True))
-    else:
-        console.print(
-            f"\n  [bold]{_doctor_summary_label(warn_count, fail_count)}[/bold]  "
-            f"({ok_count} ok, {warn_count} warn, {fail_count} fail)\n",
-        )
-    if strict and fail_count:
-        raise typer.Exit(1)
 
 
 # ── Cache management ──

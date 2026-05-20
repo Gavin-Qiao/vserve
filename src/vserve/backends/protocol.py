@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol, TypedDict, runtime_checkable
 
 if TYPE_CHECKING:
     from vserve.gpu import GpuInfo
@@ -54,6 +54,83 @@ CacheFingerprint = Mapping[str, Any]
 ProfileData = Mapping[str, Any]
 
 
+class Choices(TypedDict, total=False):
+    """Canonical keys for the ``choices`` dict passed to
+    :py:meth:`Backend.build_config`.
+
+    0.6.3: codifies the contract the audit
+    (`docs/audits/2026-05-20-backend-consistency.md` finding #2) flagged
+    as drifting between backends. Existing call sites still pass plain
+    dicts; this TypedDict is a documentation + type-check hook for
+    future call sites to use ``Choices(context=..., slots=...)``.
+
+    Per-backend specifics:
+
+    * **Both backends**: ``context``, ``port``, ``tools``, ``tool_parser``,
+      ``reasoning_parser``, ``thinking``, ``chat_template_kwargs``,
+      ``embedding``, ``pooling``.
+    * **vLLM only** (silently dropped by llama.cpp):
+      ``kv_dtype`` (use ``kv_cache_k`` / ``kv_cache_v`` on llama.cpp),
+      ``slots`` (canonical name; llama.cpp uses ``parallel`` as an
+      alias for the same concept),
+      ``batched_tokens``, ``gpu_mem_util``, ``trust_remote_code``,
+      ``performance_mode``, ``optimization_level``, ``block_size``,
+      ``kv_cache_memory_bytes``, ``enable_prefix_caching``,
+      ``attention_backend``, ``gpu_compute_cap``.
+    * **llama.cpp only** (silently dropped by vLLM):
+      ``parallel`` (alias for ``slots``), ``n_gpu_layers``,
+      ``kv_cache_k``, ``kv_cache_v``, ``batch_size``, ``ubatch_size``,
+      ``override_tensors``, ``mmap``, ``cache_reuse``, ``cram_mb``,
+      ``slot_save_path``, ``swa_full``, ``n_cpu_moe``,
+      ``reasoning_budget``, ``mmproj``, ``reasoning_format``,
+      ``spec_draft``.
+    """
+
+    # Both backends
+    context: int
+    port: int
+    tools: bool
+    tool_parser: str | None
+    reasoning_parser: str | None
+    thinking: bool | None
+    chat_template_kwargs: dict[str, Any]
+    embedding: bool
+    pooling: str | None
+
+    # vLLM-side (slots is canonical; llama.cpp aliases as `parallel`)
+    slots: int
+    kv_dtype: str
+    batched_tokens: int | None
+    gpu_mem_util: float
+    trust_remote_code: bool
+    performance_mode: str | None
+    optimization_level: str | None
+    block_size: int | None
+    kv_cache_memory_bytes: int | None
+    enable_prefix_caching: bool
+    attention_backend: str | None
+    gpu_compute_cap: int | None
+
+    # llama.cpp-side
+    parallel: int
+    n_gpu_layers: int
+    kv_cache_k: str
+    kv_cache_v: str
+    batch_size: int | None
+    ubatch_size: int | None
+    override_tensors: list[str]
+    mmap: bool
+    cache_reuse: int | None
+    cram_mb: int | None
+    slot_save_path: str | None
+    swa_full: bool
+    n_cpu_moe: int | None
+    reasoning_budget: int | None
+    mmproj: str | None
+    reasoning_format: str | None
+    spec_draft: dict[str, Any] | None
+
+
 @runtime_checkable
 class Backend(Protocol):
     """What every inference backend must provide."""
@@ -84,12 +161,21 @@ class Backend(Protocol):
         """Locate the server binary or launch command. None = not installed."""
         ...
 
-    def runtime_info(self) -> RuntimeIdentity | Any:
-        """Collect version and dependency facts for this backend runtime."""
+    def runtime_info(self) -> RuntimeIdentity:
+        """Collect version and dependency facts for this backend runtime.
+
+        0.6.3: tightened from ``RuntimeIdentity | Any`` to ``RuntimeIdentity``
+        once llamacpp.runtime_info was migrated off the ad-hoc dict shape.
+        """
         ...
 
-    def compatibility(self) -> CompatibilityResult | Any:
-        """Return this backend's runtime compatibility check."""
+    def compatibility(self) -> CompatibilityResult:
+        """Return this backend's runtime compatibility check.
+
+        0.6.3: tightened from ``CompatibilityResult | Any`` to
+        ``CompatibilityResult`` once llamacpp.compatibility was migrated
+        off the ad-hoc dict shape.
+        """
         ...
 
     def tune(self, model: ModelInfo, gpu: GpuInfo, *, gpu_mem_util: float) -> TuningResult:

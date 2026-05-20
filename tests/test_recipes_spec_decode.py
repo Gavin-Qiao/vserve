@@ -135,6 +135,17 @@ class TestVocabCompatible:
         assert vocab_compatible("Qwen3ForCausalLM", 1, 2, draft) is False
 
 
+class TestSpecBlocklistContents:
+    """0.6.3 bug fix 4: SPEC_BLOCKLIST contained `GptOssMoeForCausalLM` (a
+    typo — every other registry uses `GptOssForCausalLM`), so the entry was
+    dead code and the actual `gpt-oss` model wasn't blocked from spec-decode."""
+
+    def test_blocklist_uses_canonical_gptoss_arch_name(self):
+        from vserve.recipes.spec_decode import SPEC_BLOCKLIST
+        assert "GptOssForCausalLM" in SPEC_BLOCKLIST
+        assert "GptOssMoeForCausalLM" not in SPEC_BLOCKLIST  # the typo
+
+
 class TestSpecBuildConfig:
     """Wire-through tests for the build_config integration."""
 
