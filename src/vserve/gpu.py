@@ -13,6 +13,10 @@ class GpuInfo:
     vram_free_mb: int
     driver: str
     cuda: str
+    # Compute capability as a packed integer (e.g. 120 = sm120 / Blackwell
+    # RTX, 100 = sm100 / Blackwell DC, 90 = sm90 / Hopper). None when nvidia-smi
+    # didn't surface it.
+    compute_cap: int | None = None
 
     @property
     def vram_total_gb(self) -> float:
@@ -27,7 +31,7 @@ def _run_nvidia_smi() -> str:
     result = subprocess.run(
         [
             "nvidia-smi",
-            "--query-gpu=name,memory.total,utilization.gpu,memory.used,driver_version",
+            "--query-gpu=name,memory.total,utilization.gpu,memory.used,driver_version,compute_cap",
             "--format=csv,noheader,nounits",
         ],
         capture_output=True,
@@ -77,6 +81,18 @@ def get_gpu_info(config: object | None = None) -> GpuInfo:
     vram_used = int(parts[3])
     driver = parts[4]
     cuda = _get_cuda_version()
+    # compute_cap is "8.6", "9.0", "12.0" etc.; convert to packed int
+    # (12.0 → 120, 9.0 → 90). Missing/garbled values silently fall through.
+    compute_cap: int | None = None
+    if len(parts) >= 6:
+        raw_cc = parts[5].strip()
+        try:
+            major_str, _, minor_str = raw_cc.partition(".")
+            major = int(major_str)
+            minor = int(minor_str or "0")
+            compute_cap = major * 10 + minor
+        except (TypeError, ValueError):
+            compute_cap = None
     return GpuInfo(
         index=gpu_index,
         name=name,
@@ -85,6 +101,7 @@ def get_gpu_info(config: object | None = None) -> GpuInfo:
         vram_free_mb=vram_total - vram_used,
         driver=driver,
         cuda=cuda,
+        compute_cap=compute_cap,
     )
 
 

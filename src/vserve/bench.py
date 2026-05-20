@@ -1,10 +1,18 @@
-"""Small bounded benchmark helpers for local serving endpoints."""
+"""Small bounded benchmark helpers for local serving endpoints.
+
+Now includes a streaming benchmark that captures TTFT / TPOT / ITL / E2E
+percentiles, matching what ``vllm bench serve`` produces (item P). The
+sequential helpers below stay for backward compat and embedding endpoints.
+"""
 
 from __future__ import annotations
 
 import json
 import math
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from typing import Callable, Protocol
 from urllib.request import Request, urlopen
 
@@ -15,6 +23,55 @@ Clock = Callable[[], float]
 class PostJson(Protocol):
     def __call__(self, url: str, payload: dict, *, timeout: float) -> dict:
         ...
+
+
+@dataclass
+class TokenTimeline:
+    """Per-request token-arrival timeline used to compute TTFT/TPOT/ITL."""
+
+    request_started_ms: float
+    first_token_ms: float | None = None
+    last_token_ms: float | None = None
+    token_count: int = 0
+    inter_token_ms: list[float] = field(default_factory=list)
+    error: str | None = None
+
+    @property
+    def ttft_ms(self) -> float | None:
+        if self.first_token_ms is None:
+            return None
+        return self.first_token_ms - self.request_started_ms
+
+    @property
+    def tpot_ms(self) -> float | None:
+        if self.token_count <= 1 or self.first_token_ms is None or self.last_token_ms is None:
+            return None
+        decode_span = self.last_token_ms - self.first_token_ms
+        return decode_span / max(1, self.token_count - 1)
+
+    @property
+    def e2e_ms(self) -> float | None:
+        if self.last_token_ms is None:
+            return None
+        return self.last_token_ms - self.request_started_ms
+
+
+@dataclass
+class BenchResult:
+    """Streaming benchmark output (matches ``vllm bench serve`` schema)."""
+
+    ttft_ms_p50: float | None
+    ttft_ms_p99: float | None
+    tpot_ms_p50: float | None
+    tpot_ms_p99: float | None
+    itl_ms_p99: float | None
+    throughput_tokens_per_sec: float
+    throughput_requests_per_sec: float
+    e2e_p99_ms: float | None
+    requests_completed: int
+    requests_total: int
+    errors: list[str]
+    total_seconds: float
 
 
 def _post_json(url: str, payload: dict, timeout: float) -> dict:
@@ -154,3 +211,141 @@ def run_openai_embedding_benchmark(
         "items_per_second": round(completed / total_seconds, 2) if total_seconds > 0 else 0,
         "errors": errors,
     }
+
+
+def _percentile_ms(values: list[float], pct: float) -> float | None:
+    """Return the ``pct``-th percentile of seconds, in milliseconds."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, math.ceil(pct * len(ordered)) - 1)
+    return round(ordered[idx] * 1000, 2)
+
+
+def _stream_request(
+    url: str,
+    payload: dict,
+    *,
+    timeout_s: float,
+    monotonic: Clock,
+) -> TokenTimeline:
+    """Issue one streaming /v1/chat/completions request and record timings.
+
+    Parses Server-Sent Events lines (``data: <JSON>\\n\\n``) and timestamps
+    each chunk that contains a token delta. Returns a TokenTimeline.
+    """
+    started_ms = monotonic() * 1000
+    timeline = TokenTimeline(request_started_ms=started_ms)
+    body = json.dumps(payload).encode("utf-8")
+    req = Request(
+        url, data=body,
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=timeout_s) as response:
+            for line in response:
+                if not line:
+                    continue
+                decoded = line.decode("utf-8", errors="replace").strip()
+                if not decoded.startswith("data:"):
+                    continue
+                payload_text = decoded[len("data:"):].strip()
+                if not payload_text or payload_text == "[DONE]":
+                    continue
+                try:
+                    obj = json.loads(payload_text)
+                except json.JSONDecodeError:
+                    continue
+                choices = obj.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    continue
+                delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+                if not isinstance(delta, dict):
+                    continue
+                content = delta.get("content")
+                if content is None or content == "":
+                    continue
+                now_ms = monotonic() * 1000
+                if timeline.first_token_ms is None:
+                    timeline.first_token_ms = now_ms
+                else:
+                    timeline.inter_token_ms.append(now_ms - (timeline.last_token_ms or now_ms))
+                timeline.last_token_ms = now_ms
+                timeline.token_count += 1
+    except Exception as exc:
+        timeline.error = str(exc)
+    return timeline
+
+
+def run_streaming_benchmark(
+    base_url: str,
+    *,
+    model: str,
+    concurrency: int = 1,
+    duration_s: float = 60.0,
+    max_tokens: int = 256,
+    prompt: str = "Write one paragraph about GPU inference tuning.",
+    max_latency_ms: float | None = None,
+    monotonic: Clock = time.monotonic,
+) -> BenchResult:
+    """Drive concurrent streaming /v1/chat/completions requests for
+    ``duration_s`` seconds (or until ``max_latency_ms`` is exceeded). Computes
+    TTFT / TPOT / ITL percentiles and total throughput. Concurrency=1 is
+    effectively sequential streaming.
+    """
+    concurrency = max(1, int(concurrency))
+    duration_s = max(0.1, float(duration_s))
+    url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+    }
+
+    started = monotonic()
+    deadline = started + duration_s
+    timelines: list[TokenTimeline] = []
+    timelines_lock = threading.Lock()
+    abort = threading.Event()
+
+    def _worker() -> None:
+        while not abort.is_set() and monotonic() < deadline:
+            tl = _stream_request(url, payload, timeout_s=duration_s + 30, monotonic=monotonic)
+            with timelines_lock:
+                timelines.append(tl)
+            # Early termination on latency ceiling.
+            if max_latency_ms is not None and tl.e2e_ms is not None and tl.e2e_ms > max_latency_ms:
+                abort.set()
+
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = [ex.submit(_worker) for _ in range(concurrency)]
+        for _ in as_completed(futures):
+            pass
+
+    total_seconds = max(1e-6, monotonic() - started)
+
+    ttfts = [tl.ttft_ms / 1000.0 for tl in timelines if tl.ttft_ms is not None]
+    tpots = [tl.tpot_ms / 1000.0 for tl in timelines if tl.tpot_ms is not None]
+    itl_all = [v / 1000.0 for tl in timelines for v in tl.inter_token_ms]
+    e2es = [tl.e2e_ms / 1000.0 for tl in timelines if tl.e2e_ms is not None]
+    total_tokens = sum(tl.token_count for tl in timelines)
+    completed = sum(1 for tl in timelines if tl.error is None and tl.token_count > 0)
+    errors = [tl.error for tl in timelines if tl.error]
+
+    return BenchResult(
+        ttft_ms_p50=_percentile_ms(ttfts, 0.5),
+        ttft_ms_p99=_percentile_ms(ttfts, 0.99),
+        tpot_ms_p50=_percentile_ms(tpots, 0.5),
+        tpot_ms_p99=_percentile_ms(tpots, 0.99),
+        itl_ms_p99=_percentile_ms(itl_all, 0.99),
+        throughput_tokens_per_sec=round(total_tokens / total_seconds, 2),
+        throughput_requests_per_sec=round(completed / total_seconds, 2),
+        e2e_p99_ms=_percentile_ms(e2es, 0.99),
+        requests_completed=completed,
+        requests_total=len(timelines),
+        errors=[str(e) for e in errors][:5],  # cap for log readability
+        total_seconds=round(total_seconds, 3),
+    )

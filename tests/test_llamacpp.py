@@ -1,6 +1,7 @@
 """Tests for the llama.cpp backend."""
 
 import struct
+from pathlib import Path
 from unittest.mock import Mock
 
 from vserve.backends.llamacpp import LlamaCppBackend
@@ -498,7 +499,11 @@ class TestLlamaCppTune:
 
         result = LlamaCppBackend().tune(m, gpu, gpu_mem_util=0.96)
 
-        assert result["limits"]["262144"]["f16"] == 6
+        # 5 slots, not 6: the compute-buffer reserve (10% of total VRAM)
+        # shaves headroom that pure KV math would otherwise hand to one
+        # extra slot. Prevents the runtime CPU-spill failure mode where
+        # llama.cpp silently relocated tensors mid-run.
+        assert result["limits"]["262144"]["f16"] == 5
 
     def test_llamacpp_memory_counts_recurrent_state_bytes(self):
         metadata = {
@@ -1163,9 +1168,11 @@ class TestLlamaCppEmbedding:
         cfg = b.build_config(m, {
             "context": 4096, "n_gpu_layers": 10, "parallel": 1,
             "port": 8888, "tools": False,
-            "override_tensors": [".ffn_.*_exps.=CPU"],
+            # Use a layer-range pattern that ncmoe can't express — verifies
+            # the surgical -ot path still survives after 0.7.0 item H.
+            "override_tensors": [r"\.([1-5][0-9])\.ffn_(up|gate)_exps.=CPU"],
         })
-        assert cfg["override_tensors"] == [".ffn_.*_exps.=CPU"]
+        assert cfg["override_tensors"] == [r"\.([1-5][0-9])\.ffn_(up|gate)_exps.=CPU"]
 
     def test_start_emits_ctk_ctv_b_ub_and_ot(self, fake_gguf_model_dir, tmp_path, mocker):
         """The generated launch script contains every new flag in canonical form."""
@@ -1177,7 +1184,9 @@ class TestLlamaCppEmbedding:
             "port": 8888, "tools": True,
             "kv_cache_k": "q8_0", "kv_cache_v": "q8_0",
             "batch_size": 4096, "ubatch_size": 512,
-            "override_tensors": [".ffn_.*_exps.=CPU"],
+            # Layer-range pattern so the surgical -ot path stays (0.7.0 H
+            # converts the all-experts regex to -ncmoe 99).
+            "override_tensors": [r"\.([1-5][0-9])\.ffn_(up|gate)_exps.=CPU"],
         })
         cfg_path = tmp_path / "test.json"
         import json
@@ -1196,7 +1205,9 @@ class TestLlamaCppEmbedding:
         assert "-ctv q8_0" in script
         assert "-b 4096" in script
         assert "-ub 512" in script
-        assert "-ot '.ffn_.*_exps.=CPU'" in script or '-ot ".ffn_.*_exps.=CPU"' in script
+        # Surgical -ot pattern survives the ncmoe conversion.
+        assert "-ot" in script
+        assert "ffn_(up|gate)_exps.=CPU" in script
         # L7: --no-mmap is auto-added whenever -ot is set so the new llama.cpp
         # binary doesn't emit its "mmap + tensor override" perf warning.
         assert "--no-mmap" in script
@@ -1231,7 +1242,8 @@ class TestLlamaCppEmbedding:
         assert "--no-mmap" not in script
 
     def test_start_respects_explicit_mmap_true(self, fake_gguf_model_dir, tmp_path, mocker):
-        """Setting mmap=True in the cfg suppresses the auto --no-mmap even when -ot is on."""
+        """Setting mmap=True in the cfg suppresses the auto --no-mmap even
+        when an MoE offload (ncmoe or -ot) is on."""
         b = LlamaCppBackend()
         from vserve.models import detect_model
         m = detect_model(fake_gguf_model_dir)
@@ -1240,6 +1252,7 @@ class TestLlamaCppEmbedding:
         cfg = b.build_config(m, {
             "context": 4096, "n_gpu_layers": 10, "parallel": 1,
             "port": 8888, "tools": False,
+            # All-experts pattern → converted to ncmoe=99 by item H.
             "override_tensors": [".ffn_.*_exps.=CPU"],
         })
         cfg["mmap"] = True
@@ -1257,8 +1270,8 @@ class TestLlamaCppEmbedding:
 
         script = active.read_text()
         assert "--no-mmap" not in script
-        # -ot still emitted
-        assert "-ot" in script
+        # ncmoe still emitted (it replaced the all-experts -ot regex).
+        assert "-ncmoe 99" in script
 
     def test_is_unsloth_ud_detects_UD_prefix(self, tmp_path):
         """ModelInfo.is_unsloth_ud is True only when filename contains -UD-."""
@@ -1304,3 +1317,795 @@ class TestLlamaCppEmbedding:
         assert LlamaCppBackend._guess_pooling("BGE-Large-EN-v1.5") == "cls"
         assert LlamaCppBackend._guess_pooling("NOMIC-EMBED-TEXT") == "mean"
         assert LlamaCppBackend._guess_pooling("Jina-Reranker-v2") == "rank"
+
+
+# --- 0.7.0 item BB: --fit off ---
+
+
+class TestLlamaCppFitOff:
+    """Defect (BB): llama.cpp's auto-fitter logs `common_fit_params: failed
+    to fit params to free device memory: n_gpu_layers already set by user
+    to N, abort` on every start because vserve always emits -ngl. Looks
+    like an error in journals — emit `--fit off` to suppress (llamacpp#21801).
+    """
+
+    def test_start_emits_fit_off(self, fake_gguf_model_dir, tmp_path, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+
+        b = LlamaCppBackend()
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        cfg_path = tmp_path / "test.json"
+        import json
+        cfg_path.write_text(json.dumps(cfg))
+        active = tmp_path / "active.sh"
+        active.parent.mkdir(parents=True, exist_ok=True)
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+
+        b.start(cfg_path)
+
+        script = active.read_text()
+        assert "--fit off" in script
+
+
+# --- 0.7.0 item A: architecture-derived sampler defaults ---
+
+
+class TestLlamaCppSamplingDefaults:
+    """Item A: llama.cpp build_config injects --temp / --top-p / --top-k /
+    --min-p when the GGUF metadata's `general.architecture` matches a row
+    in the recipe registry. start() routes them through the flag_map."""
+
+    def test_build_config_injects_sampler_for_gemma4(self, fake_gguf_model_dir, tmp_path, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        # Force the GGUF metadata reader to return Gemma-4 — bypasses needing
+        # an actual GGUF file with valid headers.
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "gemma4", "num_layers": 60, "num_kv_heads": 8, "head_dim": 256},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        assert cfg["temp"] == 1.0
+        assert cfg["top_p"] == 0.95
+        assert cfg["top_k"] == 64
+        assert cfg["min_p"] == 0.01
+
+    def test_build_config_no_sampler_for_unknown_arch(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "future_unknown", "num_layers": 32, "num_kv_heads": 8, "head_dim": 128},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        for key in ("temp", "top_p", "top_k", "min_p"):
+            assert key not in cfg
+
+    def test_recipe_sampling_opt_out_suppresses_keys(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "gemma4", "num_layers": 60, "num_kv_heads": 8, "head_dim": 256},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "recipe_sampling": False,
+        })
+        assert "temp" not in cfg
+
+    def test_caller_supplied_sampler_wins(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "gemma4", "num_layers": 60, "num_kv_heads": 8, "head_dim": 256},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "temp": 0.5,
+        })
+        assert cfg["temp"] == 0.5
+        # Other defaults still fill in.
+        assert cfg["top_p"] == 0.95
+
+    def test_start_emits_sampler_flags(self, fake_gguf_model_dir, tmp_path, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "gemma4", "num_layers": 60, "num_kv_heads": 8, "head_dim": 256},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        cfg_path = tmp_path / "test.json"
+        import json
+        cfg_path.write_text(json.dumps(cfg))
+        active = tmp_path / "active.sh"
+        active.parent.mkdir(parents=True, exist_ok=True)
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+        b.start(cfg_path)
+        script = active.read_text()
+        assert "--temp 1.0" in script
+        assert "--top-p 0.95" in script
+        assert "--top-k 64" in script
+        assert "--min-p 0.01" in script
+
+
+# --- 0.7.0 item C: chat-template-kwargs + --special for llama.cpp ---
+
+
+class TestLlamaCppChatTemplateKwargs:
+    """Item C for llama.cpp: ``--chat-template-kwargs '<JSON>'`` plus the
+    Kimi-K2-specific ``--special`` (R2 §13)."""
+
+    def test_build_config_emits_enable_thinking_for_gemma4(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "gemma4", "num_layers": 60, "num_kv_heads": 8, "head_dim": 256},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "thinking": True,
+        })
+        assert cfg["chat_template_kwargs"] == {"enable_thinking": True}
+
+    def test_build_config_deepseek_uses_thinking_key(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "deepseek3", "num_layers": 60, "num_kv_heads": 8, "head_dim": 128},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "thinking": True,
+        })
+        assert cfg["chat_template_kwargs"] == {"thinking": True}
+
+    def test_build_config_kimi_emits_special(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "kimik2", "num_layers": 60, "num_kv_heads": 8, "head_dim": 128},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        assert cfg["special"] is True
+
+    def test_start_emits_chat_template_kwargs_as_json(self, fake_gguf_model_dir, tmp_path, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "gemma4", "num_layers": 60, "num_kv_heads": 8, "head_dim": 256},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "thinking": False,
+        })
+        cfg_path = tmp_path / "test.json"
+        import json
+        cfg_path.write_text(json.dumps(cfg))
+        active = tmp_path / "active.sh"
+        active.parent.mkdir(parents=True, exist_ok=True)
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+        b.start(cfg_path)
+        script = active.read_text()
+        assert "--chat-template-kwargs" in script
+        # The JSON string itself, single-quoted by shlex.
+        assert '{"enable_thinking": false}' in script
+
+    def test_start_emits_special_flag_for_kimi(self, fake_gguf_model_dir, tmp_path, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "kimik2", "num_layers": 60, "num_kv_heads": 8, "head_dim": 128},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        cfg_path = tmp_path / "test.json"
+        import json
+        cfg_path.write_text(json.dumps(cfg))
+        active = tmp_path / "active.sh"
+        active.parent.mkdir(parents=True, exist_ok=True)
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+        b.start(cfg_path)
+        script = active.read_text()
+        assert " --special" in script
+
+
+# --- 0.7.0 item H: --n-cpu-moe over regex ---
+
+
+class TestLlamaCppNCpuMoe:
+    """Item H: --n-cpu-moe N supersedes the all-experts -ot regex for the
+    most common offload case. Cleaner, version-stable, no regex required."""
+
+    def test_all_experts_regex_converted_to_ncmoe(self, fake_gguf_model_dir):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+            "override_tensors": [".ffn_.*_exps.=CPU"],
+        })
+        assert cfg["n_cpu_moe"] == 99
+        # Original -ot list dropped to avoid emitting both.
+        assert "override_tensors" not in cfg
+
+    def test_surgical_layer_range_keeps_ot(self, fake_gguf_model_dir):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+            "override_tensors": [r"\.([0-9]|[1-9][0-9])\.ffn_(gate|up|down)_exps.=CPU"],
+        })
+        # Layer-range patterns can't be expressed as -ncmoe N → keep -ot.
+        assert "n_cpu_moe" not in cfg
+        assert cfg["override_tensors"] == [r"\.([0-9]|[1-9][0-9])\.ffn_(gate|up|down)_exps.=CPU"]
+
+    def test_explicit_n_cpu_moe_passes_through(self, fake_gguf_model_dir):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "n_cpu_moe": 16,
+        })
+        assert cfg["n_cpu_moe"] == 16
+
+    def test_start_emits_ncmoe_flag(self, fake_gguf_model_dir, tmp_path, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+            "override_tensors": [".ffn_.*_exps.=CPU"],
+        })
+        cfg_path = tmp_path / "test.json"
+        import json
+        cfg_path.write_text(json.dumps(cfg))
+        active = tmp_path / "active.sh"
+        active.parent.mkdir(parents=True, exist_ok=True)
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+        b.start(cfg_path)
+        script = active.read_text()
+        assert "-ncmoe 99" in script
+        # Original regex is gone — only ncmoe survives.
+        assert ".ffn_.*_exps.=CPU" not in script
+        # --no-mmap still auto-added (perf gate applies to ncmoe too).
+        assert "--no-mmap" in script
+
+
+# --- 0.7.0 item I: K==V invariant + widened KV-quant matrix ---
+
+
+class TestLlamaCppKvInvariant:
+    """Item I: fused Flash-Attention requires symmetric K/V (llamacpp#22411).
+    Refuse asymmetric pairs when -fa is on; force V=f16 on Gemma-4-31B
+    regardless of picker (llamacpp#22527). Also widen the candidate dtype
+    list to include q5_1 and bf16."""
+
+    def test_refuses_asymmetric_kv_when_fa_on(self, fake_gguf_model_dir, mocker):
+        import pytest
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "llama", "num_layers": 32, "num_kv_heads": 8, "head_dim": 128},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        with pytest.raises(ValueError, match="K==V"):
+            b.build_config(m, {
+                "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+                "port": 8888, "tools": False,
+                "kv_cache_k": "q8_0", "kv_cache_v": "f16",
+            })
+
+    def test_allows_asymmetric_kv_when_fa_off(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "llama", "num_layers": 32, "num_kv_heads": 8, "head_dim": 128},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "flash_attn": False,
+            "kv_cache_k": "q8_0", "kv_cache_v": "f16",
+        })
+        assert cfg["cache_type_k"] == "q8_0"
+        assert cfg["cache_type_v"] == "f16"
+
+    def test_gemma4_31b_forces_v_to_f16(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        # 60 layers → Gemma-4-31B specifically.
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "gemma4", "num_layers": 60, "num_kv_heads": 8, "head_dim": 256},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+            "kv_cache_k": "q8_0", "kv_cache_v": "q8_0",
+        })
+        # Symmetric q8_0 chosen by picker — but Gemma-4-31B forces V=f16.
+        assert cfg["cache_type_v"] == "f16"
+        # K stays at q8_0 (asymmetric, but the FA-K==V check only applies
+        # before the gemma4-31B override fires — the override is a forced
+        # safety patch).
+        assert cfg["cache_type_k"] == "q8_0"
+        # Surface a note explaining the override.
+        notes = cfg.get("notes") or []
+        assert any("22527" in n or "Gemma-4-31B" in n for n in notes)
+
+    def test_gemma4_27b_does_not_force_v(self, fake_gguf_model_dir, mocker):
+        """26B-A4B (also 60 layers in some configs) — verify the layer
+        threshold doesn't over-trigger. We gate on layer count ≥ 60 because
+        that's the 31B-dense signature."""
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "gemma4", "num_layers": 48, "num_kv_heads": 2, "head_dim": 256},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+            "kv_cache_k": "q8_0", "kv_cache_v": "q8_0",
+        })
+        # 48-layer Gemma-4 → no override.
+        assert cfg["cache_type_v"] == "q8_0"
+
+    def test_widened_dtype_matrix_includes_q5_1_bf16(self):
+        from vserve.backends.llamacpp import _DEFAULT_KV_DTYPES
+        assert "q5_1" in _DEFAULT_KV_DTYPES
+        assert "bf16" in _DEFAULT_KV_DTYPES
+
+    def test_iq4_nl_excluded_when_fa_all_quants_not_built(self, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        b = LlamaCppBackend()
+        mocker.patch.object(b, "find_entrypoint", return_value=Path("/no/such/binary"))
+        candidates = b._candidate_kv_dtypes()
+        assert "iq4_nl" not in candidates
+
+    def test_iq4_nl_included_when_fa_all_quants_built(self, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.llamacpp_probe import LlamaCppBuildInfo
+        b = LlamaCppBackend()
+        mocker.patch.object(b, "find_entrypoint", return_value=Path("/fake/llama-server"))
+        mocker.patch(
+            "vserve.llamacpp_probe.probe_llama_cpp_build",
+            return_value=LlamaCppBuildInfo(
+                build_number=9222, commit="abc1234",
+                cuda_version="12.8", fa_all_quants=True,
+            ),
+        )
+        candidates = b._candidate_kv_dtypes()
+        assert "iq4_nl" in candidates
+
+
+class TestLlamaCppProbe:
+    """Probe helpers (item L wiring — used by build-version gate too)."""
+
+    def test_parses_build_number_and_commit(self):
+        from vserve.llamacpp_probe import _parse_version_text
+        info = _parse_version_text(
+            "llama-server\nversion: 9222 (abc1234deadbeef)\nbuilt with CUDA 12.8"
+        )
+        assert info.build_number == 9222
+        assert info.commit is not None and info.commit.startswith("abc1234")
+        assert info.cuda_version == "12.8"
+
+    def test_detects_fa_all_quants(self):
+        from vserve.llamacpp_probe import _parse_version_text
+        info = _parse_version_text(
+            "version: 9222 (abc1234deadbeef)\nFlags: GGML_CUDA_FA_ALL_QUANTS=1"
+        )
+        assert info.fa_all_quants is True
+
+    def test_check_build_compat_warns_on_iq4_xs_old_build(self):
+        from vserve.llamacpp_probe import LlamaCppBuildInfo, check_build_compat
+        info = LlamaCppBuildInfo(build_number=8500, commit=None, cuda_version=None, fa_all_quants=False)
+        warnings = check_build_compat(info, "IQ4_XS")
+        assert any("gibberish" in w.lower() or "8808" in w for w in warnings)
+
+    def test_check_build_compat_warns_on_cuda_13_2(self):
+        from vserve.llamacpp_probe import LlamaCppBuildInfo, check_build_compat
+        info = LlamaCppBuildInfo(build_number=9222, commit=None, cuda_version="13.2", fa_all_quants=False)
+        warnings = check_build_compat(info, "Q4_K_XL")
+        assert any("13.2" in w for w in warnings)
+
+    def test_check_build_compat_silent_on_modern_build(self):
+        from vserve.llamacpp_probe import LlamaCppBuildInfo, check_build_compat
+        info = LlamaCppBuildInfo(build_number=9222, commit=None, cuda_version="12.8", fa_all_quants=True)
+        assert check_build_compat(info, "Q4_K_XL") == []
+        assert check_build_compat(info, "IQ4_XS") == []
+
+    def test_check_build_compat_warns_on_b8661(self):
+        from vserve.llamacpp_probe import LlamaCppBuildInfo, check_build_compat
+        info = LlamaCppBuildInfo(build_number=8661, commit=None, cuda_version="12.8", fa_all_quants=True)
+        warnings = check_build_compat(info, "Q4_K_XL")
+        assert any("8661" in w for w in warnings)
+
+
+# --- 0.7.0 item J: mmproj auto-detection ---
+
+
+class TestLlamaCppMmproj:
+    """Item J: llama.cpp serves multimodal models silently as text-only if
+    --mmproj is missing. Auto-discover ``mmproj-BF16.gguf`` and emit it."""
+
+    def test_build_config_emits_mmproj_from_model_info(self, fake_gguf_model_dir, mocker, tmp_path):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        # Add the mmproj alongside the GGUF in the fixture's dir.
+        mmproj_path = fake_gguf_model_dir / "mmproj-BF16.gguf"
+        mmproj_path.write_bytes(b"GGUF")
+        b = LlamaCppBackend()
+        m = detect_model(fake_gguf_model_dir)
+        # detect_model picks the first .gguf alphabetically; since the
+        # mmproj_path field was set during detect_model, build_config
+        # should pull it forward.
+        assert m.mmproj_path is not None
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        assert cfg["mmproj"] == str(m.mmproj_path)
+
+    def test_start_emits_mmproj_flag(self, fake_gguf_model_dir, tmp_path, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        mmproj_path = fake_gguf_model_dir / "mmproj-BF16.gguf"
+        mmproj_path.write_bytes(b"GGUF")
+        b = LlamaCppBackend()
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        cfg_path = tmp_path / "test.json"
+        import json
+        cfg_path.write_text(json.dumps(cfg))
+        active = tmp_path / "active.sh"
+        active.parent.mkdir(parents=True, exist_ok=True)
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+        b.start(cfg_path)
+        script = active.read_text()
+        assert "--mmproj" in script
+        assert "mmproj-BF16.gguf" in script
+
+    def test_no_mmproj_when_model_has_none(self, fake_gguf_model_dir):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        m = detect_model(fake_gguf_model_dir)
+        assert m.mmproj_path is None
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        assert "mmproj" not in cfg
+
+    def test_explicit_mmproj_choice_overrides(self, fake_gguf_model_dir, tmp_path):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        m = detect_model(fake_gguf_model_dir)
+        # User-supplied path; should overwrite the model's discovered path.
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+            "mmproj": "/custom/path/mmproj-BF16.gguf",
+        })
+        assert cfg["mmproj"] == "/custom/path/mmproj-BF16.gguf"
+
+    def test_explicit_empty_mmproj_disables(self, fake_gguf_model_dir):
+        """``mmproj=""`` or ``mmproj=False`` opts out of auto-discovery."""
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        mmproj_path = fake_gguf_model_dir / "mmproj-BF16.gguf"
+        mmproj_path.write_bytes(b"GGUF")
+        b = LlamaCppBackend()
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "mmproj": "",
+        })
+        assert "mmproj" not in cfg
+
+
+# --- 0.7.0 item K: --reasoning-format auto-emission ---
+
+
+class TestLlamaCppReasoningFormat:
+    """Item K: llama.cpp's --reasoning-format ('harmony' | 'deepseek' | 'none')
+    controls how thinking-channel blocks are separated from final content.
+    Auto-detect from the GGUF chat template marker."""
+
+    def test_think_marker_emits_deepseek_format(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_chat_template",
+            return_value="{%- if enable_thinking %}<think>{%- endif %}...",
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        assert cfg["reasoning_format"] == "deepseek"
+
+    def test_channel_marker_emits_harmony_format(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_chat_template",
+            return_value="...<|channel|>thought...<channel|>...",
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        assert cfg["reasoning_format"] == "harmony"
+
+    def test_no_marker_omits_reasoning_format(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(b, "_read_gguf_chat_template", return_value="plain template, no markers")
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+        })
+        assert "reasoning_format" not in cfg
+
+    def test_explicit_reasoning_format_wins(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_chat_template",
+            return_value="<think>...",  # would auto-pick deepseek
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+            "reasoning_format": "none",
+        })
+        assert cfg["reasoning_format"] == "none"
+
+    def test_reasoning_budget_passes_through(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(b, "_read_gguf_chat_template", return_value="<think>...")
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "reasoning_budget": 2048,
+        })
+        assert cfg["reasoning_budget"] == 2048
+
+    def test_start_emits_reasoning_flags(self, fake_gguf_model_dir, tmp_path, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(b, "_read_gguf_chat_template", return_value="<think>...")
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "reasoning_budget": 1024,
+        })
+        cfg_path = tmp_path / "test.json"
+        import json
+        cfg_path.write_text(json.dumps(cfg))
+        active = tmp_path / "active.sh"
+        active.parent.mkdir(parents=True, exist_ok=True)
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+        b.start(cfg_path)
+        script = active.read_text()
+        assert "--reasoning-format deepseek" in script
+        assert "--reasoning-budget 1024" in script
+
+
+# --- 0.7.0 item S: prompt-caching primitives ---
+
+
+class TestLlamaCppPromptCaching:
+    """Item S: --cache-reuse, --slot-save-path, --cram, --swa-full.
+    Plus the Gemma-4 cache-reuse gate (llamacpp#21468)."""
+
+    def test_build_config_emits_cache_reuse(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "llama", "num_layers": 32, "num_kv_heads": 8, "head_dim": 128},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "cache_reuse": 256,
+        })
+        assert cfg["cache_reuse"] == 256
+
+    def test_build_config_emits_slot_save_path(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "llama", "num_layers": 32, "num_kv_heads": 8, "head_dim": 128},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "slot_save_path": "/tmp/slots",
+        })
+        assert cfg["slot_save_path"] == "/tmp/slots"
+
+    def test_build_config_emits_cram_mb(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "llama", "num_layers": 32, "num_kv_heads": 8, "head_dim": 128},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "cram_mb": 512,
+        })
+        assert cfg["cram_mb"] == 512
+
+    def test_gemma4_cache_reuse_requires_swa_full(self, fake_gguf_model_dir, mocker):
+        import pytest
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "gemma4", "num_layers": 48, "num_kv_heads": 2, "head_dim": 256},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        with pytest.raises(ValueError, match="21468"):
+            b.build_config(m, {
+                "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+                "port": 8888, "tools": False, "cache_reuse": 256,
+            })
+
+    def test_gemma4_cache_reuse_with_swa_full_ok(self, fake_gguf_model_dir, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "gemma4", "num_layers": 48, "num_kv_heads": 2, "head_dim": 256},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False, "cache_reuse": 256, "swa_full": True,
+        })
+        assert cfg["cache_reuse"] == 256
+        assert cfg["swa_full"] is True
+
+    def test_start_emits_all_caching_flags(self, fake_gguf_model_dir, tmp_path, mocker):
+        from vserve.backends.llamacpp import LlamaCppBackend
+        from vserve.models import detect_model
+        b = LlamaCppBackend()
+        mocker.patch.object(
+            b, "_read_gguf_metadata",
+            return_value={"arch": "llama", "num_layers": 32, "num_kv_heads": 8, "head_dim": 128},
+        )
+        m = detect_model(fake_gguf_model_dir)
+        cfg = b.build_config(m, {
+            "context": 4096, "n_gpu_layers": 10, "parallel": 1,
+            "port": 8888, "tools": False,
+            "cache_reuse": 256, "cram_mb": 512, "slot_save_path": "/tmp/slots",
+            "swa_full": True,
+        })
+        cfg_path = tmp_path / "test.json"
+        import json
+        cfg_path.write_text(json.dumps(cfg))
+        active = tmp_path / "active.sh"
+        active.parent.mkdir(parents=True, exist_ok=True)
+        mocker.patch.object(b, "_active_config_path", return_value=active)
+        mocker.patch.object(b, "_assert_unit_safe_for_privileged_action")
+        mocker.patch("vserve.backends.llamacpp.subprocess.run",
+                     return_value=Mock(returncode=0, stdout="", stderr=""))
+        b.start(cfg_path)
+        script = active.read_text()
+        assert "--cache-reuse 256" in script
+        assert "--cram 512" in script
+        assert "--slot-save-path /tmp/slots" in script
+        assert "--swa-full" in script

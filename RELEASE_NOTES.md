@@ -1,3 +1,490 @@
+# vserve 0.6.1b1 Release Notes (beta)
+
+> **Beta gate.** `0.6.1b1` ships as a **pre-release** because the original
+> failing config — Qwen3.5-4B at 128k × 11 with `turboquant_3bit_nc`, the
+> crash that motivated the AA fix — has **not yet been re-run against an
+> idle GPU**. Static, lint, type, and unit-test gates are all green
+> (885/885), but live end-to-end verification of TurboQuant
+> workspace-lock pre-emption is deferred until the workstation GPU is
+> free. Treat tok/s figures, NVFP4 routing, and TRITON_ATTN selection as
+> **best-effort until a `0.6.1` final** confirms them on hardware.
+> Production deploys should pin `0.6.0` and migrate after `0.6.1` final
+> ships.
+
+`0.6.1b1` bundles the full output of a multi-stream best-practices research
+pass (vLLM 0.21+, llama.cpp b9222+, Unsloth Dynamic 2.0, Gemma 4 family).
+0.6.0 closed seven tuner-correctness defects discovered by live debugging;
+0.6.1 closes the structural gaps that 0.6.0's research surface revealed —
+twenty-one items across five areas. The release is bundled (one ship
+cycle, one CI run, one changelog) and organized below by area so users
+scanning for "what changed for my model" can find their section quickly.
+
+The probe-based tune redesign (`docs/plans/2026-05-19-tune-redesign-probe.md`)
+stays separate as the next minor release — items below remove ~90% of the
+cases the probe would otherwise have to catch, making that PR meaningfully
+smaller.
+
+## Bundled corrections to 0.6.0
+
+### AA. `cudagraph_mode: NONE`, not `--enforce-eager`, for TurboQuant workspace lock
+
+The 0.6.0 diagnoser hinted `--enforce-eager` for the
+`AssertionError: Workspace is locked but allocation from
+'turboquant_attn.py:879:_decode_attention' requires N MB` failure. The
+canonical maintainer-recommended fix is
+`compilation-config: {cudagraph_mode: NONE}` (per vllm#40807 and #41403
+maintainer comments) — that workaround keeps `torch.compile` fusions
+while skipping CUDA-graph capture, where `--enforce-eager` overshoots and
+disables both (lose ~10-30% decode tokens/sec for no extra benefit).
+
+Two changes:
+
+1. `_diagnose_engine_failure` now emits a citation-bearing recommendation
+   that names `cudagraph_mode: NONE` first and references the issue
+   numbers inline.
+2. `VllmBackend.build_config` pre-emits `compilation-config:
+   {cudagraph_mode: NONE}` automatically when the chosen KV dtype is any
+   `turboquant_*` variant — and again when speculative decoding is
+   requested with quantized KV (vllm#41559, DFlash spec-decode breaks
+   with any KV quantization). User-set explicit values win via setdefault.
+
+### BB. `--fit off` for llama.cpp launches
+
+Every llama-server start logged `common_fit_params: failed to fit params
+to free device memory: n_gpu_layers already set by user to N, abort`
+because vserve always pins `-ngl` and the auto-fitter aborts. Cosmetic
+but noisy in `journalctl -u llama-cpp.service`. `start()` now appends
+`--fit off` to silence the auto-fitter explicitly (llamacpp#21801).
+
+## vLLM-side hosting
+
+### A. Architecture-derived sampling-defaults registry
+
+New module `vserve/recipes/sampling.py` maps architectures to the
+sampler parameters Unsloth and the model vendors document — e.g. Gemma 4
+`temp=1.0 top_p=0.95 top_k=64 min_p=0.01`, Qwen3-Thinking `temp=0.6
+top_p=0.95 top_k=20 presence_penalty=1.0`, DeepSeek V3.1
+`temp=0.6 min_p=0.01`, Kimi K2 Thinking `temp=1.0`. Vendor defaults are
+documented to be load-bearing for thinking models (Unsloth: "NEVER use
+greedy on thinking variants — loop trap"); shipping the stock backend
+default silently degraded output. vLLM `build_config` now emits an
+`override-generation-config:` block; llama.cpp `build_config` writes the
+flags directly into the launch script. Per-request sampler overrides
+still win at inference time. Opt out per launch with `recipe_sampling:
+False` in the choices dict.
+
+### B. Reasoning-parser auto-discovery
+
+0.6.0 added architecture-aware tool-parser auto-discovery; 0.6.1 mirrors
+it for `reasoning-parser`. `_ARCH_TO_REASONING_PARSER` maps the
+architectures vserve might see (Gemma 3/4 → `gemma4`, DeepSeek V3-V4 →
+`deepseek_r1`, Qwen3 family → `qwen3`, GPT-OSS → `openai_gptoss`, etc.).
+Both `tune()` and `build_config` now use the lookup, so users no longer
+need to pass `--reasoning-parser` explicitly for the architectures
+vserve recognizes. Runtime registry filtering (the same path used by
+tool-parser detection) only emits parsers the installed vLLM build
+actually has.
+
+### C. `chat-template-kwargs` plumbing
+
+Gemma 4, Qwen 3.x, and DeepSeek V3.1+ all toggle their thinking channel
+via a chat-template kwarg (`enable_thinking` for the first two,
+`thinking` for DeepSeek), not a CLI flag. vserve now accepts
+`choices["thinking"]: bool | "auto"` and routes it to the right kwarg
+based on architecture. The escape hatch `choices["chat_template_kwargs"]:
+dict` passes arbitrary kwargs through. On the llama.cpp side, the kwargs
+serialize as a single JSON string passed to `--chat-template-kwargs`;
+Kimi-K2 models also auto-add `--special` so `<think>` tokens reach the
+reasoning parser.
+
+### D. Expanded `_ARCH_TO_TOOL_PARSER` to vLLM 0.21's full table
+
+0.6.0's table mapped four architectures (Gemma 3/4 only). 0.6.1 expands
+to vLLM 0.21's complete parser set — Llama 3/4, Qwen 3 family (incl.
+Coder + XML), DeepSeek V3/V3.1/V3.2/V4, Kimi K2 (instruct + thinking),
+GLM-4.5/4.7, IBM Granite 3/4, Cohere Command R+, Baidu ERNIE 4.5, AI21
+Jamba, Salesforce xLAM, Liquid LFM 2/2.5, Mistral, GPT-OSS, InternLM.
+The chat-template-marker fallback in `tools.py:_MARKER_TABLE` was also
+extended with the new vendor-specific tags (`<|tool_calls_section_begin|>`
+for Kimi K2, `<|START_TOOL|>` for Cohere, `<|TOOL_CALL|>` for LFM, etc.).
+
+### E. Hybrid head_dim KV math (Gemma 4)
+
+Gemma 4 has `head_dim=256` on sliding-window layers and `head_dim=512`
+on global-attention layers (5:1 pattern). vserve's fallback
+`head_dim = hidden_size // num_attention_heads` rounded to 288, missing
+both. `extract_model_info` now uses the weighted average over
+`sliding_window_pattern` — 5×256 + 1×512 / 6 = 298 for Gemma 4's 5+1
+pattern. `ModelInfo` gains a `global_head_dim` field so downstream
+upper-bound budgeting (e.g. cudaMalloc estimates) can use
+`max(head_dim, global_head_dim)`.
+
+### F. Gemma-4 chat template auto-resolution
+
+The vLLM-bundled `gemma4` tool parser scans for a custom encoding
+(`<|"|>` string delimiter, `<|tool_call>` outer tag, bare unquoted JSON
+keys) that the stock HF chat template does not emit. Without the
+vendored `tool_chat_template_gemma4.jinja`, every tool-call request
+silently produces malformed output that the parser rejects. vserve now
+auto-resolves the template: first checks the configured vLLM install
+under `examples/`, falls back to a packaged copy shipped in
+`vserve/templates/tool_chat_template_gemma4.jinja` (the upstream-canonical
+file pinned at the 2026-05 vLLM main snapshot). Explicit
+`choices["chat_template"]` wins over auto-resolution.
+
+### Q. NVFP4 / FlashInfer / MXFP4 quant flags + envs
+
+`QUANT_FLAGS` now covers NVFP4 (Blackwell-required), ModelOpt-NVFP4
+checkpoints (nvidia/* repos), MXFP4 (MoE), bitsandbytes (single-card
+4-bit iteration), and gguf (vLLM 0.21 can serve GGUFs directly).
+`QUANT_ENV_VARS` plumbs `VLLM_USE_FLASHINFER_MOE_FP4=1` and
+`VLLM_FLASHINFER_MOE_BACKEND=throughput` into the systemd
+EnvironmentFile when an NVFP4/ModelOpt model is launched — without
+those envs, MoE inference on FlashInfer falls back to the slow path.
+NVFP4 models with `kv_dtype=auto` are auto-pinned to `fp8` because vLLM
+otherwise treats fp8-KV as fp8-checkpoint (vllm#39133). A new
+`recommend_quant_for_arch(sm, is_moe, available)` helper exposes the
+canonical (compute_cap, MoE) → quant routing table.
+
+### R. MLA attention-backend awareness
+
+MLA architectures (DeepSeek V2-V4, Kimi K2, LongCat-Flash) ship their
+own attention layout; vLLM's auto-pick can pick a slower fallback.
+`_ARCH_FORCES_BACKEND` now pins FLASHMLA on Hopper / TOKENSPEED_MLA on
+Blackwell for MLA models, keeps TRITON_ATTN for heterogeneous-head_dim
+architectures (Gemma 4), and forces TRITON_ATTN for GPT-OSS on SM120
+specifically (vllm#40153 — FlashInfer doesn't support attention sinks
+on that compute capability). Other compute caps use the default
+backend. A new `_forced_attention_backend(model_path, compute_cap)`
+helper does the routing and consults the per-backend
+`BACKEND_INCOMPATIBLE_KV_DTYPES` table to filter cells the backend
+would otherwise refuse. `GpuInfo` now carries the parsed compute cap.
+
+### M. Speculative decoding (ngram + draft + MTP, with MoE blocklist)
+
+New module `vserve/recipes/spec_decode.py` covers three independent
+shapes: vLLM-only `ngram` (zero extra-model cost), `draft` (pair a
+small same-family GGUF), and `mtp` (Unsloth Qwen3.6 MTP variants).
+`pick_spec_config()` walks the (architecture, backend, available drafts)
+state and returns a `SpecConfig`. The blocklist refuses spec-decode by
+default on A3B-style MoE (Qwen3-A3B, Qwen3-MoE, gpt-oss-MoE, Mixtral,
+DeepSeek V2) because spec-decode is net-negative on consumer hardware
+for that family per llamacpp#19493 benchmarks; `force=True` bypasses.
+vLLM `build_config` refuses MTP + Gemma-4 + tools (vllm#41967 — first
+call's args corrupted); llama.cpp `start()` emits `-md` plus
+`--spec-draft-n-max/n-min/p-min`. `vocab_compatible()` enforces
+identical BOS/EOS + family before pairing a draft.
+
+## llama.cpp-side hosting
+
+### H. `--n-cpu-moe N` over the regex `-ot`
+
+`-ncmoe N` (alias `--n-cpu-moe`) is the modern equivalent of
+`-ot ".ffn_.*_exps.=CPU"` — counts from the highest-numbered layer down,
+no regex required. `build_config` now converts the all-experts `-ot`
+pattern to `n_cpu_moe=99` (clamps to actual expert layer count) and
+drops the `-ot` to avoid emitting both. Surgical layer-range patterns
+(e.g. `\.([1-5][0-9])\.ffn_(up|gate)_exps.=CPU`) stay on the `-ot` path.
+The `--no-mmap` auto-add (perf gate from 0.6.0 L7) now fires for both
+`-ot` and `-ncmoe`.
+
+### I. K==V invariant + widened KV-quant matrix
+
+Fused Flash-Attention requires symmetric K and V cache dtypes
+(llamacpp#22411 — asymmetric pairs silently fall back to a much slower
+dequant-on-the-fly path). `build_config` now refuses asymmetric pairs
+when `flash_attn=True`; callers wanting asymmetric pairs must pass
+`flash_attn=False` explicitly. The candidate KV-dtype matrix widens
+from `(f16, q8_0, q4_1, q4_0)` to `(f16, bf16, q8_0, q5_1, q4_1, q4_0)`,
+and `iq4_nl` is added conditionally when the binary was built with
+`GGML_CUDA_FA_ALL_QUANTS=ON` (probed via `--version` output). For
+Gemma-4-31B (60-layer dense), V is force-pinned to `f16` regardless of
+picker output to avoid illegal-memory-access after the second SWA
+checkpoint (llamacpp#22527).
+
+### J. `mmproj-*.gguf` auto-detection + audio MM-token floor
+
+llama.cpp silently serves multimodal models as text-only when `--mmproj`
+is missing. `find_mmproj(model_dir)` now discovers the projector GGUF
+(prefers `mmproj-BF16.gguf`; quantized variants are documented to
+produce garbage); `ModelInfo.mmproj_path` carries the result; the
+llama.cpp `start()` emits `--mmproj <path>` automatically. Callers can
+override with `choices["mmproj"]` (path string) or opt out with
+`mmproj=""`. On the vLLM side, `_mm_batched_tokens_floor` now returns
+8192 for audio-capable models (Gemma 4 E-class audio: 750 tokens/segment
+× multi-segment requests exceed the 4096 vision-only floor).
+
+### K. `--reasoning-format` auto-emission
+
+llama.cpp's `--reasoning-format` controls how `<think>` / `<|channel|>`
+blocks split from final content in the response JSON. `build_config`
+now reads the GGUF chat template and picks `harmony` for `<|channel|>`
+markers, `deepseek` for `<think>` markers, none otherwise. The
+companion `--reasoning-budget N` (hard cap on thinking tokens) is
+passed through from `choices["reasoning_budget"]`.
+
+### L. llama.cpp build-version gate
+
+New module `vserve/llamacpp_probe.py` runs `llama-server --version`
+and parses build number, commit, CUDA runtime version, and the
+`GGML_CUDA_FA_ALL_QUANTS` flag. `check_build_compat()` issues
+warnings for known-bad combos: CUDA 13.2 + any GGUF produces gibberish
+(Unsloth + llamacpp#21371); UD-IQ4_XS / UD-IQ4_NL pre-b8808 produces
+gibberish; b8661 has a Windows tokenizer regression. Warnings print
+before `backend.start()` in the run banner; the probe failing silently
+means "build info unavailable" — never blocks launch.
+
+### S. Prompt-caching primitives
+
+`build_config` now accepts `cache_reuse` (minimum chunk for KV-shift
+reuse within a slot; 256 is the canonical default), `slot_save_path`
+(persistent slot snapshots for warm-restart of long-context agents),
+`cram_mb` (host-memory prompt cache for shared prefixes; 93% TTFT
+reduction per llamacpp#20574), and `swa_full` (required for Gemma 4 +
+cache-reuse per llamacpp#21468). `start()` routes them to
+`--cache-reuse`, `--slot-save-path`, `--cram`, `--swa-full`. The
+Gemma-4-cache-reuse-without-swa_full combination raises a config-time
+ValueError citing the issue.
+
+### N. Graduated `-ot` strategies
+
+New module `vserve/recipes/ot_strategies.py` exposes a tiered offload
+hierarchy (`none → partial-up → moderate → max → layered`) instead of
+0.6.0's binary "all experts to CPU or nothing." `pick_ot_strategy()`
+walks the ladder and returns the least-aggressive strategy that fits
+the VRAM budget with a configurable safety margin. The layered fallback
+covers very-large-MoE cases (DeepSeek-V3 671B et al.) with a
+layer-range regex.
+
+## Tuning + benchmarking
+
+### O. Empirical `llama-bench` tuner backend
+
+New module `vserve/recipes/llama_bench.py` wraps `llama-bench` for
+sweep-and-pick tuning. `run_sweep()` drives the binary with a
+caller-supplied axis matrix (e.g. `-p 512,4096,8192 -n 128,256 -fa 1
+-ctk f16,q8_0 -ctv f16,q8_0`); `parse_llama_bench_jsonl()` parses the
+JSONL output; `pick_best_cell()` selects by weighted prefill/decode
+throughput under the `throughput | latency | balanced` profile.
+`cache_key()` content-addresses results by `(model, gpu, build)` so
+reruns reuse cached sweeps.
+
+### P. `bench.py` TTFT / TPOT / ITL streaming rewrite
+
+`run_streaming_benchmark()` issues concurrent streaming
+`/v1/chat/completions` requests, parses SSE chunks, timestamps each
+token, and returns a `BenchResult` with TTFT (first-token latency)
+p50+p99, TPOT (time-per-output-token) p50+p99, ITL (inter-token-latency)
+p99, throughput (tokens/sec + requests/sec), and E2E p99. Accepts a
+`max_latency_ms` ceiling for early termination. The legacy sequential
+`run_openai_completion_benchmark` and `run_openai_embedding_benchmark`
+helpers stay for backward compat.
+
+### T. Persistent decode-tok/s in the picker matrix + `vserve status`
+
+Three pieces:
+
+1. **Perf cache** (`vserve/perf_cache.py`) — per-user JSON under
+   `~/.cache/vserve-perf/`, keyed on `(model, GPU UUID, backend,
+   build-id, config-hash)`. Schema captures decode tok/s p50, TTFT p50,
+   sample count, served name, timestamp. Atomic writes (tmp + rename)
+   survive concurrent launches. Cache entries from a different build
+   are filtered out — we never show stale numbers.
+2. **Measurement-at-launch** — after `vserve run` reaches health-OK,
+   a 5-second streaming probe records the actual decode tok/s for the
+   exact config that just launched and persists it. The launch banner
+   now prints "Decode: 78 tok/s · TTFT 180 ms (measured at launch)".
+3. **Picker matrix annotation** — the limits matrix now has a
+   companion "Measured decode tok/s" sub-table that shows the cached
+   number for every cell with a prior measurement; cells without data
+   show "—" (we never show a math-derived estimate because the
+   estimate is wrong on exactly the cases the user most needs to know
+   about — expert spill, build regressions).
+4. **`vserve status` live probe** — when the service is running,
+   `vserve status` now fires a 3-second streaming probe and prints
+   "Decode: X tok/s   TTFT Y ms (live, 3s probe)" plus the
+   launch-time baseline from the cache for comparison. Closes the
+   "I don't know if my inference is healthy" loop without leaving the
+   shell.
+
+The math-formula option ("Expected tok/s: 80") was explicitly
+rejected: a closed-form estimate is misleading on the worst-case
+configs (5-8× wrong on expert-spill cliff cases). Measured-or-nothing
+is more honest.
+
+### G. Unsloth Dynamic 2.0 quant-tier classification
+
+`models.py` parses the `-UD-<tier>` segment from GGUF filenames and
+records the tier on `ModelInfo.quant_tier` (Q4_K_XL, IQ4_XS, MXFP4_MOE,
+TQ1_0, Q5_K_XL, Q8_K_XL, etc.). The `UNSLOTH_QUANT_TIERS` table records
+approximate bits-per-weight, min VRAM per billion params, and a
+relative quality ranking — useful for per-card recommendation and for
+the build-version gate (item L) to fire per-tier (e.g. UD-IQ4_XS
+specifically requires b8808+). MXFP4_MOE-tagged files set
+`is_moe=True` and `quant_method="mxfp4_moe"` regardless of upstream
+metadata.
+
+## Discipline notes
+
+This release was assembled in dependency order behind a single
+test/lint/mypy gate. The release-notes correction in item AA cites
+the maintainer-canonical fix inline (vllm#40807, #41403) per the
+`feedback_release_discipline` memory update — diagnoser hints, recipe
+recommendations, and "Try this:" suggestions are claims about the world
+and need an upstream citation, not just internal reasoning. Every new
+recipe-table entry above is paired with a Unsloth doc / vLLM doc /
+issue link in the source comments.
+
+---
+
+# vserve 0.6.0 Release Notes
+
+`v0.6.0` ships seven tuner-correctness fixes discovered through a live
+session debugging Gemma-4 (both the 26B-A4B MoE on llama.cpp and the 31B
+NVFP4 multimodal on vLLM). Every defect shared the same root cause: the
+tuner was a memory-budget calculator pretending to be a config validator.
+It emitted cells the engine actually refused — for backend-incompatible
+KV dtypes, undersized multimodal batches, default served-name path
+issues, missing tool-parser wiring, MoE auto-offload that hurt
+throughput, slot ceilings read from the wrong KV-dtype column, and
+compute-buffer optimism. Each defect is now closed by code; the
+underlying memory-math-vs-probe redesign is tracked separately for a
+later release.
+
+## 1. llama.cpp slot-ceiling clamped to the *effective* KV-dtype column
+
+Previously the interactive picker showed `max()` across all KV-dtype
+columns of `limits[ctx]`. For Gemma-4-26B-A4B on q8_0, `limits[128k] =
+{f16: 11, q8_0: 22, q4_1: 38, q4_0: 42}` displayed `max = 42` — but the
+runtime defaulted to f16 and OOM'd at slot 12. The picker now uses the
+runtime-effective dtype column (default `recommended_kv_dtype`, which is
+q8_0 here) and the slot prompt reads `entry[effective_kv]`.
+
+## 2. llama.cpp `-ot` auto-applied only when needed
+
+Defect: vserve 0.5.8 auto-added `-ot ".ffn_.*_exps.=CPU"` for *every*
+MoE model. For a 12.5 GB model on a 48 GB GPU, that pushed hot expert
+weights to system RAM — every expert lookup traversed PCIe at ~32 GB/s
+instead of HBM at ~1 TB/s, collapsing tokens/s by ~8× (Unsloth's own
+benchmark: 119 → 30 tok/s). Auto-apply is now gated on
+`_llamacpp_needs_moe_offload(limits, ctx, slots, kv)`, which returns
+True only when `full_offload=False` OR the chosen slots exceed the
+no-`-ot` capacity. Models that fit get the fast path.
+
+## 3. vLLM backend × dtype × architecture compatibility
+
+Defect: `vserve run` on Gemma-4-31B-IT-NVFP4 picked
+`kv-cache-dtype: turboquant_3bit_nc` (the tuner's high-slot
+recommendation). Engine init crashed with:
+
+```
+ValueError: Selected backend TRITON_ATTN is not valid for this
+configuration. Reason: ['kv_cache_dtype not supported']
+```
+
+Gemma-4 has heterogeneous head dimensions (`head_dim=256,
+global_head_dim=512`) → vLLM forces the TRITON_ATTN backend → TRITON_ATTN
+does not accept any `turboquant_*` dtype. The tuner now detects this
+architecture trigger and filters every `turboquant_*` cell out of
+`limits` and `kv_cache_dtypes` in the tune output. Compatible dtypes
+(`auto`, `fp8`) survive untouched.
+
+## 4. Multimodal `max-num-batched-tokens` floor
+
+Defect: Gemma-4-31B-IT-NVFP4 (vision + audio) crashed at startup with:
+
+```
+ValueError: Chunked MM input disabled but max_tokens_per_mm_item (2496)
+is larger than max_num_batched_tokens (2048).
+```
+
+vLLM auto-disables MM-input chunking for bidirectional-attention vision
+encoders — a single image must fit in a single batch. vserve emitted no
+`max-num-batched-tokens`, so vLLM used its 2048 default. The tuner now
+sets a conservative 4096 floor whenever the model has a `vision_config`
+or `audio_config` block (covers Gemma-4 vision's 2496 with margin).
+
+## 5. `served-model-name` aliases auto-emitted
+
+Defect: vLLM defaulted the served model id to the full filesystem path
+`/opt/vllm/models/nvidia/Gemma-4-31B-IT-NVFP4`. Every OpenAI-compatible
+client sending a short name (`"model": "gemma-4-31b"` or
+`"model": "nvidia/Gemma-4-31B-IT-NVFP4"`) got HTTP 400 "model not
+found." `build_config` now emits both the canonical
+`provider/model` id and a lowercased slug with chat suffixes stripped:
+
+```yaml
+served-model-name:
+  - nvidia/Gemma-4-31B-IT-NVFP4
+  - gemma-4-31b
+```
+
+## 6. Tool-call parser auto-discovery (vLLM 0.21+)
+
+Defect: vLLM 0.21 ships a per-architecture `gemma4_tool_parser` (and
+many others) but vserve had no mapping from architecture → parser name.
+A client sending `{"tool_choice": "auto", "tools": [...]}` got HTTP
+400: `'auto' tool choice requires --enable-auto-tool-choice and
+--tool-call-parser to be set`. `tune()` now maps `Gemma4*ForCausalLM`
+and `Gemma4*ForConditionalGeneration` to `gemma4` (using vLLM's lazy
+registry as ground truth for what's actually installed), and
+`build_config()` consumes the suggested parser when `--tools` is
+requested.
+
+## 7. llama.cpp compute-buffer reserve
+
+Defect: tuner held back only 10 % of VRAM for the layer-fit decision,
+then handed every remaining byte to KV-cache math. Reality on
+high-parallel runs is that llama.cpp also needs ~5–8 GB for prompt
+prefill compute buffers (scale with `-np × ubatch`), CUDA workspace,
+pinned host-side transfer buffers, and the embedding/output projection.
+Without that reserve, the tuner approved `22 slots × 128k × q8_0` on a
+48 GB card; at runtime llama.cpp silently moved tensors back to host
+RAM (40.9 GB RAM peak observed, decode collapsed). The tune budget now
+subtracts a fixed 10 % compute reserve from the KV-cache pool. The
+gemma 256 k slot ceiling drops from 6 → 5, qwen3.5-style models from
+their previous ceiling by 1; everything else by 0–1. Headroom in
+exchange for not silently OOM-spilling.
+
+## Tests
+
+`587 → 603 passed` (+16). New coverage:
+
+- `tests/test_cli.py` — slot-ceiling regression, `-ot` gating helper
+  across (within-cap, exceeds-cap, partial-offload, non-MoE) cases.
+- `tests/test_backends.py` — TRITON_ATTN compat filter (heterogeneous
+  head_dim detection, TurboQuant removal, no-op for Llama, recommended
+  profile invalidation), MM token floor (text-only / vision / audio),
+  `served-model-name` alias generation, tool-parser arch-to-name
+  mapping with runtime-registry cross-check.
+- `tests/test_llamacpp.py` — Gemma-4 SWA test recalibrated to 5-slot
+  ceiling (was 6) to reflect the new compute reserve.
+
+`ruff`, `mypy` clean.
+
+## Migration
+
+Profiles saved by 0.5.x may carry settings the new tuner would reject
+(TurboQuant on a TRITON_ATTN architecture, MoE `-ot` on a model that
+fits). To regenerate cleanly:
+
+```bash
+rm /opt/{vllm,llama-cpp}/configs/models/<provider>--<model>.<profile>.{yaml,json,sh}
+vserve run <provider>/<model> --save-profile <name>
+```
+
+## Tracking — what's deferred to 0.7.0
+
+The defects above are still all closed by code, but the structural
+redesign that prevents the entire defect class — **probe-based tune**:
+launch the engine for ~5 s per candidate cell, drop cells that
+crash — is tracked in
+`docs/plans/2026-05-19-tune-redesign-probe.md`. Closing that ticket
+turns the per-defect band-aids into a single test that runs at tune
+time.
+
+---
+
 # vserve 0.5.9 Release Notes
 
 `v0.5.9` is a hotfix for a context-sizing bug discovered after 0.5.8 shipped.

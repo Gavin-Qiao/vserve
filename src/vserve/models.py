@@ -26,6 +26,9 @@ class ModelInfo:
     num_layers: int | None = None
     head_dim: int | None = None
     is_gguf: bool = False
+    quant_tier: str | None = None  # Unsloth Dynamic 2.0 tier (e.g. Q4_K_XL, IQ4_XS, MXFP4_MOE)
+    mmproj_path: Path | None = None  # llama.cpp vision/audio projector (mmproj-*.gguf)
+    global_head_dim: int | None = None  # Gemma-4 global-attn layer head_dim (when != head_dim)
 
     @property
     def full_name(self) -> str:
@@ -65,12 +68,130 @@ class ModelInfo:
 
 
 QUANT_FLAGS = {
-    "gptq": "--quantization gptq_marlin",
-    "awq": "--quantization awq_marlin",
-    "fp8": "--quantization fp8",
+    "gptq":             "--quantization gptq_marlin",
+    "awq":              "--quantization awq_marlin",
+    "fp8":              "--quantization fp8",
     "compressed-tensors": "",
-    "none": "",
+    "none":             "",
+    # Item Q: vLLM 0.21+ quant variants — NVFP4 (Blackwell), MXFP4 (MoE),
+    # bitsandbytes (single-card 4-bit), gguf (vLLM can serve GGUF directly).
+    "nvfp4":            "--quantization nvfp4",
+    "modelopt":         "--quantization modelopt",  # ModelOpt checkpoint NVFP4
+    "mxfp4":            "--quantization mxfp4",
+    "mxfp4_moe":        "--quantization mxfp4",
+    "bitsandbytes":     "--quantization bitsandbytes",
+    "gguf":             "--quantization gguf",
 }
+
+
+# Item Q: environment-variable plumbing per quant method. Emitted into the
+# systemd EnvironmentFile when the model uses one of these methods.
+# Sources: vLLM 0.21 release notes (FlashInfer MoE FP4 backend), R3 (Unsloth
+# Dynamic FP8 / NVFP4 artifacts).
+QUANT_ENV_VARS: dict[str, dict[str, str]] = {
+    "nvfp4": {
+        "VLLM_USE_FLASHINFER_MOE_FP4": "1",
+        "VLLM_FLASHINFER_MOE_BACKEND": "throughput",
+    },
+    "modelopt": {
+        "VLLM_USE_FLASHINFER_MOE_FP4": "1",
+        "VLLM_FLASHINFER_MOE_BACKEND": "throughput",
+    },
+    # MXFP4 uses the Humming backend by default in vLLM 0.21 — no env vars
+    # required, but reserve the entry for future per-backend tuning.
+    "mxfp4": {},
+    "mxfp4_moe": {},
+}
+
+
+def recommend_quant_for_arch(sm: int, is_moe: bool, available_quants: set[str] | None = None) -> str | None:
+    """Recommend the canonical quant variant for a (compute_cap, MoE) pair.
+
+    Compute capability mapping:
+      sm120 — Blackwell RTX consumer (PRO 5000) → NVFP4 dense, MXFP4 MoE
+      sm100 — Blackwell datacenter (B200) → NVFP4 dense, MXFP4 MoE
+      sm90  — Hopper (H100) → FP8 dense / FP8 MoE
+      sm89  — Ada (4090/A6000-Ada) → AWQ-Marlin
+      <89   — older → GGUF or fp16
+
+    ``available_quants`` filters by what the model ships; pass None to
+    return the "ideal" recommendation regardless of availability.
+    """
+    if sm >= 100:
+        primary = "mxfp4" if is_moe else "nvfp4"
+        if available_quants is None or primary in available_quants:
+            return primary
+        # Fall through to FP8 if NVFP4 not packaged for this model.
+        if available_quants is not None and "fp8" in available_quants:
+            return "fp8"
+    if sm >= 90:
+        if available_quants is None or "fp8" in available_quants:
+            return "fp8"
+        if available_quants is not None and "awq" in available_quants:
+            return "awq"
+    if sm >= 89:
+        if available_quants is None or "awq" in available_quants:
+            return "awq"
+    if available_quants is None or "gguf" in available_quants:
+        return "gguf"
+    return None
+
+
+# Unsloth Dynamic 2.0 quant tiers (https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs).
+# bits_per_weight is approximate effective bits including imatrix overhead.
+# min_vram_gb_per_b is a rough VRAM-per-billion-param recommendation.
+# quality_rank is a relative ordering (higher = closer to BF16 reference output).
+UNSLOTH_QUANT_TIERS: dict[str, dict] = {
+    "TQ1_0":     {"bits_per_weight": 1.6, "min_vram_gb_per_b": 0.20, "quality_rank": 1},
+    "Q2_K_XL":   {"bits_per_weight": 2.8, "min_vram_gb_per_b": 0.35, "quality_rank": 2},
+    "Q3_K_XL":   {"bits_per_weight": 3.4, "min_vram_gb_per_b": 0.45, "quality_rank": 3},
+    "IQ4_XS":    {"bits_per_weight": 4.2, "min_vram_gb_per_b": 0.55, "quality_rank": 4},
+    "IQ4_NL":    {"bits_per_weight": 4.5, "min_vram_gb_per_b": 0.58, "quality_rank": 5},
+    "Q4_K_M":    {"bits_per_weight": 4.5, "min_vram_gb_per_b": 0.60, "quality_rank": 5},
+    "Q4_K_XL":   {"bits_per_weight": 4.7, "min_vram_gb_per_b": 0.62, "quality_rank": 6},
+    "Q5_K_M":    {"bits_per_weight": 5.5, "min_vram_gb_per_b": 0.70, "quality_rank": 7},
+    "Q5_K_XL":   {"bits_per_weight": 5.7, "min_vram_gb_per_b": 0.72, "quality_rank": 8},
+    "Q6_K":      {"bits_per_weight": 6.5, "min_vram_gb_per_b": 0.82, "quality_rank": 9},
+    "Q6_K_XL":   {"bits_per_weight": 6.7, "min_vram_gb_per_b": 0.84, "quality_rank": 9},
+    "Q8_0":      {"bits_per_weight": 8.5, "min_vram_gb_per_b": 1.05, "quality_rank": 10},
+    "Q8_K_XL":   {"bits_per_weight": 8.5, "min_vram_gb_per_b": 1.10, "quality_rank": 10},
+    "MXFP4_MOE": {"bits_per_weight": 4.0, "min_vram_gb_per_b": 0.50, "quality_rank": 6, "moe_only": True},
+    "BF16":      {"bits_per_weight": 16.0, "min_vram_gb_per_b": 2.10, "quality_rank": 12},
+    "F16":       {"bits_per_weight": 16.0, "min_vram_gb_per_b": 2.10, "quality_rank": 12},
+}
+
+_UD_TIER_PATTERN = re.compile(
+    r"-UD-(?P<tier>TQ1_0|Q2_K_XL|Q3_K_XL|IQ4_XS|IQ4_NL|Q4_K_M|Q4_K_XL|Q5_K_M|Q5_K_XL|"
+    r"Q6_K_XL|Q6_K|Q8_K_XL|Q8_0|MXFP4_MOE|BF16|F16)",
+    re.IGNORECASE,
+)
+
+
+def parse_unsloth_quant_tier(filename: str) -> str | None:
+    """Extract the Unsloth Dynamic 2.0 quant tier from a GGUF filename.
+
+    Returns the canonical tier name (e.g. ``Q4_K_XL``, ``IQ4_XS``, ``MXFP4_MOE``)
+    when the filename contains a ``-UD-<tier>`` segment, else None.
+    """
+    m = _UD_TIER_PATTERN.search(filename)
+    return m.group("tier").upper() if m else None
+
+
+def find_mmproj(model_dir: Path) -> Path | None:
+    """Locate the multimodal projector GGUF (mmproj-*.gguf) in a model dir.
+
+    Gemma-4 / Llava-style multimodal models ship a separate projector GGUF.
+    Without ``--mmproj`` llama.cpp silently serves them as text-only. Quantized
+    mmproj variants reportedly produce garbage; we prefer BF16 when available.
+    """
+    try:
+        bf16_candidates = sorted(model_dir.glob("mmproj*BF16*.gguf"))
+        if bf16_candidates:
+            return bf16_candidates[0]
+        all_candidates = sorted(model_dir.glob("mmproj*.gguf"))
+        return all_candidates[0] if all_candidates else None
+    except OSError:
+        return None
 
 
 def _validate_index_shards(model_dir: Path) -> None:
@@ -109,17 +230,28 @@ def detect_model(model_dir: Path) -> ModelInfo:
         # GGUF model — may or may not have config.json alongside
         size_bytes = sum(f.stat().st_size for f in gguf_files)
         size_gb = round(size_bytes / (1024**3), 1)
+        # Pick the first tier found across the model's GGUF files.
+        tier: str | None = None
+        for gguf_file in gguf_files:
+            tier = parse_unsloth_quant_tier(gguf_file.name)
+            if tier:
+                break
+        # MXFP4_MOE tier always implies MoE even if legacy metadata says dense.
+        gguf_is_moe = tier == "MXFP4_MOE"
+        mmproj = find_mmproj(model_dir)
         return ModelInfo(
             path=model_dir,
             provider=model_dir.parent.name,
             model_name=model_dir.name,
             architecture="gguf",
             model_type="gguf",
-            quant_method=None,
+            quant_method=("mxfp4_moe" if tier == "MXFP4_MOE" else None),
             max_position_embeddings=0,  # read from GGUF metadata at tune time
-            is_moe=False,
+            is_moe=gguf_is_moe,
             model_size_gb=size_gb,
             is_gguf=True,
+            quant_tier=tier,
+            mmproj_path=mmproj,
         )
 
     if not config_path.exists():
@@ -163,6 +295,28 @@ def detect_model(model_dir: Path) -> ModelInfo:
     if num_kv_heads is None and num_attn_heads is not None:
         num_kv_heads = num_attn_heads
     head_dim_val = text_config.get("head_dim", config.get("head_dim"))
+    # Gemma-4-style hybrid head_dim: sliding-window layers use head_dim while
+    # global-attn layers use global_head_dim (typically 2x). The interleave
+    # follows sliding_window_pattern (default 6 = 5 local + 1 global). Use the
+    # weighted average for KV-byte budgeting; downstream PagedAttention block-
+    # rounds per layer so this is the right average.
+    global_head_dim_val = text_config.get("global_head_dim", config.get("global_head_dim"))
+    if (
+        isinstance(head_dim_val, int) and not isinstance(head_dim_val, bool)
+        and isinstance(global_head_dim_val, int) and not isinstance(global_head_dim_val, bool)
+        and global_head_dim_val != head_dim_val
+    ):
+        pattern_len_raw = text_config.get(
+            "sliding_window_pattern",
+            config.get("sliding_window_pattern", 6),
+        )
+        try:
+            pattern_len = int(pattern_len_raw) if pattern_len_raw else 6
+        except (TypeError, ValueError):
+            pattern_len = 6
+        if pattern_len < 1:
+            pattern_len = 6
+        head_dim_val = ((pattern_len - 1) * head_dim_val + global_head_dim_val) // pattern_len
     if head_dim_val is None and hidden_size and num_attn_heads:
         head_dim_val = hidden_size // num_attn_heads
 
@@ -183,6 +337,11 @@ def detect_model(model_dir: Path) -> ModelInfo:
         num_kv_heads=num_kv_heads,
         num_layers=num_layers,
         head_dim=head_dim_val,
+        global_head_dim=(
+            global_head_dim_val
+            if isinstance(global_head_dim_val, int) and not isinstance(global_head_dim_val, bool)
+            else None
+        ),
     )
 
 

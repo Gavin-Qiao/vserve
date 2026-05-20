@@ -25,9 +25,18 @@ _MARKER_TABLE: list[tuple[str, str | None, str]] = [
     ("tool\u2581calls\u2581begin",  None,    "deepseek_v3"),
     ("<|tool_call>",          None,          "gemma4"),       # asymmetric tag
     ("<|action_start|>",      None,          "internlm"),
+    ("<|tool_calls_section_begin|>", None,   "kimi_k2"),
+    ("<|tool_call_begin|>",   None,          "kimi_k2"),
+    ("<|START_TOOL|>",        None,          "cohere_command4"),
+    ("<|TOOL_CALL|>",         None,          "lfm2"),
+    # IBM Granite — generic <|tool_call|> tag (Granite 3 + 4 share it; the
+    # parser layer disambiguates by checksum of the surrounding schema).
+    ("<|tool_call|>",         None,          "granite"),
     # Shared <tool_call> tag — disambiguate by inner format
     ("<tool_call>",           "<function=",  "qwen3_coder"),  # XML inner
-    ("<tool_call>",           None,          "hermes"),        # JSON inner
+    ("<tool_call>",           "<arg_name>",  "glm45"),         # GLM-4.5 attribute-list inner
+    ("<tool_call>",           "ERNIE",       "ernie45"),       # ERNIE-4.5 inner schema
+    ("<tool_call>",           None,          "hermes"),        # JSON inner — default
 ]
 
 # Name-based fallback for models that use token-level routing
@@ -45,9 +54,11 @@ _REASONING_MARKER_TABLE: list[tuple[str, str | None, str]] = [
     ("<seed:think>",      None,              "seed_oss"),
     ("[THINK]",           None,              "mistral"),
     ("<|channel>",        None,              "gemma4"),
+    ("<|im_thinking|>",   None,              "cohere"),
+    ("<|hun_thinking|>",  None,              "hunyuan"),
     # Shared <think> — disambiguate
     ("<think>",           "enable_thinking",  "qwen3"),        # Qwen3/3.5
-    ("<think>",           None,              "deepseek_r1"),   # DeepSeek, QwQ, etc.
+    ("<think>",           None,              "deepseek_r1"),   # DeepSeek, QwQ, KimiK2Thinking, etc.
 ]
 
 _REASONING_NAME_FALLBACKS: list[tuple[str, str]] = [

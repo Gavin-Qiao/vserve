@@ -7,6 +7,7 @@ from pathlib import Path
 from vserve.config import (
     cfg,
     find_systemd_unit_path,
+    read_profile_yaml,
     unit_content_matches_backend,
     unit_uses_environment_file,
     validate_systemd_service_name,
@@ -113,16 +114,18 @@ def _write_vllm_manifest(config_path: Path, *, status: str, error: str | None = 
     write_active_manifest(manifest, cfg().run_dir / "active-manifest.json")
 
 
-def _upsert_env_file() -> Path:
+def _upsert_env_file(extra: dict[str, str] | None = None) -> Path:
     c = cfg()
     env_path = c.vllm_root / "configs" / ".env"
     env_path.parent.mkdir(parents=True, exist_ok=True)
-    values = {
+    values: dict[str, str] = {
         "CUDA_HOME": str(c.cuda_home),
         "TMPDIR": str(c.vllm_root / "tmp"),
         "VLLM_RPC_BASE_PATH": str(c.vllm_root / "tmp"),
         "CUDA_VISIBLE_DEVICES": str(int(getattr(c, "gpu_index", 0) or 0)),
     }
+    if extra:
+        values.update(extra)
     lines: list[str] = []
     seen: set[str] = set()
     if env_path.exists():
@@ -147,6 +150,28 @@ def _upsert_env_file() -> Path:
             updated.append(f"{key}={value}")
     env_path.write_text("\n".join(updated) + "\n")
     return env_path
+
+
+def _resolve_quant_envs(config_path: Path) -> dict[str, str]:
+    """Read the active YAML config; return any quant-method-specific env vars.
+
+    Used by ``start_vllm`` to write `VLLM_USE_FLASHINFER_MOE_FP4=1` etc. into
+    the env file when the launched model uses NVFP4 / ModelOpt-NVFP4 / MXFP4.
+    Silent fallthrough on read errors — env vars are advisory.
+    """
+    try:
+        data = read_profile_yaml(config_path) or {}
+    except Exception:
+        return {}
+    quant = data.get("quantization") if isinstance(data, dict) else None
+    if not isinstance(quant, str):
+        return {}
+    from vserve.models import QUANT_ENV_VARS
+    # Map vLLM `--quantization` strings back to env-table keys.
+    qkey = quant.lower()
+    if qkey in QUANT_ENV_VARS:
+        return dict(QUANT_ENV_VARS[qkey])
+    return {}
 
 
 def _service_uses_env_file(env_path: Path) -> bool:
@@ -178,7 +203,10 @@ def is_vllm_running() -> bool:
 
 def start_vllm(config_path: Path, *, non_interactive: bool = False) -> None:
     snapshot = _snapshot_active_config()
-    env_path = _upsert_env_file()
+    # Quant-specific env vars (Q): write VLLM_USE_FLASHINFER_MOE_FP4 etc.
+    # alongside the base CUDA/TMP/RPC values so the systemd service picks
+    # them up from the EnvironmentFile.
+    env_path = _upsert_env_file(_resolve_quant_envs(config_path))
     if not _service_uses_env_file(env_path):
         raise RuntimeError(
             f"{cfg().service_name}.service must reference EnvironmentFile={env_path} "

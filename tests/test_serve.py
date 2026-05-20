@@ -213,3 +213,88 @@ def test_stop_vllm_failure(mocker):
     mocker.patch("vserve.serve._systemctl", return_value=(False, "", "Failed to stop"))
     with pytest.raises(RuntimeError, match="systemctl stop failed"):
         stop_vllm()
+
+
+# --- 0.7.0 item Q: NVFP4 / FlashInfer envs ---
+
+
+def test_resolve_quant_envs_nvfp4(mocker, tmp_path):
+    """NVFP4-quantized model → emit FlashInfer envs into the env file."""
+    from vserve.serve import _resolve_quant_envs
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("quantization: nvfp4\nmodel: /tmp/x\n")
+    envs = _resolve_quant_envs(cfg_path)
+    assert envs.get("VLLM_USE_FLASHINFER_MOE_FP4") == "1"
+    assert envs.get("VLLM_FLASHINFER_MOE_BACKEND") == "throughput"
+
+
+def test_resolve_quant_envs_modelopt_alias(tmp_path):
+    """ModelOpt-NVFP4 checkpoints also need FlashInfer envs."""
+    from vserve.serve import _resolve_quant_envs
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("quantization: modelopt\nmodel: /tmp/x\n")
+    envs = _resolve_quant_envs(cfg_path)
+    assert envs.get("VLLM_USE_FLASHINFER_MOE_FP4") == "1"
+
+
+def test_resolve_quant_envs_no_quant_returns_empty(tmp_path):
+    from vserve.serve import _resolve_quant_envs
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("model: /tmp/x\n")
+    assert _resolve_quant_envs(cfg_path) == {}
+
+
+def test_resolve_quant_envs_fp8_returns_empty(tmp_path):
+    """FP8 doesn't need any per-quant env vars; the model just emits the
+    --quantization flag."""
+    from vserve.serve import _resolve_quant_envs
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("quantization: fp8\nmodel: /tmp/x\n")
+    assert _resolve_quant_envs(cfg_path) == {}
+
+
+def test_upsert_env_file_includes_extra(mocker, tmp_path):
+    """The extra-envs hook merges quant envs into the base env-file write."""
+    from vserve.serve import _upsert_env_file
+    mock_cfg = Mock()
+    mock_cfg.vllm_root = tmp_path
+    mock_cfg.cuda_home = Path("/usr/local/cuda")
+    mock_cfg.gpu_index = 0
+    mocker.patch("vserve.serve.cfg", return_value=mock_cfg)
+    env_path = _upsert_env_file({"VLLM_USE_FLASHINFER_MOE_FP4": "1"})
+    text = env_path.read_text()
+    assert "CUDA_HOME=" in text
+    assert "VLLM_USE_FLASHINFER_MOE_FP4=1" in text
+
+
+def test_recommend_quant_blackwell_dense():
+    from vserve.models import recommend_quant_for_arch
+    assert recommend_quant_for_arch(sm=120, is_moe=False) == "nvfp4"
+
+
+def test_recommend_quant_blackwell_moe():
+    from vserve.models import recommend_quant_for_arch
+    assert recommend_quant_for_arch(sm=120, is_moe=True) == "mxfp4"
+
+
+def test_recommend_quant_hopper_fp8():
+    from vserve.models import recommend_quant_for_arch
+    assert recommend_quant_for_arch(sm=90, is_moe=False) == "fp8"
+
+
+def test_recommend_quant_filters_by_available():
+    from vserve.models import recommend_quant_for_arch
+    # NVFP4 not in available → fall back to FP8
+    assert recommend_quant_for_arch(sm=120, is_moe=False, available_quants={"fp8"}) == "fp8"
+
+
+def test_quant_flags_includes_new_entries():
+    from vserve.models import QUANT_FLAGS
+    for key in ("nvfp4", "modelopt", "mxfp4", "mxfp4_moe", "bitsandbytes", "gguf"):
+        assert key in QUANT_FLAGS, f"Missing quant flag: {key}"
+
+
+def test_quant_env_vars_includes_nvfp4_modelopt():
+    from vserve.models import QUANT_ENV_VARS
+    assert "VLLM_USE_FLASHINFER_MOE_FP4" in QUANT_ENV_VARS["nvfp4"]
+    assert "VLLM_USE_FLASHINFER_MOE_FP4" in QUANT_ENV_VARS["modelopt"]

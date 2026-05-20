@@ -171,3 +171,61 @@ def test_restore_fan_auto_falls_back_when_default_api_fails():
         call(handle, 0, 0),
         call(handle, 1, 0),
     ]
+
+
+# --- 0.6.1 item R: compute capability parsing ---
+
+
+def test_compute_cap_parsed_from_nvidia_smi_blackwell(mocker):
+    """Blackwell RTX (PRO 5000) reports compute_cap 12.0 → packed sm120."""
+    mocker.patch(
+        "vserve.gpu._run_nvidia_smi",
+        return_value="NVIDIA RTX PRO 5000 Blackwell, 48935, 0, 1024, 595.58.03, 12.0",
+    )
+    mocker.patch("vserve.gpu._get_cuda_version", return_value="13.0")
+    info = get_gpu_info()
+    assert info.compute_cap == 120
+
+
+def test_compute_cap_parsed_for_hopper(mocker):
+    """H100 reports compute_cap 9.0 → packed sm90."""
+    mocker.patch(
+        "vserve.gpu._run_nvidia_smi",
+        return_value="NVIDIA H100 80GB, 81920, 0, 0, 535.171.04, 9.0",
+    )
+    mocker.patch("vserve.gpu._get_cuda_version", return_value="12.8")
+    info = get_gpu_info()
+    assert info.compute_cap == 90
+
+
+def test_compute_cap_parsed_for_ada(mocker):
+    """4090 reports compute_cap 8.9 → packed sm89."""
+    mocker.patch(
+        "vserve.gpu._run_nvidia_smi",
+        return_value="NVIDIA GeForce RTX 4090, 24564, 0, 1024, 550.0.0, 8.9",
+    )
+    mocker.patch("vserve.gpu._get_cuda_version", return_value="12.8")
+    info = get_gpu_info()
+    assert info.compute_cap == 89
+
+
+def test_compute_cap_falls_back_to_none_when_missing(mocker):
+    """Older nvidia-smi without compute_cap column → field is None."""
+    mocker.patch(
+        "vserve.gpu._run_nvidia_smi",
+        return_value="NVIDIA RTX PRO 5000, 48935, 0, 1024, 595.58.03",
+    )
+    mocker.patch("vserve.gpu._get_cuda_version", return_value="13.0")
+    info = get_gpu_info()
+    assert info.compute_cap is None
+
+
+def test_compute_cap_falls_back_to_none_when_garbled(mocker):
+    """Unparseable compute_cap string → None (silent fallthrough)."""
+    mocker.patch(
+        "vserve.gpu._run_nvidia_smi",
+        return_value="NVIDIA RTX PRO 5000, 48935, 0, 1024, 595.58.03, garbage",
+    )
+    mocker.patch("vserve.gpu._get_cuda_version", return_value="13.0")
+    info = get_gpu_info()
+    assert info.compute_cap is None

@@ -2181,7 +2181,40 @@ def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
             table.add_row(*row)
         console.print(table)
 
+        # Annotate cells with measured decode tok/s from the perf cache, if
+        # any prior launches measured this (model, GPU, backend, build, ctx,
+        # kv, slots) tuple. Cells with no cache hit stay silent — we never
+        # show stale math estimates because they're misleading on the cases
+        # that matter most (expert spill, build regressions).
+        _print_measured_cells_block(limits_data, m, backend, dtype_order, limits)
+
         if backend == "vllm":
+            # Inline notes that the matrix alone can't convey. These are the
+            # tuner caveats users used to learn only by crashing.
+            forced_backend = limits_data.get("forced_attn_backend")
+            if forced_backend:
+                console.print(
+                    f"  [yellow]Note:[/yellow] this architecture forces vLLM's "
+                    f"[bold]{forced_backend}[/bold] attention backend. "
+                    "TurboQuant* columns are hidden because that backend rejects them."
+                )
+            has_turboquant_cell = any(
+                isinstance(entry, dict) and any(
+                    k.startswith("turboquant") and v is not None for k, v in entry.items()
+                )
+                for entry in limits.values()
+            )
+            if has_turboquant_cell:
+                console.print(
+                    "  [yellow]Note:[/yellow] [bold]turboquant_*[/bold] KV dtypes are "
+                    "experimental — the kernel's CUDA-graph workspace may assert at "
+                    "high slot/context combos. If you hit "
+                    "[dim]AssertionError: Workspace is locked[/dim], add "
+                    "[dim]compilation-config: {cudagraph_mode: NONE}[/dim] to the YAML "
+                    "(maintainer-canonical fix per [dim]vllm#40807/41403[/dim]), or "
+                    "drop the KV dtype to [dim]fp8[/dim]."
+                )
+
             recommendations = limits_data.get("recommendations")
             if isinstance(recommendations, dict) and recommendations:
                 rendered = []
@@ -2210,6 +2243,84 @@ def _print_limits_table(limits_data: dict, m: "ModelInfo") -> None:
 
     _print_benchmark_summary(limits_data)
     console.print()
+
+
+def _print_measured_cells_block(
+    limits_data: dict,
+    m: "ModelInfo",
+    backend: str | None,
+    dtype_order: list[str],
+    limits: dict,
+) -> None:
+    """Print measured decode tok/s next to the limits matrix when the perf
+    cache has entries for this (model, GPU, backend, build).
+
+    Soft-fail on any error — never block the picker.
+    """
+    if backend not in {"vllm", "llamacpp"}:
+        return
+    try:
+        from vserve.gpu import get_gpu_info
+        from vserve.perf_cache import gpu_uuid_or_index, lookup_for_picker
+        gpu = get_gpu_info()
+        gpu_uuid = gpu_uuid_or_index(gpu)
+    except Exception:
+        return
+    # Need a backend handle to derive build_id; look it up by name.
+    try:
+        from vserve.backends import _BACKENDS
+        backend_obj = next((b for b in _BACKENDS if b.name == backend), None)
+    except Exception:
+        backend_obj = None
+    if backend_obj is None:
+        return
+    try:
+        build_id = _build_id_for_backend(backend_obj)
+    except Exception:
+        return
+    entries = lookup_for_picker(
+        model_path=str(m.path), gpu_uuid=gpu_uuid,
+        backend=backend, build_id=build_id,
+    )
+    if not entries:
+        return
+    # Index by (context, kv_dtype) — the picker matrix dimensions.
+    by_cell: dict[tuple[int, str], list] = {}
+    for e in entries:
+        by_cell.setdefault((e.context, e.kv_dtype), []).append(e)
+
+    table = Table(
+        show_header=True, box=None, padding=(0, 2),
+        title="  Measured decode tok/s (from prior launches)",
+        title_style="dim", title_justify="left",
+    )
+    table.add_column("Context", style="bold")
+    for dtype in dtype_order:
+        table.add_column(_vllm_kv_label(dtype), justify="right")
+
+    has_data = False
+    for ctx_str in sorted(limits, key=int):
+        ctx_val = int(ctx_str)
+        row = [f"{ctx_val:,}"]
+        ctx_has = False
+        for dtype in dtype_order:
+            matches = by_cell.get((ctx_val, dtype), [])
+            if matches:
+                # Pick the most recent measurement.
+                latest = max(matches, key=lambda e: e.measured_at or "")
+                tps = latest.decode_tps_p50
+                if isinstance(tps, (int, float)) and tps > 0:
+                    row.append(f"{tps:.0f} t/s")
+                    ctx_has = True
+                else:
+                    row.append("[dim]—[/dim]")
+            else:
+                row.append("[dim]—[/dim]")
+        if ctx_has:
+            has_data = True
+        table.add_row(*row)
+    if has_data:
+        console.print(table)
 
 
 def _print_llamacpp_moe_block(moe: dict, dtype_order: list[str]) -> None:
@@ -2248,6 +2359,163 @@ def _print_llamacpp_moe_block(moe: dict, dtype_order: list[str]) -> None:
             row.append(f"{value} slots" if value else "[dim]OOM[/dim]")
         ot_table.add_row(*row)
     console.print(ot_table)
+
+
+def _diagnose_engine_failure(log_text: str, backend_name: str) -> list[tuple[str, str]]:
+    """Scan engine logs for known failure signatures and return one or more
+    `(cause, suggestion)` pairs the CLI can print.
+
+    Empty list means "no recognized pattern" — caller should fall back to the
+    generic "Check: sudo journalctl ..." hint. Patterns reflect failure modes
+    seen in the 2026-05-19 debugging session; each one was previously left to
+    the user to grep out of journalctl / vllm.log by hand.
+    """
+    if not log_text:
+        return []
+    findings: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(cause: str, suggestion: str) -> None:
+        key = cause
+        if key in seen:
+            return
+        seen.add(key)
+        findings.append((cause, suggestion))
+
+    # vLLM-side patterns
+    if backend_name == "vllm":
+        if "Selected backend" in log_text and "is not valid for this configuration" in log_text \
+                and "kv_cache_dtype not supported" in log_text:
+            _add(
+                "vLLM forced an attention backend that does not accept the requested kv-cache-dtype.",
+                "Re-run with --kv-cache-dtype fp8 (or auto). Architectures like Gemma-4 force "
+                "TRITON_ATTN which rejects every turboquant_* dtype.",
+            )
+        if "Workspace is locked but allocation" in log_text and "turboquant" in log_text:
+            _add(
+                "TurboQuant decode kernel needed more workspace than CUDA-graph capture sized.",
+                "Add `compilation-config: {cudagraph_mode: NONE}` to the YAML "
+                "(keeps torch.compile fusions, only skips graph capture — the "
+                "maintainer-canonical fix per vllm#40807/41403). Alternative: drop "
+                "--kv-cache-dtype to fp8. --enforce-eager also works but unnecessarily "
+                "disables torch.compile (vserve auto-emits cudagraph_mode: NONE for "
+                "turboquant_* dtypes starting in 0.6.1).",
+            )
+        if "Chunked MM input disabled" in log_text and "max_tokens_per_mm_item" in log_text:
+            _add(
+                "Multimodal model: one image/audio item is larger than max-num-batched-tokens.",
+                "Set --batched-tokens 4096 (or higher). vserve 0.6.0+ does this automatically "
+                "for any model with vision_config / audio_config.",
+            )
+        if "auto" in log_text and "tool choice requires --enable-auto-tool-choice" in log_text:
+            _add(
+                "Tool calling was requested but vLLM is not configured with a tool-call parser.",
+                "Pass --tools and re-run; vserve 0.6.0+ auto-maps known architectures (gemma4, "
+                "qwen3_coder, etc.) to a parser. Older configs need both "
+                "enable-auto-tool-choice and tool-call-parser in the YAML.",
+            )
+        if "CUDA out of memory" in log_text or "torch.cuda.OutOfMemoryError" in log_text:
+            _add(
+                "Engine ran out of GPU memory while allocating buffers.",
+                "Reduce --slots, --context, or use a smaller-bytes KV dtype (fp8). "
+                "Re-run `vserve tune <model> --recalc` to refresh the limits cache.",
+            )
+
+    # llama.cpp patterns (failure surface is in journal, not vllm.log)
+    if backend_name == "llamacpp":
+        if "cudaMalloc failed: out of memory" in log_text \
+                or "failed to allocate buffer for kv cache" in log_text:
+            _add(
+                "llama.cpp ran out of GPU memory allocating the KV cache.",
+                "Reduce --slots or --context. The product (slots × context) drives KV size. "
+                "vserve 0.6.0+ reserves more compute headroom in tune to prevent this.",
+            )
+        if "common_fit_params: failed to fit params to free device memory" in log_text \
+                and "n_gpu_layers already set by user" in log_text:
+            _add(
+                "llama.cpp's auto-fitter wanted to spill layers to CPU but --n-gpu-layers was "
+                "explicit; engine aborts.",
+                "Either reduce --n-gpu-layers below the model's total, OR enable MoE expert "
+                "CPU offload via --override-tensor '.ffn_.*_exps.=CPU' (vserve auto-applies "
+                "this in 0.6.0+ only when needed).",
+            )
+        if "core-dump" in log_text or "SIGSEGV" in log_text or "status=11/SEGV" in log_text:
+            _add(
+                "llama-server segfaulted (typically a model/runtime mismatch or KV alloc failure).",
+                "Check `journalctl -u llama-cpp.service -n 200` for the preceding error. "
+                "Common cause is requesting more KV than fits; try smaller --slots or --context.",
+            )
+        if "n_ctx_seq" in log_text and "n_ctx_train" in log_text:
+            # Informational — not a fatal warning, but worth surfacing when paired with a crash.
+            pass
+
+    return findings
+
+
+def _fetch_engine_log_for_diagnosis(backend, *, max_lines: int = 400) -> str:
+    """Read enough engine log to feed `_diagnose_engine_failure`.
+
+    For vLLM the engine writes stdout/stderr to `<logs_dir>/vllm.log` via the
+    systemd unit's `StandardOutput=append:` redirect (journal only contains
+    systemd state-change lines). For llama.cpp logs land in the journal.
+    """
+    import subprocess
+    from vserve.config import cfg as _cfg
+
+    if backend.name == "vllm":
+        log_path = _cfg().logs_dir / "vllm.log"
+        try:
+            # `sudo tail` reads the vllm-owned file; readable for the
+            # vserve-running user since the directory permissions allow it
+            # on the supported install. Fall back to journalctl if not.
+            result = subprocess.run(
+                ["sudo", "-n", "tail", "-n", str(max_lines), str(log_path)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0 and result.stdout:
+                return result.stdout
+        except Exception:
+            pass
+
+    try:
+        result = subprocess.run(
+            [
+                "journalctl",
+                "-u",
+                backend.service_name,
+                "--no-pager",
+                "-n",
+                str(max_lines),
+                "-o",
+                "cat",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout or ""
+    except Exception:
+        pass
+    return ""
+
+
+def _print_engine_diagnosis(backend, *, header: str | None = None) -> bool:
+    """Run diagnosis on the recent engine log and print findings. Returns True
+    if at least one finding was surfaced (caller can suppress the generic
+    journalctl hint when we already gave a precise answer)."""
+    log_text = _fetch_engine_log_for_diagnosis(backend)
+    findings = _diagnose_engine_failure(log_text, backend.name)
+    if not findings:
+        return False
+    if header:
+        console.print(header)
+    for cause, suggestion in findings:
+        console.print(f"  [bold]Cause:[/bold] {cause}")
+        console.print(f"  [bold]Try:[/bold]   {suggestion}\n")
+    return True
 
 
 def _wait_for_health(
@@ -2323,6 +2591,104 @@ def _wait_for_health(
     if dots_printed:
         console.print()
     return "timeout"
+
+
+def _resolve_probe_model_name(backend, cfg: dict) -> str | None:
+    """Pick the model id to send in the probe's request payload.
+
+    vLLM: prefer the first ``served-model-name`` alias, else the full path.
+    llama.cpp: any string works (the server ignores model id), default to "llamacpp".
+    """
+    if backend.name == "vllm":
+        names = cfg.get("served-model-name") or cfg.get("served_model_name")
+        if isinstance(names, list) and names:
+            first = names[0]
+            if isinstance(first, str) and first:
+                return first
+        model_path = cfg.get("model")
+        if isinstance(model_path, str) and model_path:
+            return model_path
+        return None
+    if backend.name == "llamacpp":
+        # llama-server accepts any model id in the request; use a stable alias.
+        return "llamacpp"
+    return None
+
+
+def _build_id_for_backend(backend) -> str:
+    """Get the (cached) build identifier the perf cache should key on."""
+    from vserve.perf_cache import llamacpp_build_id, vllm_build_id
+    if backend.name == "vllm":
+        try:
+            return vllm_build_id(backend.runtime_info(prefer_cache=True, with_pip_check=False))
+        except Exception:
+            return "vllm-unknown"
+    if backend.name == "llamacpp":
+        try:
+            from vserve.llamacpp_probe import probe_llama_cpp_build
+            ep = backend.find_entrypoint()
+            return llamacpp_build_id(probe_llama_cpp_build(ep) if ep else None)
+        except Exception:
+            return "llamacpp-unknown"
+    return "unknown"
+
+
+def _measure_and_cache(backend, cfg: dict, cfg_path, port: int):
+    """Run a short streaming probe against the just-started backend and
+    persist the result to the perf cache. Returns the PerfEntry on success
+    or None on any soft failure (so the launch path is unaffected)."""
+    from vserve.bench import run_streaming_benchmark
+    from vserve.gpu import get_gpu_info
+    from vserve.perf_cache import (
+        PerfEntry, config_hash_from_cfg, gpu_uuid_or_index, write_entry,
+    )
+
+    served = _resolve_probe_model_name(backend, cfg)
+    if served is None:
+        return None
+    base_url = f"http://localhost:{port}"
+    result = run_streaming_benchmark(
+        base_url, model=served, concurrency=1, duration_s=5.0, max_tokens=128,
+    )
+    if result.requests_completed == 0:
+        return None
+
+    try:
+        gpu = get_gpu_info()
+        gpu_uuid = gpu_uuid_or_index(gpu)
+        driver = gpu.driver
+    except Exception:
+        gpu_uuid = "unknown"
+        driver = "unknown"
+
+    if backend.name == "vllm":
+        context = int(cfg.get("max-model-len") or 0)
+        kv_dtype = str(cfg.get("kv-cache-dtype") or "auto")
+        slots = int(cfg.get("max-num-seqs") or 1)
+    else:
+        context = int(cfg.get("ctx_per_slot") or cfg.get("ctx_size") or 0)
+        kv_dtype = str(cfg.get("cache_type_k") or "f16")
+        slots = int(cfg.get("parallel") or 1)
+
+    entry = PerfEntry(
+        model_path=str(cfg.get("model") or cfg_path),
+        backend=backend.name,
+        gpu_uuid=gpu_uuid,
+        build_id=_build_id_for_backend(backend),
+        driver=driver,
+        config_hash=config_hash_from_cfg(cfg, backend.name),
+        context=context,
+        kv_dtype=kv_dtype,
+        slots=slots,
+        decode_tps_p50=result.throughput_tokens_per_sec,
+        decode_tps_p99=None,
+        ttft_ms_p50=result.ttft_ms_p50,
+        e2e_ms_p99=result.e2e_p99_ms,
+        sample_count=result.requests_completed,
+        served_name=served,
+    )
+    write_entry(entry)
+    return entry
 
 
 def _launch_backend(
@@ -2470,6 +2836,28 @@ def _launch_backend(
                 resolved_health_timeout_s = 600
                 console.print("  [yellow]First run — compiling kernels (~5-10 min).[/yellow]")
 
+        # L: build-version compat warnings for llama.cpp. Probes the binary
+        # for build number + CUDA runtime + GGML_CUDA_FA_ALL_QUANTS, then
+        # diffs against known-bad tier/build/runtime combos.
+        if backend.name == "llamacpp":
+            try:
+                from vserve.llamacpp_probe import probe_llama_cpp_build, check_build_compat
+                ep = backend.find_entrypoint()
+                build_info = probe_llama_cpp_build(ep) if ep else None
+                model_quant_tier: str | None = None
+                model_path_raw = cfg.get("model") if isinstance(cfg, dict) else None
+                if isinstance(model_path_raw, str) and model_path_raw:
+                    from pathlib import Path as _Path
+                    from vserve.models import parse_unsloth_quant_tier
+                    model_quant_tier = parse_unsloth_quant_tier(_Path(model_path_raw).name)
+                if build_info is not None:
+                    warnings = check_build_compat(build_info, model_quant_tier)
+                    for w in warnings:
+                        console.print(f"  [yellow]Build warning:[/yellow] {w}")
+            except Exception:
+                # Probe failures must not block launch.
+                pass
+
         try:
             backend.start(cfg_path, non_interactive=non_interactive)
         except RuntimeError as e:
@@ -2500,7 +2888,25 @@ def _launch_backend(
             _record_backend_manifest(backend, cfg_path, label=label, status="ready", port=port)
             console.print(f"\n[bold green]{backend.display_name} is running[/bold green] at http://localhost:{port}/v1")
             console.print(f"  Config: {cfg_path}")
-            console.print(f"  Logs:   sudo journalctl -u {backend.service_name} -f\n")
+            console.print(f"  Logs:   sudo journalctl -u {backend.service_name} -f")
+            # Measurement-at-launch — short streaming probe + persist to
+            # the perf cache so the picker can show "Measured: X tok/s"
+            # next to this exact cell on the next run.
+            try:
+                measured = _measure_and_cache(backend, cfg, cfg_path, port)
+                if measured is not None:
+                    tps = measured.decode_tps_p50
+                    ttft = measured.ttft_ms_p50
+                    if tps is not None:
+                        line = f"  [dim]Decode:[/dim] {tps:.1f} tok/s"
+                        if ttft is not None:
+                            line += f" · TTFT {ttft:.0f} ms"
+                        line += " [dim](measured at launch)[/dim]"
+                        console.print(line)
+            except Exception as exc:
+                # Probe failure must never block launch.
+                console.print(f"  [dim]Decode probe skipped: {exc}[/dim]")
+            console.print()
             return
         if outcome == "stopped":
             clear_session()
@@ -2512,7 +2918,12 @@ def _launch_backend(
                 port=port,
                 error="service stopped before health endpoint became ready",
             )
-            console.print(f"[red]Service stopped unexpectedly.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
+            console.print("\n[red]Service stopped unexpectedly.[/red]")
+            had_diagnosis = _print_engine_diagnosis(
+                backend, header="  [yellow]Diagnosed from the engine log:[/yellow]"
+            )
+            if not had_diagnosis:
+                console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
             raise typer.Exit(1)
 
         service_running = _service_running_state()
@@ -2527,7 +2938,12 @@ def _launch_backend(
                 port=port,
                 error="timed out waiting for health endpoint",
             )
-            console.print(f"[red]Timed out waiting for health endpoint.[/red] Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
+            console.print("\n[red]Timed out waiting for health endpoint.[/red]")
+            had_diagnosis = _print_engine_diagnosis(
+                backend, header="  [yellow]Diagnosed from the engine log:[/yellow]"
+            )
+            if not had_diagnosis:
+                console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
             raise typer.Exit(1)
         if service_running is True:
             _record_backend_manifest(backend, cfg_path, label=label, status="warming", port=port)
@@ -2662,8 +3078,11 @@ def _scripted_config(
                 "Flash-Attention path. Performance will degrade."
             )
 
-        # MoE expert CPU offload (`-ot ".ffn_.*_exps.=CPU"`). Auto-include
-        # when limits_data flags MoE and the user did not opt out.
+        # MoE expert CPU offload (`-ot ".ffn_.*_exps.=CPU"`). Only auto-apply
+        # when the chosen run cannot otherwise fit on GPU — applying `-ot`
+        # unconditionally to MoE models that already fit pushes hot expert
+        # weights to system RAM and traverses PCIe on every lookup, making
+        # tokens/s drop 10–100×. See `_llamacpp_needs_moe_offload`.
         override_tensors: list[str] = list(llamacpp_override_tensors or [])
         moe_info = limits_data.get("moe")
         if (
@@ -2672,14 +3091,17 @@ def _scripted_config(
             and isinstance(moe_info, dict)
             and moe_info.get("is_moe")
             and moe_info.get("ot_pattern")
+            and _llamacpp_needs_moe_offload(
+                limits_data, chosen_context, chosen_slots, chosen_k
+            )
         ):
             override_tensors.append(str(moe_info["ot_pattern"]))
             freed = moe_info.get("estimated_gpu_freed_gb")
             if freed:
                 console.print(
-                    f"  [dim]MoE detected: defaulting to "
-                    f"`-ot \"{moe_info['ot_pattern']}\"` "
-                    f"(frees ~{freed} GB VRAM). Pass --no-moe-offload to opt out.[/dim]"
+                    f"  [dim]MoE: chosen slots/context exceeds no-`-ot` capacity — "
+                    f"adding `-ot \"{moe_info['ot_pattern']}\"` "
+                    f"(frees ~{freed} GB VRAM). Pass --no-moe-offload to refuse.[/dim]"
                 )
 
         choices = {
@@ -2921,6 +3343,72 @@ def _llamacpp_slots_from_limits_entry(entry: object) -> int | None:
     if entry is None or isinstance(entry, bool) or not isinstance(entry, int):
         return None
     return entry
+
+
+def _llamacpp_needs_moe_offload(
+    limits_data: dict, chosen_context: int, chosen_slots: int, effective_kv: str
+) -> bool:
+    """True only when the chosen (context, slots, kv) can't fit on GPU without
+    `-ot`. Auto-applying `-ot` when the model already fits on GPU pushes hot
+    expert weights to system RAM — every lookup then traverses PCIe and
+    tokens/s collapses. Use this gate before auto-enabling the pattern."""
+    moe = limits_data.get("moe")
+    if not isinstance(moe, dict) or not moe.get("is_moe") or not moe.get("ot_pattern"):
+        return False
+    if not limits_data.get("full_offload", True):
+        # Model is already partially on CPU; `-ot` gives a cleaner partition
+        # (move whole expert FFN blocks instead of arbitrary tail layers).
+        return True
+    base = limits_data.get("limits")
+    if not isinstance(base, dict):
+        return False
+    entry = base.get(str(chosen_context))
+    if not isinstance(entry, dict):
+        return False
+    cap = entry.get(effective_kv)
+    if not isinstance(cap, int):
+        cap = entry.get("f16")
+    if not isinstance(cap, int):
+        return False
+    return chosen_slots > cap
+
+
+def _llamacpp_interactive_runtime_defaults(lim: dict) -> tuple[str, dict]:
+    """Return (effective_kv_dtype, effective_limits_table).
+
+    Mirrors the scripted-CLI defaults so the interactive picker advertises
+    slot ceilings that match the run the user will actually get:
+      * KV dtype defaults to `recommended_kv_dtype` (q8_0 if it strictly beats
+        f16 in the matrix, else f16). Without this the picker showed the max
+        across *every* KV-dtype column — including q4_0 — even though the run
+        defaults to f16, producing wildly inflated ceilings.
+
+    Note: this no longer auto-promotes the MoE `limits_with_ot` table. `-ot`
+    sacrifices throughput for KV-cache headroom and is only worth applying
+    when the model can't fit on GPU; that decision happens later via
+    `_llamacpp_needs_moe_offload` once the slot/context choice is known.
+    """
+    recommended_kv = lim.get("recommended_kv_dtype") or "f16"
+    base = lim.get("limits")
+    effective_limits = base if isinstance(base, dict) else {}
+    return recommended_kv, effective_limits
+
+
+def _llamacpp_interactive_slot_ceiling(
+    effective_limits: dict, chosen_ctx: int, effective_kv: str
+) -> int | None:
+    """Slot ceiling for the (context, dtype) the interactive flow will actually
+    run with. Falls back to f16 (the in-library default), then to any value in
+    the row, so legacy / partial caches still produce a usable number."""
+    entry = effective_limits.get(str(chosen_ctx))
+    if not isinstance(entry, dict):
+        return _llamacpp_slots_from_limits_entry(entry)
+    slots = entry.get(effective_kv)
+    if not isinstance(slots, int) or isinstance(slots, bool):
+        slots = entry.get("f16")
+    if not isinstance(slots, int) or isinstance(slots, bool):
+        slots = _llamacpp_slots_from_limits_entry(entry)
+    return slots if isinstance(slots, int) and slots >= 1 else None
 
 
 def _vllm_limits_entry(entry: object) -> dict[str, int | None]:
@@ -3211,14 +3699,14 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
     n_gpu_layers = lim.get("n_gpu_layers", 0)
     num_layers = lim.get("num_layers", 0)
     full_offload = lim.get("full_offload", True)
-    limits_obj = lim.get("limits", {})
-    limits = limits_obj if isinstance(limits_obj, dict) else {}
+
+    effective_kv, effective_limits = _llamacpp_interactive_runtime_defaults(lim)
 
     # 1. Context window
     working_ctxs = sorted(
         int(str(c))
-        for c, v in limits.items()
-        if _llamacpp_slots_from_limits_entry(v) is not None
+        for c in effective_limits
+        if _llamacpp_interactive_slot_ceiling(effective_limits, int(str(c)), effective_kv) is not None
     )
     if not working_ctxs:
         console.print("[red]No working configs found.[/red]")
@@ -3227,9 +3715,10 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
     console.print(f"\n[bold]Configure {m.model_name}[/bold] (llama.cpp)\n")
     ctx_items = []
     for ctx in working_ctxs:
-        slots = _llamacpp_slots_from_limits_entry(limits.get(str(ctx)))
+        slots = _llamacpp_interactive_slot_ceiling(effective_limits, ctx, effective_kv)
         slot_str = f"({slots} slots)" if slots else ""
         ctx_items.append(f"{ctx // 1024}k  {slot_str}")
+    console.print(f"  [dim]Slot counts below assume KV={effective_kv}.[/dim]")
     console.print("  [bold]1. Context window[/bold]")
     ctx_idx = _pick(ctx_items, title="  Context:")
     if ctx_idx is None:
@@ -3249,7 +3738,7 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
         console.print(f"\n  [dim]GPU layers: {n_gpu_layers}/{num_layers} (all on GPU)[/dim]")
 
     # 3. Parallel slots
-    max_parallel = _llamacpp_slots_from_limits_entry(limits.get(str(chosen_ctx), 1)) or 1
+    max_parallel = _llamacpp_interactive_slot_ceiling(effective_limits, chosen_ctx, effective_kv) or 1
     console.print(f"\n  [bold]3. Parallel slots[/bold] (max: {max_parallel})")
     par_str = typer.prompt(f"  Slots [1-{max_parallel}]", default=str(max_parallel))
     try:
@@ -3296,13 +3785,25 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
             else:
                 console.print("     [green]Enabled[/green] (--jinja)")
 
+    # Only apply `-ot` if needed. For models that already fit on GPU within
+    # the chosen slot/context, pushing experts to RAM costs throughput for
+    # zero benefit.
+    needs_offload = _llamacpp_needs_moe_offload(lim, chosen_ctx, chosen_parallel, effective_kv)
+
     # Build config via backend
     choices: dict = {
         "context": chosen_ctx,
         "n_gpu_layers": n_gpu_layers,
         "parallel": chosen_parallel,
         "port": 8888,
+        "kv_cache_k": effective_kv,
+        "kv_cache_v": effective_kv,
     }
+    if needs_offload:
+        moe_obj = lim.get("moe") if isinstance(lim.get("moe"), dict) else {}
+        pattern = moe_obj.get("ot_pattern") if isinstance(moe_obj, dict) else None
+        if isinstance(pattern, str) and pattern:
+            choices["override_tensors"] = [pattern]
     if is_embedding:
         choices["embedding"] = True
         choices["pooling"] = chosen_pooling
@@ -3315,6 +3816,14 @@ def _custom_config_llamacpp(m: ModelInfo, backend, *, tools: bool = False) -> "p
     console.print(f"    Context:     {chosen_ctx // 1024}k")
     console.print(f"    GPU layers:  {n_gpu_layers}/{num_layers}")
     console.print(f"    Parallel:    {chosen_parallel}")
+    console.print(f"    KV dtype:    {effective_kv} (K=V, fused FA)")
+    if needs_offload and choices.get("override_tensors"):
+        moe_obj = lim.get("moe") if isinstance(lim.get("moe"), dict) else {}
+        freed = moe_obj.get("estimated_gpu_freed_gb") if isinstance(moe_obj, dict) else None
+        if freed:
+            console.print(f"    MoE offload: [green]-ot (frees ~{freed} GB VRAM)[/green]")
+        else:
+            console.print("    MoE offload: [green]-ot[/green]")
     if is_embedding:
         console.print(f"    Mode:        [green]embedding (--pooling {chosen_pooling})[/green]")
     elif tools:
@@ -4315,6 +4824,17 @@ def status(
         if manifest_state and manifest_state != "ready":
             console.print(f"  [bold]State[/bold]      {manifest_state}")
     console.print(f"  [bold]Model[/bold]      {model_name}")
+    # Surface vLLM's served-model-name aliases so the user knows what `"model":
+    # ..."` strings the API accepts (without grepping the YAML themselves).
+    served_aliases: list[str] = []
+    if running_backend.name == "vllm":
+        raw_aliases = cfg.get("served-model-name")
+        if isinstance(raw_aliases, list):
+            served_aliases = [str(a) for a in raw_aliases if isinstance(a, str)]
+        elif isinstance(raw_aliases, str):
+            served_aliases = [raw_aliases]
+    if served_aliases:
+        console.print(f"  [bold]API names[/bold]  {', '.join(served_aliases)}")
     console.print(f"  [bold]Endpoint[/bold]   http://localhost:{port}/v1")
     console.print()
 
@@ -4377,8 +4897,95 @@ def status(
     except Exception:
         pass
 
+    # Copy-pasteable test request. Prefer the shortest served-name alias for
+    # vLLM (so the user doesn't have to send the filesystem path); for
+    # llama.cpp the model arg is ignored, so omit it.
+    sample_model = ""
+    if running_backend.name == "vllm" and served_aliases:
+        sample_model = min(served_aliases, key=len)
+    elif running_backend.name == "vllm":
+        sample_model = str(model_path)
+    if running_backend.name == "vllm":
+        console.print("\n  [bold]Test it[/bold]")
+        console.print(
+            f"    [dim]curl -s http://localhost:{port}/v1/chat/completions \\\n"
+            f"      -H 'Content-Type: application/json' \\\n"
+            f"      -d '{{\"model\":\"{sample_model}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"max_tokens\":20}}'[/dim]"
+        )
+    elif running_backend.name == "llamacpp":
+        console.print("\n  [bold]Test it[/bold]")
+        console.print(
+            f"    [dim]curl -s http://localhost:{port}/v1/chat/completions \\\n"
+            f"      -H 'Content-Type: application/json' \\\n"
+            f"      -d '{{\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"max_tokens\":20}}'[/dim]"
+        )
+
+    # Live inference probe — short streaming request to report current
+    # decode tok/s + TTFT. Plus the launch-time baseline from the perf
+    # cache when available. Both are best-effort; probe failures are silent.
+    _print_status_inference_probe(running_backend, cfg, port)
+
     if config_source:
         console.print(f"\n  [dim]{config_source}[/dim]\n")
+
+
+def _print_status_inference_probe(running_backend, cfg: dict, port: int) -> None:
+    """Run a small streaming probe + read perf cache; print decode tok/s line.
+
+    Soft-fails on any error so `vserve status` still produces output even
+    when the server is mid-startup or the probe times out.
+    """
+    served = _resolve_probe_model_name(running_backend, cfg)
+    if served is None:
+        return
+    base_url = f"http://localhost:{port}"
+    decode_tps: float | None = None
+    ttft_ms: float | None = None
+    try:
+        from vserve.bench import run_streaming_benchmark
+        result = run_streaming_benchmark(
+            base_url, model=served, concurrency=1, duration_s=3.0, max_tokens=64,
+        )
+        if result.requests_completed > 0:
+            decode_tps = result.throughput_tokens_per_sec
+            ttft_ms = result.ttft_ms_p50
+    except Exception:
+        decode_tps = None
+
+    # Cached baseline (last launch-time measurement for the same exact config).
+    cached_tps: float | None = None
+    cached_at: str | None = None
+    try:
+        from vserve.gpu import get_gpu_info
+        from vserve.perf_cache import (
+            config_hash_from_cfg, gpu_uuid_or_index, lookup_one,
+        )
+        gpu = get_gpu_info()
+        cached = lookup_one(
+            model_path=str(cfg.get("model") or ""),
+            gpu_uuid=gpu_uuid_or_index(gpu),
+            backend=running_backend.name,
+            build_id=_build_id_for_backend(running_backend),
+            config_hash=config_hash_from_cfg(cfg, running_backend.name),
+        )
+        if cached is not None:
+            cached_tps = cached.decode_tps_p50
+            cached_at = cached.measured_at
+    except Exception:
+        pass
+
+    if decode_tps is None and cached_tps is None:
+        return
+    console.print("\n  [bold]Inference[/bold]")
+    if decode_tps is not None:
+        line = f"    Decode:            {decode_tps:.1f} tok/s"
+        if ttft_ms is not None:
+            line += f"   TTFT {ttft_ms:.0f} ms"
+        line += "   [dim](live, 3s probe)[/dim]"
+        console.print(line)
+    if cached_tps is not None:
+        when = cached_at[:10] if isinstance(cached_at, str) else "?"
+        console.print(f"    Launch baseline:   {cached_tps:.1f} tok/s   [dim](measured at last `vserve run`, {when})[/dim]")
 
 
 @app.command()

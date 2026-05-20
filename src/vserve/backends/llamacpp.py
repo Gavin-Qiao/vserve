@@ -40,14 +40,20 @@ _KV_DTYPE_BYTES_PER_ELEMENT: dict[str, float] = {
 
 # K/V dtype candidates surfaced in tune output. We restrict the matrix to
 # symmetric pairs because llama.cpp's fused Flash-Attention kernel falls back
-# to a much slower path when K and V types don't match.
-_DEFAULT_KV_DTYPES: tuple[str, ...] = ("f16", "q8_0", "q4_1", "q4_0")
+# to a much slower path when K and V types don't match (llamacpp#22411).
+# iq4_nl is gated on the GGML_CUDA_FA_ALL_QUANTS build flag — without it,
+# the iq4_nl pair silently falls back to non-fused FA.
+_DEFAULT_KV_DTYPES: tuple[str, ...] = ("f16", "bf16", "q8_0", "q5_1", "q4_1", "q4_0")
+_FA_ALL_QUANTS_GATED_DTYPES: frozenset[str] = frozenset({"iq4_nl"})
 
 _LLAMACPP_KV_DTYPE_QUALITY: dict[str, str] = {
-    "f16": "native",
-    "q8_0": "lossy; widely documented as near-zero quality cost",
-    "q4_1": "lossy; aggressive — validate with eval before adopting",
-    "q4_0": "lossy; most aggressive — validate with eval before adopting",
+    "f16":    "native",
+    "bf16":   "native (newer GPUs)",
+    "q8_0":   "lossy; widely documented as near-zero quality cost",
+    "q5_1":   "lossy; middle-ground between q8_0 and q4_1",
+    "q4_1":   "lossy; aggressive — validate with eval before adopting",
+    "q4_0":   "lossy; most aggressive — validate with eval before adopting",
+    "iq4_nl": "lossy; most accurate 4-bit — requires GGML_CUDA_FA_ALL_QUANTS=ON",
 }
 
 
@@ -150,6 +156,25 @@ class LlamaCppBackend:
             "errors": errors,
         }
 
+    def _candidate_kv_dtypes(self) -> tuple[str, ...]:
+        """Return the KV-cache dtype candidates surfaced in tune output,
+        filtered by build flags. iq4_nl is gated on GGML_CUDA_FA_ALL_QUANTS
+        being set at build time (otherwise the fused FA kernel can't use it).
+        """
+        candidates: list[str] = list(_DEFAULT_KV_DTYPES)
+        try:
+            from vserve.llamacpp_probe import probe_llama_cpp_build
+            ep = self.find_entrypoint()
+            info = probe_llama_cpp_build(ep) if ep is not None else None
+            allow_fa_all_quants = bool(info and info.fa_all_quants)
+        except Exception:
+            allow_fa_all_quants = False
+        if allow_fa_all_quants:
+            # Append after q4_0 in quality order so existing matrices don't
+            # change column ordering for builds without the flag.
+            candidates.append("iq4_nl")
+        return tuple(candidates)
+
     def tune(self, model: ModelInfo, gpu: GpuInfo, *, gpu_mem_util: float = 0.90) -> dict:
         """Calculate n-gpu-layers, context sizes, and a context × KV-dtype matrix.
 
@@ -178,18 +203,35 @@ class LlamaCppBackend:
         n_gpu_layers = min(num_layers, int(available_for_layers / layer_size_gb)) if layer_size_gb > 0 else num_layers
         full_offload = n_gpu_layers >= num_layers
 
+        # Compute/runtime VRAM reserve held back from the KV-cache budget.
+        # llama-server uses VRAM beyond model + KV for: prompt-prefill compute
+        # buffers (scale ~linearly with -np × ubatch), CUDA workspace, pinned
+        # host-side transfer buffers, the embedding/output projection, and a
+        # small per-graph scratch. Without this reserve, the tuner produced
+        # configs that fit in pure KV math but at runtime llama.cpp silently
+        # shed tensors back to host RAM (observed: 22 slots × 128k q8_0 →
+        # 40 GB RAM peak as experts traversed PCIe). 10% of total VRAM
+        # (~5 GB on a 48 GB card) is a conservative floor that prevents the
+        # silent CPU-spill failure mode on the high-parallel configs we
+        # actually emit.
+        compute_reserve_gb = gpu.vram_total_gb * 0.10
         gpu_model_gb = n_gpu_layers * layer_size_gb
-        remaining_gb = usable_gb - gpu_model_gb
+        remaining_gb = usable_gb - gpu_model_gb - compute_reserve_gb
         remaining_bytes = int(max(0, remaining_gb) * (1024**3))
 
         from vserve.probe import _context_steps
         steps = _context_steps(max_context) if max_context >= 4096 else [4096]
 
+        # I: filter iq4_nl out of the candidate matrix when the binary was
+        # not built with GGML_CUDA_FA_ALL_QUANTS=ON. Without that flag, the
+        # fused FA kernel silently falls back to a dequant-on-the-fly path.
+        candidate_dtypes = self._candidate_kv_dtypes()
+
         # 2D matrix: { "<ctx>": { "f16": slots, "q8_0": slots, ... } }
         limits: dict[str, dict[str, int | None]] = {}
         for ctx in steps:
             row: dict[str, int | None] = {}
-            for dtype in _DEFAULT_KV_DTYPES:
+            for dtype in candidate_dtypes:
                 slots = self._max_parallel_slots_for_context(
                     metadata, remaining_bytes, ctx, k_dtype=dtype, v_dtype=dtype
                 )
@@ -982,6 +1024,20 @@ class LlamaCppBackend:
         }
         k_dtype = choices.get("kv_cache_k")
         v_dtype = choices.get("kv_cache_v")
+        # I: Fused Flash-Attention requires K and V to share a dtype
+        # (llamacpp#22411). Without symmetric pairs the engine silently falls
+        # back to a much slower dequant-on-the-fly path. Refuse to emit
+        # asymmetric pairs when -fa is on (the default).
+        if (
+            k_dtype is not None and v_dtype is not None
+            and str(k_dtype) != str(v_dtype)
+            and choices.get("flash_attn", True)
+        ):
+            raise ValueError(
+                f"llama.cpp fused Flash-Attention requires K==V; got "
+                f"K={k_dtype} V={v_dtype}. Pass symmetric --kv-cache-k/v, or "
+                f"disable -fa via flash_attn=False (slower non-fused path)."
+            )
         if k_dtype:
             cfg["cache_type_k"] = str(k_dtype)
         if v_dtype:
@@ -993,12 +1049,163 @@ class LlamaCppBackend:
         override = choices.get("override_tensors")
         if isinstance(override, list) and override:
             cfg["override_tensors"] = [str(item) for item in override]
+        # J: mmproj-BF16.gguf for vision/audio models (Gemma-4 etc.).
+        # Caller may opt out by passing mmproj=False or mmproj="" explicitly.
+        mmproj_override = choices.get("mmproj")
+        if mmproj_override is None:
+            if model.mmproj_path is not None:
+                cfg["mmproj"] = str(model.mmproj_path)
+        elif mmproj_override:
+            cfg["mmproj"] = str(mmproj_override)
+        # H: prefer --n-cpu-moe N over the all-experts-CPU regex. ncmoe is
+        # cleaner, version-stable, and well-defined ("first N MoE layers'
+        # experts on CPU" counting from highest layer down). Keep the regex
+        # path open for surgical layer-range cases.
+        n_cpu_moe = choices.get("n_cpu_moe")
+        if n_cpu_moe is None and isinstance(override, list) and override == [".ffn_.*_exps.=CPU"]:
+            n_cpu_moe = 99  # 99 = "all expert layers" — llama.cpp clamps to actual count
+            cfg.pop("override_tensors", None)
+        if isinstance(n_cpu_moe, int) and not isinstance(n_cpu_moe, bool):
+            cfg["n_cpu_moe"] = max(0, n_cpu_moe)
         if choices.get("embedding"):
             cfg["embedding"] = True
             if choices.get("pooling"):
                 cfg["pooling"] = choices["pooling"]
         elif choices.get("tools"):
             cfg["jinja"] = True
+
+        # Architecture-derived sampler defaults — unless the caller opted out.
+        # Read the architecture from GGUF metadata (already used for KV math)
+        # and map to recipe defaults. Caller-supplied sampler keys win.
+        sampler_keys = (
+            "temp", "top_p", "top_k", "min_p",
+            "presence_penalty", "repeat_penalty",
+        )
+        for key in sampler_keys:
+            if key in choices and choices[key] is not None:
+                cfg[key] = choices[key]
+        try:
+            metadata = self._read_gguf_metadata(Path(model_file))
+        except Exception:
+            metadata = {}
+        gguf_arch = metadata.get("arch") if metadata else None
+        if choices.get("recipe_sampling", True):
+            from vserve.recipes.sampling import get_sampling_defaults_from_gguf_arch
+            defaults = get_sampling_defaults_from_gguf_arch(gguf_arch)
+            if defaults is not None:
+                for key in sampler_keys:
+                    if key not in cfg:
+                        val = getattr(defaults, key, None)
+                        if val is not None:
+                            cfg[key] = val
+
+        # chat-template-kwargs (item C). Same architecture-aware kwarg
+        # selection as the vLLM path. Stored as a JSON string that start()
+        # passes to ``--chat-template-kwargs``.
+        ctk: dict = {}
+        explicit_ctk = choices.get("chat_template_kwargs")
+        if isinstance(explicit_ctk, dict):
+            ctk.update(explicit_ctk)
+        thinking = choices.get("thinking")
+        if thinking is not None and thinking != "auto":
+            arch_lower = gguf_arch.lower() if isinstance(gguf_arch, str) else ""
+            key = "thinking" if arch_lower.startswith("deepseek") else "enable_thinking"
+            ctk[key] = bool(thinking) if isinstance(thinking, bool) else thinking in (True, "on", "true", 1)
+        if ctk:
+            cfg["chat_template_kwargs"] = ctk
+
+        # Kimi-K2 thinking models hide `<think>` tokens unless --special is
+        # passed (R2 §13). Detect by arch lower.
+        if isinstance(gguf_arch, str) and gguf_arch.lower().startswith("kimi"):
+            cfg.setdefault("special", True)
+
+        # I: Gemma-4-31B + -fa + q8_0 V → illegal memory access after the
+        # second SWA checkpoint (llamacpp#22527). Force V to f16 for that
+        # specific architecture, regardless of what the picker chose.
+        is_gemma4 = isinstance(gguf_arch, str) and gguf_arch.lower().startswith("gemma4")
+        num_layers = (metadata or {}).get("num_layers") if isinstance(metadata, dict) else None
+        if (
+            is_gemma4 and isinstance(num_layers, int) and num_layers >= 60
+            and cfg.get("flash_attn", True)
+            and cfg.get("cache_type_v") == "q8_0"
+        ):
+            cfg["cache_type_v"] = "f16"
+            # Surface a note so the tuner output / status display can warn.
+            cfg.setdefault("notes", []).append(
+                "Gemma-4-31B+FA+q8_0 V is unstable (llamacpp#22527); forcing V=f16."
+            )
+
+        # K: reasoning-format auto-emission. llama.cpp's `--reasoning-format`
+        # picks the framing (harmony for <|channel|>, deepseek for <think>,
+        # none for no separation). Without it, both leak into message.content
+        # and clients can't split.
+        if "reasoning_format" in choices and choices["reasoning_format"] is not None:
+            cfg["reasoning_format"] = str(choices["reasoning_format"])
+        else:
+            template = self._read_gguf_chat_template(model.path) or ""
+            if "<|channel|>" in template or "<|channel>" in template:
+                cfg["reasoning_format"] = "harmony"
+            elif "<think>" in template or "&lt;think&gt;" in template:
+                cfg["reasoning_format"] = "deepseek"
+        budget = choices.get("reasoning_budget")
+        if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0:
+            cfg["reasoning_budget"] = budget
+
+        # S: prompt-caching primitives. --cache-reuse N (min chunk for KV
+        # shifting within a slot), --slot-save-path (persistent snapshots),
+        # --cram <MB> (host-memory prompt cache for shared prefixes), and
+        # --swa-full (required for Gemma-4 + cache-reuse per llamacpp#21468).
+        cache_reuse = choices.get("cache_reuse")
+        slot_save_path = choices.get("slot_save_path")
+        cram_mb = choices.get("cram_mb")
+        swa_full = choices.get("swa_full")
+        if isinstance(cache_reuse, int) and not isinstance(cache_reuse, bool) and cache_reuse > 0:
+            cfg["cache_reuse"] = cache_reuse
+        if isinstance(slot_save_path, str) and slot_save_path:
+            cfg["slot_save_path"] = slot_save_path
+        if isinstance(cram_mb, int) and not isinstance(cram_mb, bool) and cram_mb > 0:
+            cfg["cram_mb"] = cram_mb
+        if swa_full is True:
+            cfg["swa_full"] = True
+        # Gating: Gemma-4 + cache-reuse needs --swa-full (shared-KV layers
+        # break the reuse heuristic without it — llamacpp#21468).
+        if (
+            is_gemma4 and cfg.get("cache_reuse")
+            and not cfg.get("swa_full")
+        ):
+            raise ValueError(
+                "Gemma-4 + --cache-reuse requires --swa-full to avoid "
+                "stale-KV corruption (llamacpp#21468). Pass swa_full=True."
+            )
+
+        # M: speculative-decoding flags. Accept either a recipes.SpecConfig
+        # (auto-picked) or a plain dict ({draft_model_path, n_max, n_min,
+        # p_min}). Stored under ``spec_draft`` so start() can route to
+        # --spec-draft-* flags.
+        spec = choices.get("spec")
+        if spec:
+            spec_cls: type | None
+            try:
+                from vserve.recipes.spec_decode import SpecConfig as _SpecConfig
+                spec_cls = _SpecConfig
+            except Exception:
+                spec_cls = None
+            spec_dict: dict | None = None
+            if spec_cls is not None and isinstance(spec, spec_cls):
+                if spec.method == "ngram":
+                    # llama.cpp has no equivalent zero-cost ngram path; skip.
+                    spec_dict = None
+                elif spec.draft_model_path is not None:
+                    spec_dict = {
+                        "draft_model_path": str(spec.draft_model_path),
+                        "n_max": spec.n_max,
+                        "n_min": spec.n_min,
+                        "p_min": spec.p_min,
+                    }
+            elif isinstance(spec, dict):
+                spec_dict = spec
+            if spec_dict:
+                cfg["spec_draft"] = spec_dict
         return cfg
 
     def quant_flag(self, method: str | None) -> str:
@@ -1029,6 +1236,19 @@ class LlamaCppBackend:
             "ubatch_size": "-ub",
             "cache_type_k": "-ctk",
             "cache_type_v": "-ctv",
+            "n_cpu_moe": "-ncmoe",
+            "mmproj": "--mmproj",
+            "reasoning_format": "--reasoning-format",
+            "reasoning_budget": "--reasoning-budget",
+            "cache_reuse": "--cache-reuse",
+            "slot_save_path": "--slot-save-path",
+            "cram_mb": "--cram",
+            "temp": "--temp",
+            "top_p": "--top-p",
+            "top_k": "--top-k",
+            "min_p": "--min-p",
+            "presence_penalty": "--presence-penalty",
+            "repeat_penalty": "--repeat-penalty",
         }
         for key, flag in flag_map.items():
             if key in cfg:
@@ -1042,17 +1262,44 @@ class LlamaCppBackend:
             args.extend(["--pooling", str(cfg["pooling"])])
         if cfg.get("jinja"):
             args.append("--jinja")
+        if cfg.get("special"):
+            # Kimi-K2 etc. — expose hidden tokens like `<think>` to the parser.
+            args.append("--special")
+        if cfg.get("swa_full"):
+            # S: required for Gemma-4 + --cache-reuse (llamacpp#21468).
+            args.append("--swa-full")
+        # M: speculative decoding (draft model). llama.cpp uses -md plus
+        # --spec-draft-n-{min,max} / --spec-draft-p-min.
+        spec_draft = cfg.get("spec_draft")
+        if isinstance(spec_draft, dict) and spec_draft.get("draft_model_path"):
+            args.extend(["-md", str(spec_draft["draft_model_path"])])
+            if "n_max" in spec_draft:
+                args.extend(["--spec-draft-n-max", str(spec_draft["n_max"])])
+            if "n_min" in spec_draft:
+                args.extend(["--spec-draft-n-min", str(spec_draft["n_min"])])
+            if "p_min" in spec_draft:
+                args.extend(["--spec-draft-p-min", str(spec_draft["p_min"])])
+        # chat_template_kwargs (item C). Pass as a single JSON string.
+        ctk = cfg.get("chat_template_kwargs")
+        if isinstance(ctk, dict) and ctk:
+            args.extend(["--chat-template-kwargs", json.dumps(ctk)])
         # Repeatable: --override-tensor / -ot for MoE expert CPU offloading
         # and other selective offload patterns.
         override_tensors = cfg.get("override_tensors", []) or []
         for pattern in override_tensors:
             args.extend(["-ot", str(pattern)])
-        # llama.cpp 67ace02+ emits a perf warning when --override-tensor is
-        # combined with mmap-enabled loading. Auto-disable mmap so the
-        # MoE-offload path runs on the fast loader by default. Users who
-        # need mmap on can hand-edit the generated config.
-        if override_tensors and not cfg.get("mmap", False):
+        # llama.cpp 67ace02+ emits a perf warning when --override-tensor or
+        # --n-cpu-moe is combined with mmap-enabled loading. Auto-disable
+        # mmap so the MoE-offload path runs on the fast loader by default.
+        # Users who need mmap on can hand-edit the generated config.
+        if (override_tensors or cfg.get("n_cpu_moe")) and not cfg.get("mmap", False):
             args.append("--no-mmap")
+        # vserve computes n_gpu_layers ourselves; tell llama.cpp's auto-fitter
+        # to stand down. Without this, every start logs
+        #   common_fit_params: failed to fit params to free device memory:
+        #   n_gpu_layers already set by user to N, abort
+        # which looks like an error in journals but is cosmetic (llamacpp#21801).
+        args.extend(["--fit", "off"])
 
         # Write per-model launch script + JSON alongside the config,
         # then symlink active.sh/active.json to them.

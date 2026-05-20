@@ -498,3 +498,209 @@ def test_guess_pooling():
     assert LlamaCppBackend._guess_pooling("nomic-embed-text-v1.5") == "mean"
     assert LlamaCppBackend._guess_pooling("jina-reranker-v2") == "rank"
     assert LlamaCppBackend._guess_pooling("e5-small-v2") == "mean"
+
+
+# --- 0.7.0 item G: Unsloth UD-2.0 quant-tier classification ---
+
+
+class TestUnsslothQuantTier:
+    """Defect (G): vserve had a bool ``is_unsloth_ud`` flag but couldn't tell
+    Q4_K_XL from IQ4_XS. Without the tier, we can't recommend per-card
+    quants, tier-weight the auto-tuner, or fire build-version gates
+    (item L). Parse the tier from the GGUF filename."""
+
+    def test_parses_q4_k_xl(self):
+        from vserve.models import parse_unsloth_quant_tier
+        assert parse_unsloth_quant_tier("gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf") == "Q4_K_XL"
+
+    def test_parses_iq4_xs(self):
+        from vserve.models import parse_unsloth_quant_tier
+        assert parse_unsloth_quant_tier("Qwen3-Coder-UD-IQ4_XS.gguf") == "IQ4_XS"
+
+    def test_parses_mxfp4_moe(self):
+        from vserve.models import parse_unsloth_quant_tier
+        assert parse_unsloth_quant_tier("gpt-oss-20B-UD-MXFP4_MOE.gguf") == "MXFP4_MOE"
+
+    def test_parses_tq1_0(self):
+        from vserve.models import parse_unsloth_quant_tier
+        assert parse_unsloth_quant_tier("DeepSeek-V3-UD-TQ1_0.gguf") == "TQ1_0"
+
+    def test_case_insensitive(self):
+        from vserve.models import parse_unsloth_quant_tier
+        # The pattern is case-insensitive; canonical form is upper.
+        assert parse_unsloth_quant_tier("model-ud-q4_k_xl.gguf") == "Q4_K_XL"
+
+    def test_unrelated_filename_returns_none(self):
+        from vserve.models import parse_unsloth_quant_tier
+        assert parse_unsloth_quant_tier("gemma-4-26B-A4B-it.Q4_K_M.gguf") is None
+        assert parse_unsloth_quant_tier("model.safetensors") is None
+        assert parse_unsloth_quant_tier("") is None
+
+    def test_detect_model_populates_quant_tier(self, tmp_path):
+        from vserve.models import detect_model
+        model_dir = tmp_path / "models" / "unsloth" / "gemma-4-26B-A4B-it-GGUF"
+        model_dir.mkdir(parents=True)
+        (model_dir / "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf").write_bytes(b"GGUF")
+        m = detect_model(model_dir)
+        assert m.quant_tier == "Q4_K_XL"
+
+    def test_detect_model_mxfp4_moe_forces_is_moe(self, tmp_path):
+        from vserve.models import detect_model
+        # Even when GGUF metadata isn't read yet, MXFP4_MOE tier alone implies MoE.
+        model_dir = tmp_path / "models" / "unsloth" / "gpt-oss-20B-GGUF"
+        model_dir.mkdir(parents=True)
+        (model_dir / "gpt-oss-20B-UD-MXFP4_MOE.gguf").write_bytes(b"GGUF")
+        m = detect_model(model_dir)
+        assert m.quant_tier == "MXFP4_MOE"
+        assert m.is_moe is True
+        assert m.quant_method == "mxfp4_moe"
+
+    def test_detect_model_no_tier_returns_none(self, tmp_path):
+        from vserve.models import detect_model
+        model_dir = tmp_path / "models" / "thirdparty" / "RawGGUF"
+        model_dir.mkdir(parents=True)
+        (model_dir / "model.gguf").write_bytes(b"GGUF")
+        m = detect_model(model_dir)
+        assert m.quant_tier is None
+
+
+class TestFindMmproj:
+    """Helper used by item J (auto --mmproj for llama.cpp) — must locate
+    the BF16 variant when present, fall back to any mmproj GGUF, else None."""
+
+    def test_prefers_bf16_variant(self, tmp_path):
+        from vserve.models import find_mmproj
+        (tmp_path / "mmproj-BF16.gguf").write_bytes(b"GGUF")
+        (tmp_path / "mmproj-F16.gguf").write_bytes(b"GGUF")
+        result = find_mmproj(tmp_path)
+        assert result is not None
+        assert "BF16" in result.name
+
+    def test_falls_back_to_any_mmproj(self, tmp_path):
+        from vserve.models import find_mmproj
+        (tmp_path / "mmproj-F16.gguf").write_bytes(b"GGUF")
+        result = find_mmproj(tmp_path)
+        assert result is not None
+        assert result.name == "mmproj-F16.gguf"
+
+    def test_returns_none_when_no_mmproj(self, tmp_path):
+        from vserve.models import find_mmproj
+        (tmp_path / "model.gguf").write_bytes(b"GGUF")
+        assert find_mmproj(tmp_path) is None
+
+    def test_detect_model_populates_mmproj_path(self, tmp_path):
+        from vserve.models import detect_model
+        model_dir = tmp_path / "models" / "unsloth" / "gemma-4-26B-A4B-it-GGUF"
+        model_dir.mkdir(parents=True)
+        (model_dir / "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf").write_bytes(b"GGUF")
+        (model_dir / "mmproj-BF16.gguf").write_bytes(b"GGUF")
+        m = detect_model(model_dir)
+        assert m.mmproj_path is not None
+        assert m.mmproj_path.name == "mmproj-BF16.gguf"
+
+
+# --- 0.7.0 item E: hybrid head_dim KV math (Gemma-4) ---
+
+
+class TestHybridHeadDim:
+    """Defect (E): Gemma-4 has head_dim=256 on sliding layers and 512 on
+    global layers (5:1 interleave). The hidden_size/num_attention_heads
+    fallback gave 288, which under-counted KV bytes and pushed borderline
+    configs into OOM. Compute the weighted average over sliding_window_pattern.
+    """
+
+    def _write_config(self, tmp_path, **kwargs):
+        import json
+        model_dir = tmp_path / "models" / "p" / "M"
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text(json.dumps(kwargs))
+        (model_dir / "model.safetensors").write_bytes(b"\0" * 16)
+        return model_dir
+
+    def test_gemma4_weighted_average_5_local_1_global(self, tmp_path):
+        from vserve.models import detect_model
+        model_dir = self._write_config(tmp_path, **{
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "text_config": {
+                "head_dim": 256,
+                "global_head_dim": 512,
+                "sliding_window_pattern": 6,
+                "num_attention_heads": 10,
+                "num_key_value_heads": 2,
+                "hidden_size": 2880,
+                "num_hidden_layers": 60,
+                "max_position_embeddings": 131072,
+            },
+        })
+        m = detect_model(model_dir)
+        # (5*256 + 1*512) / 6 = 1792 / 6 = 298 (floor)
+        assert m.head_dim == 298
+        assert m.global_head_dim == 512
+
+    def test_uniform_head_dim_returns_simple_value(self, tmp_path):
+        from vserve.models import detect_model
+        model_dir = self._write_config(tmp_path, **{
+            "architectures": ["LlamaForCausalLM"],
+            "head_dim": 128,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "max_position_embeddings": 32768,
+        })
+        m = detect_model(model_dir)
+        assert m.head_dim == 128
+        assert m.global_head_dim is None
+
+    def test_missing_global_head_dim_safe(self, tmp_path):
+        from vserve.models import detect_model
+        model_dir = self._write_config(tmp_path, **{
+            "architectures": ["LlamaForCausalLM"],
+            "text_config": {
+                "head_dim": 128,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "hidden_size": 4096,
+                "num_hidden_layers": 32,
+                "max_position_embeddings": 32768,
+            },
+        })
+        m = detect_model(model_dir)
+        assert m.head_dim == 128
+        assert m.global_head_dim is None
+
+    def test_equal_global_and_head_dim_does_not_apply_weighting(self, tmp_path):
+        from vserve.models import detect_model
+        model_dir = self._write_config(tmp_path, **{
+            "architectures": ["LlamaForCausalLM"],
+            "text_config": {
+                "head_dim": 128,
+                "global_head_dim": 128,  # equal → not hybrid
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "hidden_size": 4096,
+                "num_hidden_layers": 32,
+                "max_position_embeddings": 32768,
+            },
+        })
+        m = detect_model(model_dir)
+        # No weighting applied when equal — keep simple value.
+        assert m.head_dim == 128
+
+    def test_top_level_head_dims_also_supported(self, tmp_path):
+        """Some configs put hybrid head dims at top level, not text_config."""
+        from vserve.models import detect_model
+        model_dir = self._write_config(tmp_path, **{
+            "architectures": ["Gemma4ForCausalLM"],
+            "head_dim": 256,
+            "global_head_dim": 512,
+            "sliding_window_pattern": 6,
+            "num_attention_heads": 10,
+            "num_key_value_heads": 2,
+            "hidden_size": 2880,
+            "num_hidden_layers": 60,
+            "max_position_embeddings": 131072,
+        })
+        m = detect_model(model_dir)
+        assert m.head_dim == 298
+        assert m.global_head_dim == 512

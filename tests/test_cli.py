@@ -2668,3 +2668,246 @@ def test_vllm_limits_helper_accepts_flat_schema():
     from vserve.cli import _vllm_limits_entry
 
     assert _vllm_limits_entry(6) == {"auto": 6}
+
+
+def test_llamacpp_interactive_slot_ceiling_uses_effective_dtype_column():
+    """Regression: picking 128k with default-dtype runtime must not advertise
+    the q4_0 ceiling. The cached gemma-4-26B-A4B matrix returns 42 across
+    columns (q4_0) but only 11 at f16 — the run-time default in the absence
+    of an explicit dtype. The picker must reflect the dtype that will
+    actually be used."""
+    from vserve.cli import (
+        _llamacpp_interactive_runtime_defaults,
+        _llamacpp_interactive_slot_ceiling,
+    )
+
+    lim = {
+        "recommended_kv_dtype": "q8_0",
+        "limits": {
+            "131072": {"f16": 11, "q8_0": 22, "q4_1": 38, "q4_0": 42},
+            "65536": {"f16": 21, "q8_0": 40, "q4_1": 69, "q4_0": 76},
+        },
+    }
+    effective_kv, effective_limits = _llamacpp_interactive_runtime_defaults(lim)
+    assert effective_kv == "q8_0"
+    # Slot ceiling at 128k must come from the q8_0 column, not max across dtypes.
+    assert _llamacpp_interactive_slot_ceiling(effective_limits, 131072, effective_kv) == 22
+    assert _llamacpp_interactive_slot_ceiling(effective_limits, 65536, effective_kv) == 40
+
+
+def test_llamacpp_interactive_runtime_defaults_does_not_promote_moe_offload_table():
+    """Regression: when the model fits on GPU, the interactive picker must
+    advertise the regular (no-`-ot`) slot ceilings — the `limits_with_ot`
+    table is for users who explicitly opt into trading throughput for KV
+    headroom. The previous implementation auto-promoted the `-ot` table for
+    any MoE model, which silently relocated expert FFN weights to RAM and
+    made inference 10–100× slower with no benefit when the model fit."""
+    from vserve.cli import (
+        _llamacpp_interactive_runtime_defaults,
+        _llamacpp_interactive_slot_ceiling,
+    )
+
+    lim = {
+        "recommended_kv_dtype": "q8_0",
+        "full_offload": True,
+        "limits": {"131072": {"f16": 11, "q8_0": 22}},
+        "moe": {
+            "is_moe": True,
+            "expert_count": 128,
+            "ot_pattern": ".ffn_.*_exps.=CPU",
+            "limits_with_ot": {"131072": {"f16": 14, "q8_0": 26}},
+        },
+    }
+    effective_kv, effective_limits = _llamacpp_interactive_runtime_defaults(lim)
+    assert effective_kv == "q8_0"
+    # Picker sees the no-`-ot` ceiling (22), not the inflated `-ot` one (26).
+    assert _llamacpp_interactive_slot_ceiling(effective_limits, 131072, effective_kv) == 22
+
+
+def test_llamacpp_needs_moe_offload_only_when_slots_exceed_no_ot_capacity():
+    """Auto-apply `-ot` only when the chosen run won't fit on GPU otherwise."""
+    from vserve.cli import _llamacpp_needs_moe_offload
+
+    lim = {
+        "full_offload": True,
+        "limits": {"131072": {"f16": 11, "q8_0": 22}},
+        "moe": {"is_moe": True, "ot_pattern": ".ffn_.*_exps.=CPU"},
+    }
+    # Within capacity → no auto-offload (preserve GPU throughput).
+    assert _llamacpp_needs_moe_offload(lim, 131072, 2, "q8_0") is False
+    assert _llamacpp_needs_moe_offload(lim, 131072, 22, "q8_0") is False
+    # Exceeds q8_0 capacity → need offload to fit.
+    assert _llamacpp_needs_moe_offload(lim, 131072, 23, "q8_0") is True
+    # Default-dtype runtime: gate against f16 column.
+    assert _llamacpp_needs_moe_offload(lim, 131072, 12, "f16") is True
+    assert _llamacpp_needs_moe_offload(lim, 131072, 11, "f16") is False
+
+
+def test_llamacpp_needs_moe_offload_partial_offload_always_true():
+    """Model already partially on CPU (full_offload=False) → `-ot` is strictly
+    better than letting llama.cpp pick which tail layers to spill, since the
+    expert FFN blocks are the cleanest chunk to move."""
+    from vserve.cli import _llamacpp_needs_moe_offload
+
+    lim = {
+        "full_offload": False,
+        "limits": {"4096": {"f16": 4}},
+        "moe": {"is_moe": True, "ot_pattern": ".ffn_.*_exps.=CPU"},
+    }
+    assert _llamacpp_needs_moe_offload(lim, 4096, 1, "f16") is True
+
+
+def test_llamacpp_needs_moe_offload_non_moe_is_false():
+    """Non-MoE models can't benefit from the expert-FFN pattern at all."""
+    from vserve.cli import _llamacpp_needs_moe_offload
+
+    lim = {"full_offload": True, "limits": {"4096": {"f16": 4}}, "moe": None}
+    assert _llamacpp_needs_moe_offload(lim, 4096, 99, "f16") is False
+    # Also degrades cleanly when the moe block has is_moe=False.
+    lim2 = {"full_offload": True, "limits": {"4096": {"f16": 4}}, "moe": {"is_moe": False}}
+    assert _llamacpp_needs_moe_offload(lim2, 4096, 99, "f16") is False
+
+
+def test_llamacpp_interactive_slot_ceiling_falls_back_to_f16_then_max():
+    """Partial / legacy cache rows: prefer the picked dtype, then f16,
+    then any non-null value in the row, so older limits remain usable."""
+    from vserve.cli import _llamacpp_interactive_slot_ceiling
+
+    # dtype absent → falls back to f16
+    assert _llamacpp_interactive_slot_ceiling({"4096": {"f16": 7}}, 4096, "q8_0") == 7
+    # dtype + f16 absent → falls back to max across the remaining columns
+    assert _llamacpp_interactive_slot_ceiling({"4096": {"q4_0": 12}}, 4096, "q8_0") == 12
+    # legacy flat-int entry (pre-L1 schema) — accept as-is
+    assert _llamacpp_interactive_slot_ceiling({"4096": 5}, 4096, "q8_0") == 5
+    # missing context
+    assert _llamacpp_interactive_slot_ceiling({"4096": {"f16": 7}}, 8192, "f16") is None
+
+
+# --- Polish 1: engine-failure diagnosis ---
+
+
+class TestDiagnoseEngineFailure:
+    """Regression coverage for every error pattern hit in the 2026-05-19 debug
+    session. Each pattern was previously left to the user to grep out of
+    journalctl / vllm.log by hand; the diagnosis surfaces it inline."""
+
+    def test_vllm_triton_attn_rejects_turboquant(self):
+        from vserve.cli import _diagnose_engine_failure
+        log = """
+        ERROR ... gemma4.py:489 ... Attention __init__
+        ERROR ValueError: Selected backend AttentionBackendEnum.TRITON_ATTN is not valid for this configuration. Reason: ['kv_cache_dtype not supported']
+        """
+        findings = _diagnose_engine_failure(log, "vllm")
+        assert len(findings) == 1
+        cause, suggestion = findings[0]
+        assert "TRITON_ATTN" in cause or "attention backend" in cause.lower()
+        assert "fp8" in suggestion
+
+    def test_vllm_turboquant_workspace_assertion(self):
+        from vserve.cli import _diagnose_engine_failure
+        log = """
+        File "/.../turboquant_attn.py", line 879, in _decode_attention
+        File "/.../workspace.py", line 157, in _ensure_workspace_size
+        AssertionError: Workspace is locked but allocation from 'turboquant_attn.py:879:_decode_attention' requires 5.61 MB
+        """
+        findings = _diagnose_engine_failure(log, "vllm")
+        assert len(findings) == 1
+        cause, suggestion = findings[0]
+        assert "turboquant" in cause.lower() or "workspace" in cause.lower()
+        # Maintainer-canonical fix per vllm#40807/41403 is cudagraph_mode: NONE
+        # (preserves torch.compile fusions). fp8 fallback is also acceptable.
+        assert "cudagraph_mode" in suggestion
+        assert "vllm#40807" in suggestion or "40807" in suggestion
+        assert "fp8" in suggestion
+
+    def test_vllm_chunked_mm_input_disabled(self):
+        from vserve.cli import _diagnose_engine_failure
+        log = """
+        ValueError: Chunked MM input disabled but max_tokens_per_mm_item (2496) is larger than max_num_batched_tokens (2048). Please increase max_num_batched_tokens.
+        """
+        findings = _diagnose_engine_failure(log, "vllm")
+        assert len(findings) == 1
+        cause, suggestion = findings[0]
+        assert "multimodal" in cause.lower() or "mm" in cause.lower()
+        assert "batched-tokens" in suggestion or "max-num-batched-tokens" in suggestion
+
+    def test_vllm_tool_choice_without_parser(self):
+        from vserve.cli import _diagnose_engine_failure
+        log = '"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set'
+        findings = _diagnose_engine_failure(log, "vllm")
+        assert len(findings) == 1
+        cause, suggestion = findings[0]
+        assert "tool" in cause.lower()
+        assert "--tools" in suggestion or "parser" in suggestion
+
+    def test_vllm_cuda_oom(self):
+        from vserve.cli import _diagnose_engine_failure
+        log = "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 12.34 GiB"
+        findings = _diagnose_engine_failure(log, "vllm")
+        assert len(findings) == 1
+        cause, suggestion = findings[0]
+        assert "GPU memory" in cause or "memory" in cause.lower()
+        assert "--slots" in suggestion or "--context" in suggestion or "fp8" in suggestion
+
+    def test_llamacpp_cuda_oom_kv_cache(self):
+        from vserve.cli import _diagnose_engine_failure
+        log = """
+        ggml_backend_cuda_buffer_type_alloc_buffer: allocating 107520.00 MiB on device 0: cudaMalloc failed: out of memory
+        alloc_tensor_range: failed to allocate CUDA0 buffer of size 112742891520
+        failed to allocate buffer for kv cache
+        """
+        findings = _diagnose_engine_failure(log, "llamacpp")
+        assert len(findings) == 1
+        cause, suggestion = findings[0]
+        assert "GPU memory" in cause or "KV cache" in cause
+        assert "--slots" in suggestion or "--context" in suggestion
+
+    def test_llamacpp_common_fit_params_explicit_ngl(self):
+        from vserve.cli import _diagnose_engine_failure
+        log = "common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 30, abort"
+        findings = _diagnose_engine_failure(log, "llamacpp")
+        assert len(findings) == 1
+        cause, suggestion = findings[0]
+        assert "n-gpu-layers" in cause.lower() or "auto-fitter" in cause
+        assert "--override-tensor" in suggestion or "override-tensor" in suggestion or "n-gpu-layers" in suggestion
+
+    def test_llamacpp_segv_surfaced(self):
+        from vserve.cli import _diagnose_engine_failure
+        log = "llama-cpp.service: Main process exited, code=dumped, status=11/SEGV"
+        findings = _diagnose_engine_failure(log, "llamacpp")
+        assert len(findings) == 1
+        cause, _suggestion = findings[0]
+        assert "segfault" in cause.lower() or "SIGSEGV" in cause or "core-dump" in cause.lower()
+
+    def test_no_match_returns_empty(self):
+        from vserve.cli import _diagnose_engine_failure
+        log = "INFO: Application startup complete.\nINFO: Listening on http://0.0.0.0:8888"
+        assert _diagnose_engine_failure(log, "vllm") == []
+        assert _diagnose_engine_failure(log, "llamacpp") == []
+
+    def test_backend_dispatch_isolated(self):
+        """vLLM patterns must not fire on llamacpp logs and vice versa."""
+        from vserve.cli import _diagnose_engine_failure
+        vllm_log = "AssertionError: Workspace is locked ... turboquant_attn ..."
+        assert len(_diagnose_engine_failure(vllm_log, "llamacpp")) == 0
+        llama_log = "cudaMalloc failed: out of memory"
+        # vLLM uses different OOM error class — llama.cpp's message shouldn't trigger vLLM diagnosis.
+        # (It would only match the vLLM CUDA OOM line if it included `CUDA out of memory`.)
+        assert len(_diagnose_engine_failure(llama_log, "vllm")) == 0
+
+    def test_empty_log_returns_empty(self):
+        from vserve.cli import _diagnose_engine_failure
+        assert _diagnose_engine_failure("", "vllm") == []
+        assert _diagnose_engine_failure("", "llamacpp") == []
+
+    def test_multiple_patterns_dedupe(self):
+        """A log can contain a cascade (TurboQuant assertion then Shutdown).
+        Each distinct cause is emitted once, not repeated per match line."""
+        from vserve.cli import _diagnose_engine_failure
+        log = """
+        AssertionError: Workspace is locked but allocation from 'turboquant_attn.py:879:_decode_attention' requires 5.61 MB
+        AssertionError: Workspace is locked but allocation from 'turboquant_attn.py:879:_decode_attention' requires 5.61 MB
+        AssertionError: Workspace is locked but allocation from 'turboquant_attn.py:879:_decode_attention' requires 5.61 MB
+        """
+        findings = _diagnose_engine_failure(log, "vllm")
+        assert len(findings) == 1  # not 3
