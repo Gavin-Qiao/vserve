@@ -1,14 +1,77 @@
-# vserve 0.6.3b2 Release Notes (beta)
+# vserve 0.6.3b3 Release Notes (beta)
 
-> **Beta gate.** `0.6.3b2` ships as a **pre-release** because the original
-> failing config — Qwen3.5-4B at 128k × 11 with `turboquant_3bit_nc`, the
-> crash that motivated the AA fix in 0.6.1 — has **not yet been re-run
-> against an idle GPU**. Static, lint, type, and unit-test gates are all
-> green, but live end-to-end verification of TurboQuant workspace-lock
-> pre-emption is deferred until the workstation GPU is free. Treat tok/s
-> figures, NVFP4 routing, and TRITON_ATTN selection as **best-effort
-> until a `0.6.3` final** confirms them on hardware. Production deploys
-> should pin `0.6.0` and migrate after `0.6.3` final ships.
+> **Beta gate updated.** `0.6.3b3` is the **on-GPU-verified beta**. The
+> original failing config — Qwen3.5-4B at 128k × 11 with
+> `turboquant_3bit_nc`, the crash that motivated the AA fix in 0.6.1 —
+> was re-run on idle RTX PRO 5000 (sm120) and loads cleanly. The
+> `cudagraph_mode=NONE` AA fix works as designed (`Maximum concurrency
+> for 131,072 tokens per request: 39.44x`). Inference round-trips
+> correctly on all four exercised models (Qwen3.5-0.8B, Qwen3.5-4B,
+> Gemma-4-31B-IT-NVFP4, gpt-oss-20b). Streaming bench confirmed
+> end-to-end (763.6 tok/s on Qwen3.5-0.8B; TPOT 11.8ms on Qwen3.5-4B
+> at 128k × 11 turboquant_3bit_nc). The "beta" label remains only
+> until one more soak / production-traffic cycle.
+
+## 0.6.3b3 — on-GPU sweep findings (since b2)
+
+The comprehensive GPU sweep surfaced two real bugs and prompted two
+new test classes. **Both bugs are fixed in this release.**
+
+### Bug 1 (CRITICAL): `vserve bench` failed on live YAML configs
+
+`_find_running_backend_and_cfg` read the running backend's config with
+`json.loads`. vserve writes vLLM configs as **YAML**. The bench command
+silently swallowed the parse error and returned "Could not resolve
+served-model name". The old test mocked `Path.read_text` to return
+JSON, masking the bug.
+
+- `cli.py:_find_running_backend_and_cfg` now dispatches on suffix
+  (`.json` → `json.loads`, otherwise `try_read_profile_yaml`).
+- `tests/test_bench_command.py::TestFindRunningBackendAndCfgYamlLoader`
+  adds two regression tests using real YAML and JSON temp files (no
+  `read_text` mock).
+
+### Bug 2 (LATENT): arch_registry references arch names that don't exist in vLLM
+
+Cross-checking every registry key against
+`vllm.model_executor.models.ModelRegistry.get_supported_archs()`
+revealed **16 of 38 keys reference vLLM arch names that don't exist**.
+The user's Qwen 3.5 / 3.6 family models (4 of 9 installed) currently
+route correctly only because the limits cache stores
+`reasoning_parser: qwen3` from prior tunes — new tunes or
+cache-clear flows would route those models to `None`.
+
+- The 0.6.3b1 "Bug fix #1" (adding `Qwen36MoeForCausalLM` to the
+  reasoning-parser table) is structurally invalid — that arch name
+  doesn't exist in vLLM. The real canonical name is
+  `Qwen3_5MoeForConditionalGeneration`.
+- 0.6.3b3 adds the real canonical names alongside the legacy ones in
+  every arch table and in `_THINKING_DEFAULT_ARCHS`. Existing tunes
+  keep working; fresh tunes now route correctly via the new entries.
+- New test `tests/test_arch_registry_vllm_canonical.py` cross-checks
+  every registry key against the captured vLLM 0.21.0 fixture
+  (`tests/fixtures/vllm_archs.json`, 361 supported archs) with an
+  explicit allowlist for the 14 remaining forward-compat entries.
+  `test_suggested_parsers_fire_for_qwen3_5_canonical` proves the new
+  entries actually fire end-to-end through `_suggested_*_parser`.
+
+### On-GPU verifications (5 models, sm120)
+
+| What | Evidence |
+| --- | --- |
+| Original crash repro: Qwen3.5-4B @ 128k × 11 + turboquant_3bit_nc | Loads cleanly; AA fix applies (`cudagraph_mode=NONE`) |
+| Streaming bench end-to-end | 763.6 tok/s on Qwen3.5-0.8B, 11.8ms TPOT on Qwen3.5-4B |
+| family_of vs arch[:5] (Gemma3/Gemma4 collision) | Gemma-4-NVFP4 routes to gemma4 family, not Gemma3 prefix |
+| FP4 env gating on sm120 | NVFP4 path active (`FlashInferCutlassNvFp4LinearKernel`) |
+| Forced TRITON_ATTN backends | Both Gemma-4 and gpt-oss-20b force TRITON_ATTN |
+| GptOssForCausalLM SPEC_BLOCKLIST | `speculative_config=None` in engine config |
+
+### Deferred to 0.6.4
+
+- Retire 14 remaining fictional arch names (needs limits-cache schema bump
+  to avoid breaking existing tunes).
+- Cross-check llama.cpp GGUF arch names against installed builds.
+- Unit test for `_resolve_quant_envs` sm < 100 branch.
 
 ## 0.6.3b2 — CI fix + hook hardening (since b1)
 

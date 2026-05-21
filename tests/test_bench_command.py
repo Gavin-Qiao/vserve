@@ -77,6 +77,62 @@ def _patch_running_backend(mocker, *, port=8888, model_path="/models/test", serv
     return backend
 
 
+class TestFindRunningBackendAndCfgYamlLoader:
+    """Regression: 0.6.3b2 shipped with `_find_running_backend_and_cfg`
+    reading the active vLLM config with ``json.loads`` even though
+    vserve writes those configs as YAML. The other bench tests in this
+    file mock ``_resolve_probe_model_name`` and ``read_text``, so the
+    real loader never got exercised."""
+
+    def test_loads_yaml_config(self, mocker, tmp_path):
+        from vserve.cli import _find_running_backend_and_cfg
+        cfg_yaml = tmp_path / "active.custom.yaml"
+        cfg_yaml.write_text(
+            "model: /models/test\n"
+            "served-model-name:\n"
+            "- Qwen/Qwen3.5-0.8B\n"
+            "- qwen3.5-0.8b\n"
+            "port: 8888\n"
+        )
+        backend = MagicMock()
+        backend.name = "vllm"
+        backend.is_running.return_value = True
+        backend.active_manifest_path.return_value = str(tmp_path / "manifest.json")
+        mocker.patch("vserve.backends._BACKENDS", [backend])
+        mocker.patch(
+            "vserve.config.read_active_manifest",
+            return_value={"port": 8888, "config_path": str(cfg_yaml)},
+        )
+
+        _, cfg, cfg_path, port = _find_running_backend_and_cfg()
+        assert cfg is not None and "served-model-name" in cfg, (
+            f"YAML config did not load — cfg keys: {list(cfg) if cfg else cfg}"
+        )
+        assert cfg["served-model-name"] == ["Qwen/Qwen3.5-0.8B", "qwen3.5-0.8b"]
+        assert port == 8888
+        assert cfg_path == cfg_yaml
+
+    def test_loads_json_config_still(self, mocker, tmp_path):
+        """llama.cpp writes JSON — verify we didn't break that path."""
+        import json as _json
+        from vserve.cli import _find_running_backend_and_cfg
+        cfg_json = tmp_path / "active.cfg.json"
+        cfg_json.write_text(_json.dumps({"model": "/m", "port": 9999}))
+        backend = MagicMock()
+        backend.name = "llamacpp"
+        backend.is_running.return_value = True
+        backend.active_manifest_path.return_value = str(tmp_path / "manifest.json")
+        mocker.patch("vserve.backends._BACKENDS", [backend])
+        mocker.patch(
+            "vserve.config.read_active_manifest",
+            return_value={"port": 9999, "config_path": str(cfg_json)},
+        )
+
+        _, cfg, _, port = _find_running_backend_and_cfg()
+        assert cfg == {"model": "/m", "port": 9999}
+        assert port == 9999
+
+
 class TestBenchCommandHelp:
     def test_bench_command_registered(self):
         result = runner.invoke(app, ["bench", "--help"])

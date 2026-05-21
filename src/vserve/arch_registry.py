@@ -39,6 +39,11 @@ _ARCH_TO_TOOL_PARSER: dict[str, str] = {
     "Qwen36MoeForCausalLM":           "hermes",
     "Qwen3CoderForCausalLM":          "qwen3_coder",
     "Qwen3XmlForCausalLM":            "qwen3_xml",
+    # vLLM 0.21 canonical names for Qwen 3.5 / 3.6 family (the *ForConditionalGeneration
+    # suffix with underscore-digit version is what HF and vLLM actually register).
+    # Verified against ModelRegistry.get_supported_archs() in 0.6.3b3.
+    "Qwen3_5ForConditionalGeneration":    "hermes",
+    "Qwen3_5MoeForConditionalGeneration": "hermes",
     # DeepSeek V-series — per-version parser
     "DeepseekV3ForCausalLM":          "deepseek_v3",
     "DeepseekV31ForCausalLM":         "deepseek_v31",
@@ -96,6 +101,8 @@ _ARCH_TO_REASONING_PARSER: dict[str, str] = {
     "Qwen3MoeForCausalLM":            "qwen3",
     "Qwen36MoeForCausalLM":           "qwen3",
     "Qwen3A3BForCausalLM":            "qwen3",
+    "Qwen3_5ForConditionalGeneration":    "qwen3",
+    "Qwen3_5MoeForConditionalGeneration": "qwen3",
     "KimiK2ThinkingForCausalLM":      "deepseek_r1",  # uses <think> markers
     "MistralForCausalLM":             "mistral",
     "MistralThinkingForCausalLM":     "mistral",
@@ -173,6 +180,8 @@ _ARCH_TO_FAMILY: dict[str, str] = {
     "Qwen3MoeForCausalLM":            "qwen3",
     "Qwen36MoeForCausalLM":           "qwen3",
     "Qwen3A3BForCausalLM":            "qwen3",
+    "Qwen3_5ForConditionalGeneration":    "qwen3",
+    "Qwen3_5MoeForConditionalGeneration": "qwen3",
     # Qwen Coder family is a separate tokenizer (extra code tokens).
     "Qwen3CoderForCausalLM":          "qwen3_coder",
     "Qwen3XmlForCausalLM":            "qwen3_xml",
@@ -232,6 +241,8 @@ _THINKING_DEFAULT_ARCHS: frozenset[str] = frozenset({
     "Qwen35ForCausalLM",
     "Qwen36ForCausalLM",
     "Qwen36MoeForCausalLM",  # 0.6.3: was missing from reasoning-parser table — bug fix 1
+    "Qwen3_5ForConditionalGeneration",    # 0.6.3b3: real canonical name
+    "Qwen3_5MoeForConditionalGeneration", # 0.6.3b3: real canonical name
     "DeepseekV3ForCausalLM",
     "DeepseekV31ForCausalLM",
     "DeepseekV32ForCausalLM",

@@ -4119,7 +4119,11 @@ def _find_running_backend_and_cfg():
             candidate = pathlib.Path(cfg_path_str)
             if candidate.exists():
                 try:
-                    data = _json.loads(candidate.read_text())
+                    if candidate.suffix.lower() == ".json":
+                        data = _json.loads(candidate.read_text())
+                    else:
+                        from vserve.config import try_read_profile_yaml
+                        data = try_read_profile_yaml(candidate)
                     if isinstance(data, dict):
                         cfg = data
                         cfg_path = candidate
