@@ -88,6 +88,10 @@ QUANT_FLAGS = {
 # systemd EnvironmentFile when the model uses one of these methods.
 # Sources: vLLM 0.21 release notes (FlashInfer MoE FP4 backend), R3 (Unsloth
 # Dynamic FP8 / NVFP4 artifacts).
+# vLLM >=0.22 deprecates these env vars (removal targeted 0.23) in favor of
+# the hardware-aware --moe-backend flag; serve.py suppresses them on a known
+# >=0.22 runtime (see _resolve_quant_envs) and `vserve run --moe-backend`
+# is the explicit replacement knob.
 QUANT_ENV_VARS: dict[str, dict[str, str]] = {
     "nvfp4": {
         "VLLM_USE_FLASHINFER_MOE_FP4": "1",
@@ -97,7 +101,8 @@ QUANT_ENV_VARS: dict[str, dict[str, str]] = {
         "VLLM_USE_FLASHINFER_MOE_FP4": "1",
         "VLLM_FLASHINFER_MOE_BACKEND": "throughput",
     },
-    # MXFP4 uses the Humming backend by default in vLLM 0.21 — no env vars
+    # MXFP4 uses the Humming backend by default (vLLM 0.21/0.22; the 0.22
+    # flag-world equivalent is --moe-backend humming) — no env vars
     # required, but reserve the entry for future per-backend tuning.
     "mxfp4": {},
     "mxfp4_moe": {},
