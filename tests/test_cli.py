@@ -947,7 +947,10 @@ def test_status_handles_unreadable_active_config(mocker, tmp_path):
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 0
     assert "active config unreadable" in result.output
-    assert str(active) in result.output
+    # Rich wraps long paths at COLUMNS=80 (deep tmp dirs split mid-path);
+    # collapse newlines before the substring check — same class of fix as
+    # the 0.6.3b2 strip_ansi hardening.
+    assert str(active) in result.output.replace("\n", "")
 
 
 def test_status_handles_non_mapping_active_config(mocker, tmp_path):
