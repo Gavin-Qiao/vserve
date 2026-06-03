@@ -1589,3 +1589,62 @@ class TestChatTemplateKwargsKeyByRuntime:
         cfg = self._cfg(tmp_path, mocker, "0.22.0")
         assert cfg["default-chat-template-kwargs"] == {"enable_thinking": False}
         assert "chat-template-kwargs" not in cfg
+
+
+class TestSpecFp8CudagraphRelaxation:
+    """vLLM 0.22.0 ships the DFlash fp8-KV fix (vllm#42692): on a KNOWN
+    >=0.22 runtime, spec-decode + fp8-family KV keeps CUDA graphs.
+    Everything else (turboquant, unknown version, other quantized
+    dtypes) still forces cudagraph_mode NONE per vllm#41559."""
+
+    def _make_model(self, tmp_path, arch="Qwen3ForCausalLM"):
+        import json
+        from vserve.models import ModelInfo
+
+        model_dir = tmp_path / "models" / "p" / "M"
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text(json.dumps({"architectures": [arch]}))
+        (model_dir / "model.safetensors").write_bytes(b"\0" * 16)
+        return ModelInfo(
+            path=model_dir, provider="p", model_name="M",
+            architecture=arch, model_type="m", quant_method=None,
+            max_position_embeddings=131072, is_moe=False, model_size_gb=1.0,
+        )
+
+    def _cfg(self, tmp_path, mocker, version, kv_dtype):
+        from vserve.backends.vllm import VllmBackend
+
+        _pin_vllm_runtime(mocker, version)
+        choices = {
+            "context": 8192, "kv_dtype": kv_dtype, "slots": 4,
+            "batched_tokens": 4096, "gpu_mem_util": 0.9, "port": 8888,
+            "tools": False, "tool_parser": None, "reasoning_parser": None,
+            "spec": {"method": "ngram", "num_speculative_tokens": 5},
+        }
+        return VllmBackend().build_config(self._make_model(tmp_path), choices)
+
+    def test_022_fp8_spec_keeps_cudagraphs(self, tmp_path, mocker):
+        cfg = self._cfg(tmp_path, mocker, "0.22.0", "fp8")
+        assert cfg.get("compilation-config", {}).get("cudagraph_mode") != "NONE"
+
+    def test_022_fp8_e4m3_spec_keeps_cudagraphs(self, tmp_path, mocker):
+        cfg = self._cfg(tmp_path, mocker, "0.22.0", "fp8_e4m3")
+        assert cfg.get("compilation-config", {}).get("cudagraph_mode") != "NONE"
+
+    def test_021_fp8_spec_still_forces_none(self, tmp_path, mocker):
+        cfg = self._cfg(tmp_path, mocker, "0.21.0", "fp8")
+        assert cfg["compilation-config"]["cudagraph_mode"] == "NONE"
+
+    def test_unknown_version_fp8_spec_still_forces_none(self, tmp_path, mocker):
+        cfg = self._cfg(tmp_path, mocker, None, "fp8")
+        assert cfg["compilation-config"]["cudagraph_mode"] == "NONE"
+
+    def test_022_turboquant_spec_still_forces_none(self, tmp_path, mocker):
+        cfg = self._cfg(tmp_path, mocker, "0.22.0", "turboquant_3bit_nc")
+        assert cfg["compilation-config"]["cudagraph_mode"] == "NONE"
+
+    def test_022_int8_kv_spec_still_forces_none(self, tmp_path, mocker):
+        # Only the fp8 family was fixed upstream; other quantized dtypes
+        # keep the conservative path even on 0.22.
+        cfg = self._cfg(tmp_path, mocker, "0.22.0", "int8_per_token_head")
+        assert cfg["compilation-config"]["cudagraph_mode"] == "NONE"

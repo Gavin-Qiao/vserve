@@ -78,6 +78,10 @@ def _architecture_forces_triton_attn(model_path: Path) -> bool:
 # TOKENSPEED_MLA on sm≥100, GptOss + sm120 → TRITON_ATTN per vllm#40153 —
 # lives in `_forced_attention_backend` below.
 
+# KV dtypes whose DFlash spec-decode incompatibility was fixed in vLLM
+# 0.22.0 (vllm#42692 — the fp8 slice of vllm#41559).
+_SPEC_FP8_KV_FIXED: frozenset[str] = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2"})
+
 # Per-backend KV dtypes that aren't supported on that backend.
 BACKEND_INCOMPATIBLE_KV_DTYPES: dict[str, frozenset[str]] = {
     "TRITON_ATTN": _TRITON_ATTN_INCOMPATIBLE_KV_DTYPES,
@@ -686,11 +690,22 @@ print(json.dumps({
             if isinstance(cc, dict):
                 cc.setdefault("cudagraph_mode", "NONE")
         # Same workaround for spec-decode + quantized KV (vllm#41559 — DFlash
-        # spec-decode breaks with any KV quantization).
+        # spec-decode breaks with KV quantization). vLLM 0.22.0 fixed the fp8
+        # slice (vllm#42692), so a KNOWN >=0.22 runtime keeps CUDA graphs for
+        # fp8-family KV; turboquant and unknown versions stay conservative.
         if choices.get("spec") and isinstance(kv_dtype, str) and kv_dtype not in {"auto", ""}:
-            cc = cfg.setdefault("compilation-config", {})
-            if isinstance(cc, dict):
-                cc.setdefault("cudagraph_mode", "NONE")
+            from vserve.runtime import VLLM_FLAG_MIGRATION_VERSION
+
+            ver = _runtime_vllm_version()
+            fp8_fixed = (
+                ver is not None
+                and ver >= VLLM_FLAG_MIGRATION_VERSION
+                and kv_dtype in _SPEC_FP8_KV_FIXED
+            )
+            if not fp8_fixed:
+                cc = cfg.setdefault("compilation-config", {})
+                if isinstance(cc, dict):
+                    cc.setdefault("cudagraph_mode", "NONE")
 
         # M: speculative-config block. Accept either a SpecConfig instance
         # (auto-picked recipe) or a pre-built dict (caller knows what they
