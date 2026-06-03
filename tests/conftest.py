@@ -110,6 +110,24 @@ def models_root(tmp_path: Path, fake_model_dir: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_lock_dir(tmp_path, monkeypatch):
+    """Point vserve.lock at a per-test directory.
+
+    The suite previously exercised the REAL /run/lock/vserve — a pytest
+    run on a workstation with a live backend could delete the operator's
+    session marker (found in the 0.6.3 on-GPU sweep: the pre-commit hook's
+    test run cleared the session and the next `run --replace` refused with
+    "session owner unknown"). Tests that need specific paths re-patch on
+    top of this.
+    """
+    lock_dir = tmp_path / "lock" / "vserve"
+    # _ensure_lock_dir() mkdirs LOCK_DIR itself but not its parents.
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("vserve.lock.LOCK_DIR", lock_dir)
+    monkeypatch.setattr("vserve.lock.SESSION_PATH", lock_dir / "vserve-session.json")
+
+
+@pytest.fixture(autouse=True)
 def _pin_unknown_vllm_runtime_version(monkeypatch):
     """Pin the vLLM runtime-version probe seams to None for every test.
 

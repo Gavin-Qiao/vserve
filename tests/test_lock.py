@@ -20,8 +20,14 @@ from vserve.lock import (
 
 @pytest.fixture(autouse=True)
 def _use_tmp_lock_dir(tmp_path, monkeypatch):
-    """Redirect LOCK_DIR to a temp dir for all tests."""
+    """Redirect LOCK_DIR *and* SESSION_PATH to a temp dir for all tests.
+
+    0.6.3 sweep finding: this fixture used to patch only LOCK_DIR, so the
+    session helpers kept building paths from the REAL SESSION_PATH —
+    every pytest run wrote and deleted /run/lock/vserve/vserve-session-*
+    on the workstation, clobbering a live operator's session marker."""
     monkeypatch.setattr("vserve.lock.LOCK_DIR", tmp_path)
+    monkeypatch.setattr("vserve.lock.SESSION_PATH", tmp_path / "vserve-session.json")
 
 
 # ── Basic acquire / release ──────────────────────────
@@ -445,3 +451,24 @@ def test_read_session_prefers_newest_marker(tmp_path, monkeypatch):
     assert info is not None
     assert info.user == "bob"
     assert info.model == "newer-model"
+
+
+# --- 0.6.3: suite must never touch the real /run/lock/vserve ---
+
+
+def test_session_writes_land_in_isolated_dir(tmp_path):
+    """Regression for the 0.6.3 sweep finding: the conftest autouse
+    fixture redirects vserve.lock at a per-test directory, so session
+    writes/clears during a pytest run can no longer delete a live
+    operator's session marker."""
+    import vserve.lock as lock
+
+    assert str(lock.LOCK_DIR).startswith(str(tmp_path)), (
+        f"LOCK_DIR not isolated: {lock.LOCK_DIR}"
+    )
+    lock.write_session("isolation-proof")
+    info = lock.read_session()
+    assert info is not None and info.model == "isolation-proof"
+    written = list(lock.LOCK_DIR.glob("vserve-session-*.json"))
+    assert written, "session marker missing from isolated lock dir"
+    lock.clear_session()
