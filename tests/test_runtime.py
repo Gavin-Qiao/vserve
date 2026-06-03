@@ -63,7 +63,7 @@ def test_check_vllm_compatibility_rejects_beta_and_wrong_minor():
     assert check_vllm_compatibility(beta).supported is False
     assert "pre-release" in " ".join(check_vllm_compatibility(beta).errors)
     assert check_vllm_compatibility(older).supported is False
-    assert ">=0.20,<0.22" in " ".join(check_vllm_compatibility(older).errors)
+    assert ">=0.20,<0.23" in " ".join(check_vllm_compatibility(older).errors)
 
 
 def test_check_vllm_compatibility_accepts_stable_021():
@@ -88,12 +88,12 @@ def test_check_vllm_compatibility_accepts_stable_021():
     assert any("0.21.0" in message for message in result.messages)
 
 
-def test_check_vllm_compatibility_rejects_022():
+def test_check_vllm_compatibility_rejects_023():
     too_new = RuntimeInfo(
         backend="vllm",
         executable=Path("/opt/vllm/venv/bin/vllm"),
         python=Path("/opt/vllm/venv/bin/python"),
-        vllm_version="0.22.0",
+        vllm_version="0.23.0",
         torch_version="2.12.0",
         torch_cuda="13.1",
         transformers_version="5.7.0",
@@ -105,7 +105,7 @@ def test_check_vllm_compatibility_rejects_022():
     result = check_vllm_compatibility(too_new)
 
     assert result.supported is False
-    assert ">=0.20,<0.22" in " ".join(result.errors)
+    assert ">=0.20,<0.23" in " ".join(result.errors)
 
 
 def test_collect_vllm_runtime_info_uses_vllm_python(mocker, tmp_path):
@@ -156,7 +156,7 @@ def test_upgrade_vllm_stable_force_reinstalls_pinned_stable(mocker, tmp_path):
     cmd = run.call_args.args[0]
     assert cmd[:4] == [str(vllm_python), "-m", "pip", "install"]
     assert "--force-reinstall" in cmd
-    assert "vllm==0.21.0" in cmd
+    assert "vllm==0.22.0" in cmd
     invalidate.assert_called_once()
 
 
@@ -502,3 +502,73 @@ def test_build_tuning_fingerprint_includes_llamacpp_runtime_identity(tmp_path):
 
     assert fp["llama_server_version"] == "llama-server 2026"
     assert fp["runtime_executable"] == "/opt/llama-cpp/bin/llama-server"
+
+
+# --- 0.6.3: vLLM 0.22 support ---
+
+
+def test_check_vllm_compatibility_accepts_022():
+    info = RuntimeInfo(
+        backend="vllm",
+        executable=Path("/opt/vllm/venv/bin/vllm"),
+        python=Path("/opt/vllm/venv/bin/python"),
+        vllm_version="0.22.0",
+        torch_version="2.11.0+cu130",
+        torch_cuda="13.0",
+        transformers_version="5.6.2",
+        huggingface_hub_version="1.12.0",
+        pip_check_ok=True,
+        pip_check_output="No broken requirements found",
+    )
+
+    result = check_vllm_compatibility(info)
+
+    assert result.supported is True, result.errors
+    assert any("0.22.0" in message for message in result.messages)
+
+
+class TestInstalledVllmVersion:
+    """installed_vllm_version is the single probe behind every 0.22
+    emission gate — None must mean "behave pre-0.22"."""
+
+    def _info(self, version):
+        return RuntimeInfo(
+            backend="vllm", executable=None, python=None, vllm_version=version
+        )
+
+    def test_parses_version(self, mocker):
+        import vserve.runtime as rt
+
+        mocker.patch.object(
+            rt, "collect_vllm_runtime_info", return_value=self._info("0.22.0")
+        )
+        from packaging.version import Version
+
+        assert rt.installed_vllm_version() == Version("0.22.0")
+
+    def test_none_when_unknown(self, mocker):
+        import vserve.runtime as rt
+
+        mocker.patch.object(
+            rt, "collect_vllm_runtime_info", return_value=self._info(None)
+        )
+        assert rt.installed_vllm_version() is None
+
+    def test_none_when_unparseable(self, mocker):
+        import vserve.runtime as rt
+
+        mocker.patch.object(
+            rt, "collect_vllm_runtime_info", return_value=self._info("not-a-version")
+        )
+        assert rt.installed_vllm_version() is None
+
+    def test_uses_fast_cache_path(self, mocker):
+        import vserve.runtime as rt
+
+        spy = mocker.patch.object(
+            rt, "collect_vllm_runtime_info", return_value=self._info("0.22.0")
+        )
+        rt.installed_vllm_version()
+        kwargs = spy.call_args.kwargs
+        assert kwargs.get("prefer_cache") is True
+        assert kwargs.get("with_pip_check") is False

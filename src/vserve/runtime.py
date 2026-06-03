@@ -15,11 +15,16 @@ from packaging.version import InvalidVersion, Version
 
 from vserve.model_files import is_weight_file_name, iter_recursive_files_with_suffix
 
-SUPPORTED_VLLM_RANGE = ">=0.20,<0.22"
-PINNED_STABLE_VLLM = "0.21.0"
+SUPPORTED_VLLM_RANGE = ">=0.20,<0.23"
+PINNED_STABLE_VLLM = "0.22.0"
 DETECTOR_SCHEMA_VERSION = 2
 _VLLM_MIN = Version("0.20")
-_VLLM_MAX = Version("0.22")
+_VLLM_MAX = Version("0.23")
+
+# vLLM 0.22 renamed --chat-template-kwargs to --default-chat-template-kwargs
+# and deprecated the FlashInfer MoE env vars (removal targeted 0.23). Every
+# version gate in vserve compares against this single boundary.
+VLLM_FLAG_MIGRATION_VERSION = Version("0.22")
 
 RUNTIME_CACHE_DIR = Path.home() / ".cache" / "vserve" / "runtime"
 VLLM_RUNTIME_CACHE_FILE = RUNTIME_CACHE_DIR / "vllm.json"
@@ -195,6 +200,23 @@ def invalidate_vllm_runtime_cache(cache_path: Path | None = None) -> None:
         pass
     except OSError:
         pass
+
+
+def installed_vllm_version(config: Any | None = None) -> Version | None:
+    """Best-effort parsed version of the installed vLLM runtime.
+
+    Fast path only (cached probe, no pip check). Returns None when the
+    runtime is missing or the version doesn't parse — callers MUST treat
+    None as "behave like pre-0.22" so a broken probe can only ever cause
+    deprecation warnings, never a launch failure.
+    """
+    info = collect_vllm_runtime_info(config, prefer_cache=True, with_pip_check=False)
+    if not info.vllm_version:
+        return None
+    try:
+        return Version(info.vllm_version)
+    except InvalidVersion:
+        return None
 
 
 def collect_vllm_runtime_info(
