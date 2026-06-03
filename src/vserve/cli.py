@@ -2748,6 +2748,7 @@ def _scripted_config(
     llamacpp_n_cpu_moe: int | None = None,
     llamacpp_reasoning_budget: int | None = None,
     thinking: bool | None = None,
+    moe_backend: str | None = None,
 ) -> "pathlib.Path":
     """Build a launch config from CLI flags without prompting."""
     from vserve import config as config_module
@@ -2926,6 +2927,7 @@ def _scripted_config(
         "block_size": recommended_scheduler.get("block_size"),
         "enable_prefix_caching": True,
         "thinking": thinking,
+        "moe_backend": moe_backend,
     }
     cfg = backend.build_config(m, vllm_choices)
     profile_name = save_profile or "custom"
@@ -3519,6 +3521,7 @@ def run(
     override_tensor: list[str] = typer.Option([], "--override-tensor", "-ot", help="llama.cpp --override-tensor pattern (repeatable, e.g. '.ffn_.*_exps.=CPU')"),
     no_moe_offload: bool = typer.Option(False, "--no-moe-offload", help="Disable the auto-applied MoE expert-CPU offload (-ot)"),
     thinking: bool | None = typer.Option(None, "--thinking/--no-thinking", help="Enable/disable model thinking-mode (chat-template-kwargs: enable_thinking or thinking, depending on family)"),
+    moe_backend: str | None = typer.Option(None, "--moe-backend", help="vLLM 0.22+: pin the MoE kernel backend (e.g. flashinfer_trtllm, flashinfer_cutlass, humming); default lets vLLM auto-select. Scripted (--yes) runs only."),
     cache_reuse: int | None = typer.Option(None, "--cache-reuse", help="llama.cpp --cache-reuse N: enable prefix cache reuse with N-token min run"),
     cram_mb: int | None = typer.Option(None, "--cram-mb", help="llama.cpp --cram MB: swap-to-host limit for inactive slots (MB)"),
     slot_save_path: str | None = typer.Option(None, "--slot-save-path", help="llama.cpp --slot-save-path: persist slot KV-cache to this directory"),
@@ -3684,6 +3687,7 @@ def run(
             llamacpp_n_cpu_moe=n_cpu_moe,
             llamacpp_reasoning_budget=reasoning_budget,
             thinking=thinking,
+            moe_backend=moe_backend,
         )
     else:
         if m is None:

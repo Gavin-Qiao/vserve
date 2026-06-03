@@ -563,6 +563,11 @@ print(json.dumps({
             cfg["block-size"] = choices["block_size"]
         if choices.get("kv_cache_memory_bytes") is not None:
             cfg["kv-cache-memory-bytes"] = choices["kv_cache_memory_bytes"]
+        if choices.get("moe_backend"):
+            # Expert knob (vLLM 0.22+): pin the MoE kernel backend instead
+            # of trusting --moe-backend=auto. Passed through verbatim —
+            # vLLM validates the value at launch.
+            cfg["moe-backend"] = choices["moe_backend"]
         if choices.get("enable_prefix_caching") is not None:
             cfg["enable-prefix-caching"] = bool(choices["enable_prefix_caching"])
 

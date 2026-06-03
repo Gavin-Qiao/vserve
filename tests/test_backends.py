@@ -1648,3 +1648,43 @@ class TestSpecFp8CudagraphRelaxation:
         # keep the conservative path even on 0.22.
         cfg = self._cfg(tmp_path, mocker, "0.22.0", "int8_per_token_head")
         assert cfg["compilation-config"]["cudagraph_mode"] == "NONE"
+
+
+class TestMoeBackendKnob:
+    """vLLM 0.22+ expert knob: pin the MoE kernel backend instead of
+    trusting --moe-backend=auto. Emitted only when explicitly chosen."""
+
+    def _make_model(self, tmp_path, arch="Qwen3ForCausalLM"):
+        import json
+        from vserve.models import ModelInfo
+
+        model_dir = tmp_path / "models" / "p" / "M"
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text(json.dumps({"architectures": [arch]}))
+        (model_dir / "model.safetensors").write_bytes(b"\0" * 16)
+        return ModelInfo(
+            path=model_dir, provider="p", model_name="M",
+            architecture=arch, model_type="m", quant_method=None,
+            max_position_embeddings=131072, is_moe=True, model_size_gb=1.0,
+        )
+
+    def _base_choices(self):
+        return {
+            "context": 8192, "kv_dtype": "auto", "slots": 4,
+            "batched_tokens": 4096, "gpu_mem_util": 0.9, "port": 8888,
+            "tools": False, "tool_parser": None, "reasoning_parser": None,
+        }
+
+    def test_emitted_when_set(self, tmp_path):
+        from vserve.backends.vllm import VllmBackend
+
+        choices = self._base_choices()
+        choices["moe_backend"] = "flashinfer_trtllm"
+        cfg = VllmBackend().build_config(self._make_model(tmp_path), choices)
+        assert cfg["moe-backend"] == "flashinfer_trtllm"
+
+    def test_absent_by_default(self, tmp_path):
+        from vserve.backends.vllm import VllmBackend
+
+        cfg = VllmBackend().build_config(self._make_model(tmp_path), self._base_choices())
+        assert "moe-backend" not in cfg
