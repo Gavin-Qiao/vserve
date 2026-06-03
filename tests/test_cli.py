@@ -2817,10 +2817,12 @@ class TestDiagnoseEngineFailure:
         assert len(findings) == 1
         cause, suggestion = findings[0]
         assert "turboquant" in cause.lower() or "workspace" in cause.lower()
-        # Maintainer-canonical fix per vllm#40807/41403 is cudagraph_mode: NONE
+        # Community-verified fix per vllm#42808/43357 is cudagraph_mode: NONE
         # (preserves torch.compile fusions). fp8 fallback is also acceptable.
+        # (0.6.3: the previously cited #40807/#41403 are different TurboQuant
+        # issues — a .tolist() capture crash and the Gemma-4 tracking issue.)
         assert "cudagraph_mode" in suggestion
-        assert "vllm#40807" in suggestion or "40807" in suggestion
+        assert "vllm#42808" in suggestion or "42808" in suggestion
         assert "fp8" in suggestion
 
     def test_vllm_chunked_mm_input_disabled(self):

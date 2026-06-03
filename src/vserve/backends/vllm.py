@@ -594,7 +594,9 @@ print(json.dumps({
             if isinstance(ac, dict):
                 ac["backend"] = forced_backend
         # Q: NVFP4 + auto KV is broken (treats fp8-KV as fp8-checkpoint per
-        # vllm#39133). Force fp8 KV when the model is NVFP4/ModelOpt and the
+        # vllm#39137 — the kv-cache gate fires on any quantized checkpoint;
+        # 0.6.3: was mis-cited as #39133). Force fp8 KV when the model is
+        # NVFP4/ModelOpt and the
         # caller hasn't pinned a KV dtype. The user can still override
         # explicitly by passing kv_dtype="auto" with their own override.
         if (

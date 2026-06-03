@@ -49,7 +49,7 @@ def diagnose_engine_failure(log_text: str, backend_name: str) -> list[tuple[str,
                 "TurboQuant decode kernel needed more workspace than CUDA-graph capture sized.",
                 "Add `compilation-config: {cudagraph_mode: NONE}` to the YAML "
                 "(keeps torch.compile fusions, only skips graph capture — the "
-                "maintainer-canonical fix per vllm#40807/41403). Alternative: drop "
+                "community-verified fix per vllm#42808/43357). Alternative: drop "
                 "--kv-cache-dtype to fp8. --enforce-eager also works but unnecessarily "
                 "disables torch.compile (vserve auto-emits cudagraph_mode: NONE for "
                 "turboquant_* dtypes starting in 0.6.1).",
