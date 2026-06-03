@@ -1,4 +1,4 @@
-"""Cross-check arch_registry keys against the vLLM 0.21 ModelRegistry.
+"""Cross-check arch_registry keys against the vLLM 0.22 ModelRegistry.
 
 This is the test that would have caught the 0.6.3 defect: tests passed
 because both code-under-test and tests used the same fictional arch
@@ -26,9 +26,10 @@ import pytest
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vllm_archs.json"
 
-# Archs that are intentionally in arch_registry but NOT in the vLLM 0.21
+# Archs that are intentionally in arch_registry but NOT in the vLLM 0.22
 # ModelRegistry. These are either forward-compat (upstream support
-# pending) or aspirational. Audit any addition here.
+# pending) or aspirational. Audit any addition here. (Re-verified at the
+# 0.22.0 fixture refresh: all 16 entries are still absent upstream.)
 _ALLOWLIST_NOT_IN_VLLM: frozenset[str] = frozenset({
     # Forward-compat — vLLM doesn't ship support for these yet
     "DeepseekV31ForCausalLM",
@@ -89,7 +90,7 @@ class TestRegistryKeysAgainstVllm:
         registry_keys = _all_registry_keys()
         missing = registry_keys - vllm_archs - _ALLOWLIST_NOT_IN_VLLM
         assert not missing, (
-            f"Registry keys not in vLLM 0.21 and not on the allowlist: {sorted(missing)}. "
+            f"Registry keys not in vLLM 0.22 and not on the allowlist: {sorted(missing)}. "
             "Either fix the key to match vLLM's canonical arch name, or add it to "
             "_ALLOWLIST_NOT_IN_VLLM with a justification."
         )

@@ -17,8 +17,10 @@ from __future__ import annotations
 
 
 # ── tool-call parser table ────────────────────────────────────────────────
-# Source: vLLM 0.21 `tool_parsers/__init__.py`. Names must match the keys
-# registered by `ToolParserManager`.
+# Source: vLLM 0.22 `tool_parsers/__init__.py` (42 parsers registered;
+# verified live against the workstation install 2026-06-03). Names must
+# match the keys registered by `ToolParserManager`. Runtime registry
+# filtering hides any name the installed (older) vLLM lacks.
 
 _ARCH_TO_TOOL_PARSER: dict[str, str] = {
     # Gemma 3 / 4 family
@@ -39,9 +41,10 @@ _ARCH_TO_TOOL_PARSER: dict[str, str] = {
     "Qwen36MoeForCausalLM":           "hermes",
     "Qwen3CoderForCausalLM":          "qwen3_coder",
     "Qwen3XmlForCausalLM":            "qwen3_xml",
-    # vLLM 0.21 canonical names for Qwen 3.5 / 3.6 family (the *ForConditionalGeneration
+    # vLLM 0.21+ canonical names for Qwen 3.5 / 3.6 family (the *ForConditionalGeneration
     # suffix with underscore-digit version is what HF and vLLM actually register).
-    # Verified against ModelRegistry.get_supported_archs() in 0.6.3b3.
+    # Verified against ModelRegistry.get_supported_archs() in 0.6.3b3 (0.21)
+    # and re-verified at the 0.22.0 fixture refresh.
     "Qwen3_5ForConditionalGeneration":    "hermes",
     "Qwen3_5MoeForConditionalGeneration": "hermes",
     # DeepSeek V-series — per-version parser
