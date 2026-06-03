@@ -135,6 +135,22 @@ def _upsert_env_file(extra: dict[str, str] | None = None) -> Path:
     return env_path
 
 
+def _runtime_vllm_version():
+    """Parsed version of the configured vLLM runtime, or None.
+
+    Single patch point for the 0.22 env-migration gate (the conftest
+    autouse fixture pins this to None suite-wide). None means "assume
+    pre-0.22" — a broken probe may cause deprecation warnings on 0.22,
+    never the 0.21 slow path.
+    """
+    try:
+        from vserve.runtime import installed_vllm_version
+
+        return installed_vllm_version()
+    except Exception:
+        return None
+
+
 def _resolve_quant_envs(config_path: Path) -> dict[str, str]:
     """Read the active YAML config; return any quant-method-specific env vars.
 
@@ -160,6 +176,19 @@ def _resolve_quant_envs(config_path: Path) -> dict[str, str]:
     if qkey not in QUANT_ENV_VARS:
         return {}
     envs = dict(QUANT_ENV_VARS[qkey])
+    # vLLM 0.22 wraps the FlashInfer MoE env vars in deprecated_env()
+    # (FutureWarning now, removal targeted 0.23) and replaces them with the
+    # hardware-aware --moe-backend flag whose default is "auto". On a KNOWN
+    # >=0.22 runtime emit nothing; unknown/older keeps the envs so a broken
+    # probe can only cause warnings, never the 0.21 slow path.
+    if "VLLM_USE_FLASHINFER_MOE_FP4" in envs:
+        ver = _runtime_vllm_version()
+        if ver is not None:
+            from vserve.runtime import VLLM_FLAG_MIGRATION_VERSION
+
+            if ver >= VLLM_FLAG_MIGRATION_VERSION:
+                envs.pop("VLLM_USE_FLASHINFER_MOE_FP4", None)
+                envs.pop("VLLM_FLASHINFER_MOE_BACKEND", None)
     # Hardware-gate the FlashInfer FP4 MoE backend on sm≥100.
     if "VLLM_USE_FLASHINFER_MOE_FP4" in envs:
         try:

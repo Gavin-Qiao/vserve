@@ -363,3 +363,44 @@ def test_quant_env_vars_includes_nvfp4_modelopt():
     from vserve.models import QUANT_ENV_VARS
     assert "VLLM_USE_FLASHINFER_MOE_FP4" in QUANT_ENV_VARS["nvfp4"]
     assert "VLLM_USE_FLASHINFER_MOE_FP4" in QUANT_ENV_VARS["modelopt"]
+
+
+# --- 0.6.3: vLLM 0.22 deprecates the FlashInfer MoE env vars ---
+
+
+def test_resolve_quant_envs_dropped_on_022(mocker, tmp_path):
+    """vLLM 0.22 wraps VLLM_USE_FLASHINFER_MOE_* in deprecated_env()
+    (removal targeted 0.23) and its moe-backend=auto default is
+    hardware-aware — on a known >=0.22 runtime, emit nothing."""
+    from packaging.version import Version
+    mocker.patch("vserve.serve._runtime_vllm_version", return_value=Version("0.22.0"))
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=Mock(compute_cap=120))
+    from vserve.serve import _resolve_quant_envs
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("quantization: nvfp4\nmodel: /tmp/x\n")
+    assert _resolve_quant_envs(cfg_path) == {}
+
+
+def test_resolve_quant_envs_kept_below_022(mocker, tmp_path):
+    """Pre-0.22 runtimes still need the env vars (no --moe-backend flag)."""
+    from packaging.version import Version
+    mocker.patch("vserve.serve._runtime_vllm_version", return_value=Version("0.21.0"))
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=Mock(compute_cap=120))
+    from vserve.serve import _resolve_quant_envs
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("quantization: nvfp4\nmodel: /tmp/x\n")
+    envs = _resolve_quant_envs(cfg_path)
+    assert envs.get("VLLM_USE_FLASHINFER_MOE_FP4") == "1"
+    assert envs.get("VLLM_FLASHINFER_MOE_BACKEND") == "throughput"
+
+
+def test_resolve_quant_envs_kept_on_unknown_version(mocker, tmp_path):
+    """Unknown runtime version must behave pre-0.22: a broken probe may
+    cause FutureWarnings on 0.22, never the 0.21 slow path."""
+    mocker.patch("vserve.serve._runtime_vllm_version", return_value=None)
+    mocker.patch("vserve.gpu.get_gpu_info", return_value=Mock(compute_cap=120))
+    from vserve.serve import _resolve_quant_envs
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("quantization: nvfp4\nmodel: /tmp/x\n")
+    envs = _resolve_quant_envs(cfg_path)
+    assert envs.get("VLLM_USE_FLASHINFER_MOE_FP4") == "1"
