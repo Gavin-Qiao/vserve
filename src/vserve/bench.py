@@ -263,8 +263,17 @@ def _stream_request(
                 delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
                 if not isinstance(delta, dict):
                     continue
-                content = delta.get("content")
-                if content is None or content == "":
+                # vLLM 0.22 streams thinking-channel tokens as `reasoning`
+                # (0.20/0.21 used `reasoning_content`, renamed in vllm#42664).
+                # Thinking-default models behind a reasoning parser emit most
+                # of their tokens there — count every channel, since decode
+                # cadence is what the bench measures.
+                token_text = (
+                    delta.get("content")
+                    or delta.get("reasoning")
+                    or delta.get("reasoning_content")
+                )
+                if not token_text:
                     continue
                 now_ms = monotonic() * 1000
                 if timeline.first_token_ms is None:

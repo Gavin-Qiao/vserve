@@ -271,3 +271,52 @@ class TestRunStreamingBenchmark:
         )
         # Just verify the dataclass accepts the empty case cleanly.
         assert r.throughput_tokens_per_sec == 0.0
+
+
+class TestReasoningDeltaCounting:
+    def test_counts_reasoning_deltas_from_022_parsers(self, mocker):
+        """vLLM 0.22 streams thinking-channel tokens as ``delta.reasoning``
+        (renamed from ``reasoning_content``, vllm#42664). Thinking-default
+        models behind a reasoning parser emit most — sometimes all — of
+        their tokens there; the bench must time those tokens or it reports
+        0/N completed against a perfectly healthy server (found live in
+        the 0.6.3 on-GPU sweep)."""
+        from vserve.bench import run_streaming_benchmark
+
+        sse_lines = [
+            b'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n',
+            b'data: {"choices":[{"delta":{"reasoning":"Thinking"}}]}\n\n',
+            b'data: {"choices":[{"delta":{"reasoning":" hard"}}]}\n\n',
+            b'data: {"choices":[{"delta":{"reasoning_content":" legacy"}}]}\n\n',
+            b'data: {"choices":[{"delta":{"content":"Answer."}}]}\n\n',
+            b'data: [DONE]\n\n',
+        ]
+        tick = iter([0.0, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 1000.0, 1000.0, 1000.0])
+
+        def fake_monotonic():
+            try:
+                return next(tick)
+            except StopIteration:
+                return 1000.0
+
+        class _FakeResp:
+            def __iter__(self):
+                return iter(sse_lines)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        mocker.patch("vserve.bench.urlopen", return_value=_FakeResp())
+        result = run_streaming_benchmark(
+            "http://localhost:8888",
+            model="m",
+            concurrency=1,
+            duration_s=0.30,
+            monotonic=fake_monotonic,
+        )
+        assert result.requests_completed >= 1
+        assert result.ttft_ms_p50 is not None
+        assert result.tpot_ms_p50 is not None
