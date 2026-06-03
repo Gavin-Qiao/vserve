@@ -9,30 +9,30 @@ Download models. Auto-tune limits. Serve with one command. Multiple backends.
 ![Python 3.12+](https://img.shields.io/badge/python-3.12+-3776ab?style=flat-square&logo=python&logoColor=white)
 ![vLLM 0.20–0.22](https://img.shields.io/badge/vLLM-0.20%E2%80%930.22-ff6f00?style=flat-square)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-GGUF-purple?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-547%20passed-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-979%20passed-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 </div>
 
 ---
 
-## Release: 0.5.6
+## Release: 0.6.3
 
-`vserve` is now in beta.
+`vserve` is now **stable** — first non-beta release of the 0.6 line.
 
-Highlights in `0.5.6`:
+Highlights in `0.6.3`:
 
-- vLLM tuning now models PagedAttention block rounding, FP8/TurboQuant KV-cache dtypes, and scheduler profiles for interactivity, balanced use, and throughput
-- generated vLLM profiles can include `performance-mode`, `optimization-level`, `block-size`, `kv-cache-memory-bytes`, and prefix-cache choices when supported by the runtime
-- llama.cpp tuning reads GGUF metadata directly and handles long-context Qwen hybrid/recurrent and Gemma sliding-window attention layouts
-- `vserve tune --bench` adds opt-in bounded microbenchmarks for vLLM and llama.cpp without making downloads start a serving backend
-- model listing uses "Weights" size terminology across vLLM and GGUF models
+- vLLM 0.22 support: range `>=0.20,<0.23`, pinned stable runtime `0.22.0`
+- migrates the deprecated `VLLM_USE_FLASHINFER_MOE_*` env vars to vLLM 0.22's hardware-aware backend auto-selection, with a `--moe-backend` escape hatch
+- emits `default-chat-template-kwargs` on 0.22 (the flag was renamed upstream); thinking toggles keep working across 0.20–0.22
+- spec-decode with fp8 KV cache keeps CUDA graphs on 0.22 (DFlash fp8 fix verified upstream); TurboQuant stays conservatively un-graphed
+- the 0.6.1–0.6.3b3 line: research bundle, `vserve bench`, de-spaghetti refactor, arch-registry canonicalization — GPU-verified on 0.21 and re-verified on 0.22
 
-Current beta caveats:
+Known caveats:
 
+- vLLM 0.20.0–0.22.0 compute RMSNorm weights in FP32 upstream (vllm#42325, fixed after the 0.22.0 cut) — accuracy-sensitive users should adopt the next vLLM patch once vserve bumps its pin
 - non-interactive startup remains intentionally strict: if the backend never reaches a healthy API state within the timeout window, `run` exits nonzero even if the service is still warming
 - multi-user coordination is best-effort operational safety, not a security boundary
-- TurboQuant capacity is reported analytically from vLLM's exposed KV dtype choices; benchmark representative profiles before treating it as a production quality setting
 
 ---
 
