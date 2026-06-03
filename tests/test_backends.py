@@ -1529,3 +1529,63 @@ class TestVllmAttentionBackend:
         cfg = b.build_config(m, choices)
         # Explicit choice overrides MLA auto-pick.
         assert cfg.get("attention-config", {}).get("backend") == "FLASH_ATTN_V3"
+
+
+# --- 0.6.3: vLLM 0.22 version-gated emission ---
+
+
+def _pin_vllm_runtime(mocker, version):
+    """Override the suite-wide None pin with an explicit runtime version."""
+    from packaging.version import Version
+
+    mocker.patch(
+        "vserve.backends.vllm._runtime_vllm_version",
+        return_value=Version(version) if version else None,
+    )
+
+
+class TestChatTemplateKwargsKeyByRuntime:
+    """vLLM 0.22 renamed --chat-template-kwargs to
+    --default-chat-template-kwargs. The emitted YAML key must follow the
+    installed runtime; unknown version stays on the pre-0.22 name."""
+
+    def _make_model(self, tmp_path, arch="Qwen3ForCausalLM"):
+        import json
+        from vserve.models import ModelInfo
+
+        model_dir = tmp_path / "models" / "p" / "M"
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text(json.dumps({"architectures": [arch]}))
+        (model_dir / "model.safetensors").write_bytes(b"\0" * 16)
+        return ModelInfo(
+            path=model_dir, provider="p", model_name="M",
+            architecture=arch, model_type="m", quant_method=None,
+            max_position_embeddings=131072, is_moe=False, model_size_gb=1.0,
+        )
+
+    def _cfg(self, tmp_path, mocker, version):
+        from vserve.backends.vllm import VllmBackend
+
+        _pin_vllm_runtime(mocker, version)
+        choices = {
+            "context": 8192, "kv_dtype": "auto", "slots": 4,
+            "batched_tokens": 4096, "gpu_mem_util": 0.9, "port": 8888,
+            "tools": False, "tool_parser": None, "reasoning_parser": None,
+            "thinking": False,
+        }
+        return VllmBackend().build_config(self._make_model(tmp_path), choices)
+
+    def test_pre_022_uses_legacy_key(self, tmp_path, mocker):
+        cfg = self._cfg(tmp_path, mocker, "0.21.0")
+        assert cfg["chat-template-kwargs"] == {"enable_thinking": False}
+        assert "default-chat-template-kwargs" not in cfg
+
+    def test_unknown_runtime_uses_legacy_key(self, tmp_path, mocker):
+        cfg = self._cfg(tmp_path, mocker, None)
+        assert cfg["chat-template-kwargs"] == {"enable_thinking": False}
+        assert "default-chat-template-kwargs" not in cfg
+
+    def test_022_uses_renamed_key(self, tmp_path, mocker):
+        cfg = self._cfg(tmp_path, mocker, "0.22.0")
+        assert cfg["default-chat-template-kwargs"] == {"enable_thinking": False}
+        assert "chat-template-kwargs" not in cfg

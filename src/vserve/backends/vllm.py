@@ -118,6 +118,22 @@ def _forced_attention_backend(model_path: Path, gpu_compute_cap: int) -> str | N
     return None
 
 
+def _runtime_vllm_version():
+    """Parsed version of the configured vLLM runtime, or None.
+
+    Single patch point for the 0.22 emission gates (the conftest autouse
+    fixture pins this to None suite-wide). None means "assume pre-0.22" —
+    gates must only ever relax or modernize behavior on a KNOWN >=0.22
+    runtime, so a broken probe degrades to warnings, never breakage.
+    """
+    try:
+        from vserve.runtime import installed_vllm_version
+
+        return installed_vllm_version()
+    except Exception:
+        return None
+
+
 def _mm_batched_tokens_floor(model_path: Path) -> int | None:
     """Floor for `max-num-batched-tokens` so a single multimodal item fits in
     one batch. vLLM disables MM-input chunking for bidirectional-attention
@@ -623,7 +639,17 @@ print(json.dumps({
             key = "thinking" if isinstance(first_arch, str) and first_arch.startswith("Deepseek") else "enable_thinking"
             ctk[key] = bool(thinking) if isinstance(thinking, bool) else thinking in (True, "on", "true", 1)
         if ctk:
-            cfg["chat-template-kwargs"] = ctk
+            # vLLM 0.22 renamed the server-level flag to
+            # --default-chat-template-kwargs (the per-request API field is
+            # unchanged). Emit the key the installed runtime accepts;
+            # unknown version → pre-0.22 name.
+            from vserve.runtime import VLLM_FLAG_MIGRATION_VERSION
+
+            ver = _runtime_vllm_version()
+            if ver is not None and ver >= VLLM_FLAG_MIGRATION_VERSION:
+                cfg["default-chat-template-kwargs"] = ctk
+            else:
+                cfg["chat-template-kwargs"] = ctk
 
         # Architecture-derived sampler defaults — unless the caller opted out
         # by passing recipe_sampling=False. vLLM accepts the parameters via
