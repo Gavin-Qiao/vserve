@@ -107,3 +107,30 @@ def fake_embedding_model_dir(tmp_path: Path) -> Path:
 def models_root(tmp_path: Path, fake_model_dir: Path) -> Path:
     """Return the models root containing fake_model_dir."""
     return tmp_path / "models"
+
+
+@pytest.fixture(autouse=True)
+def _pin_unknown_vllm_runtime_version(monkeypatch):
+    """Pin the vLLM runtime-version probe seams to None for every test.
+
+    The 0.22 emission gates probe the configured vLLM venv. On the
+    workstation that returns a real version; on GitHub CI there is no
+    venv at all. Pinning to None (= conservative pre-0.22 behavior)
+    makes the suite behave identically everywhere. Tests that exercise
+    ≥0.22 behavior re-patch the same targets explicitly.
+
+    Only the consumer-module wrappers are pinned — NOT
+    ``vserve.runtime.installed_vllm_version`` itself, which has its own
+    direct unit tests. ``raising=False`` tolerates the wrappers landing
+    in later commits of the 0.6.3 series.
+    """
+    monkeypatch.setattr(
+        "vserve.backends.vllm._runtime_vllm_version",
+        lambda: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vserve.serve._runtime_vllm_version",
+        lambda: None,
+        raising=False,
+    )
