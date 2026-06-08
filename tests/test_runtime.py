@@ -156,7 +156,7 @@ def test_upgrade_vllm_stable_force_reinstalls_pinned_stable(mocker, tmp_path):
     cmd = run.call_args.args[0]
     assert cmd[:4] == [str(vllm_python), "-m", "pip", "install"]
     assert "--force-reinstall" in cmd
-    assert "vllm==0.22.0" in cmd
+    assert "vllm==0.21.0" in cmd
     invalidate.assert_called_once()
 
 

@@ -1,3 +1,61 @@
+# vserve 0.6.3 Release Notes
+
+**First stable release of the 0.6 line** — promotes the 0.6.3b3 beta after a
+full on-GPU verification sweep on vLLM 0.22.0 (RTX PRO 5000, sm120), and adds
+vLLM 0.22 support.
+
+## vLLM 0.22 support
+
+- Supported runtime range widened to `>=0.20,<0.23`. An `installed_vllm_version`
+  probe drives three version gates, each conservative on an unknown runtime
+  (behaves pre-0.22):
+  - **`default-chat-template-kwargs`** emitted on >=0.22 (vLLM renamed the
+    flag); thinking toggles keep working across 0.20–0.22.
+  - **Deprecated FlashInfer MoE env vars** (`VLLM_USE_FLASHINFER_MOE_*`)
+    suppressed on >=0.22 in favor of vLLM's hardware-aware `--moe-backend`
+    default; new `vserve run --moe-backend` escape hatch.
+  - **spec-decode + fp8 KV keeps CUDA graphs** on >=0.22 (DFlash fp8 fix,
+    vllm#42692); turboquant and other quantized KV stay conservatively
+    un-graphed.
+- vLLM arch fixture refreshed to 0.22.0; runtime-emitted issue citations
+  corrected (#42808/#43357 workspace-lock, #39137 NVFP4-KV).
+- **Pinned stable runtime stays `0.21.0`.** 0.22 is supported, but Gemma-4
+  NVFP4 startup OOMs on 0.22 (see caveat), so `runtime upgrade --stable`
+  installs the runtime where every bundled model serves unflagged.
+
+## Bug fixes (found during the on-GPU sweep)
+
+- **Qwen 3.5 / 3.6 tool calling** routed to the wrong parser (`hermes`). These
+  models emit the XML `<function=…><parameter=…>` tool format and need
+  `qwen3_coder`; tool calls were silently leaking into `message.content` with
+  `tool_calls=[]`. Confirmed and fixed on-GPU (`arch_registry.py`).
+- **`vserve bench`** under-counted thinking-model output — vLLM 0.22 streams
+  reasoning tokens as `delta.reasoning` (renamed from `reasoning_content`), so
+  bench reported 0/N against a perfectly healthy server. Now counts all
+  channels.
+- **Test isolation**: the suite exercised the real `/run/lock/vserve`, so a
+  `pytest` run on a workstation with a live backend could delete the operator's
+  session marker. Now redirected to a per-test directory.
+
+## On-GPU sweep (vLLM 0.22.0, sm120)
+
+Verified: runtime gate; the Qwen3.5-4B @128k×11 `turboquant_3bit_nc`
+crash-repro (`cudagraph_mode=NONE` applied, round-trips); streaming bench;
+gpt-oss-20b (TRITON_ATTN forced, `speculative_config=None`); spec-decode+fp8
+CUDA-graph capture; the renamed thinking kwarg; and Qwen3.6-35B-A3B MoE
+(text + image/VLM + tool calling, under a retuned host-RAM guard).
+
+## Known caveat: Gemma-4 NVFP4 on vLLM 0.22
+
+vLLM 0.22's batched vision encoder (#43169) makes V1 startup profiling run a
+real encoder forward over 3 max-size dummy **videos**, OOMing host RAM on a
+62 GiB box. Serve Gemma-4 on 0.21, or pass
+`--limit-mm-per-prompt '{"image":1,"video":0}'` plus
+`--mm-processor-kwargs '{"max_soft_tokens":560}'`. Automatic multimodal caps
+for video-capable models land in 0.6.4.
+
+---
+
 # vserve 0.6.3b3 Release Notes (beta)
 
 > **Beta gate updated.** `0.6.3b3` is the **on-GPU-verified beta**. The

@@ -22,15 +22,17 @@ Download models. Auto-tune limits. Serve with one command. Multiple backends.
 
 Highlights in `0.6.3`:
 
-- vLLM 0.22 support: range `>=0.20,<0.23`, pinned stable runtime `0.22.0`
+- vLLM 0.22 support: range `>=0.20,<0.23` (pinned stable runtime stays `0.21.0` — see caveats)
 - migrates the deprecated `VLLM_USE_FLASHINFER_MOE_*` env vars to vLLM 0.22's hardware-aware backend auto-selection, with a `--moe-backend` escape hatch
 - emits `default-chat-template-kwargs` on 0.22 (the flag was renamed upstream); thinking toggles keep working across 0.20–0.22
 - spec-decode with fp8 KV cache keeps CUDA graphs on 0.22 (DFlash fp8 fix verified upstream); TurboQuant stays conservatively un-graphed
+- fixes Qwen 3.5 / 3.6 tool calling — these emit the XML tool format and now route to the `qwen3_coder` parser instead of `hermes` (which silently dropped tool calls into message content)
 - the 0.6.1–0.6.3b3 line: research bundle, `vserve bench`, de-spaghetti refactor, arch-registry canonicalization — GPU-verified on 0.21 and re-verified on 0.22
 
 Known caveats:
 
-- vLLM 0.20.0–0.22.0 compute RMSNorm weights in FP32 upstream (vllm#42325, fixed after the 0.22.0 cut) — accuracy-sensitive users should adopt the next vLLM patch once vserve bumps its pin
+- **Gemma-4 NVFP4 on vLLM 0.22**: startup OOMs from multimodal video-encoder profiling (vLLM #43169 batched encoder; the V1 profiler allocates max-size dummy videos). Serve it on 0.21, or pass `--limit-mm-per-prompt '{"image":1,"video":0}'` plus `--mm-processor-kwargs '{"max_soft_tokens":560}'`. Automatic multimodal caps land in 0.6.4. This is why the pinned stable runtime stays `0.21.0`.
+- vLLM 0.20.0–0.22.0 compute RMSNorm weights in FP32 upstream (vllm#42325, fixed after the 0.22.0 cut) — accuracy-sensitive users should adopt the next vLLM patch
 - non-interactive startup remains intentionally strict: if the backend never reaches a healthy API state within the timeout window, `run` exits nonzero even if the service is still warming
 - multi-user coordination is best-effort operational safety, not a security boundary
 
