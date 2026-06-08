@@ -108,7 +108,7 @@ class TestRegistryKeysAgainstVllm:
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
         ):
-            assert _ARCH_TO_TOOL_PARSER.get(arch) == "hermes", arch
+            assert _ARCH_TO_TOOL_PARSER.get(arch) == "qwen3_coder", arch
             assert _ARCH_TO_REASONING_PARSER.get(arch) == "qwen3", arch
             assert family_of(arch) == "qwen3", arch
             assert is_thinking_default(arch), arch
@@ -137,8 +137,8 @@ class TestRegistryKeysAgainstVllm:
         )
 
         for arch, expect_tp, expect_rp in (
-            ("Qwen3_5ForConditionalGeneration",    "hermes", "qwen3"),
-            ("Qwen3_5MoeForConditionalGeneration", "hermes", "qwen3"),
+            ("Qwen3_5ForConditionalGeneration",    "qwen3_coder", "qwen3"),
+            ("Qwen3_5MoeForConditionalGeneration", "qwen3_coder", "qwen3"),
         ):
             model_dir = tmp_path / arch
             model_dir.mkdir()

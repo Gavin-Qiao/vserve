@@ -32,21 +32,25 @@ _ARCH_TO_TOOL_PARSER: dict[str, str] = {
     "LlamaForCausalLM":               "llama3_json",
     "Llama4ForCausalLM":              "llama4_pythonic",
     "Llama4MoeForCausalLM":           "llama4_pythonic",
-    # Qwen3 family — Hermes-format on base, qwen3_coder for coder variants
+    # Qwen3 family. Base Qwen 3.0 emits the Hermes JSON tool format; Qwen 3.5 /
+    # 3.6 switched their chat templates to the XML `<function=…><parameter=…>`
+    # format (confirmed on-GPU 2026-06-08 + documented in README), which only
+    # the qwen3_coder parser handles — hermes silently leaks tool calls into
+    # message.content. Coder variants already used qwen3_coder.
     "Qwen3ForCausalLM":               "hermes",
-    "Qwen35ForCausalLM":              "hermes",
-    "Qwen36ForCausalLM":              "hermes",
+    "Qwen35ForCausalLM":              "qwen3_coder",
+    "Qwen36ForCausalLM":              "qwen3_coder",
     "Qwen3MoeForCausalLM":            "hermes",
     "Qwen3A3BForCausalLM":            "hermes",
-    "Qwen36MoeForCausalLM":           "hermes",
+    "Qwen36MoeForCausalLM":           "qwen3_coder",
     "Qwen3CoderForCausalLM":          "qwen3_coder",
     "Qwen3XmlForCausalLM":            "qwen3_xml",
     # vLLM 0.21+ canonical names for Qwen 3.5 / 3.6 family (the *ForConditionalGeneration
     # suffix with underscore-digit version is what HF and vLLM actually register).
     # Verified against ModelRegistry.get_supported_archs() in 0.6.3b3 (0.21)
     # and re-verified at the 0.22.0 fixture refresh.
-    "Qwen3_5ForConditionalGeneration":    "hermes",
-    "Qwen3_5MoeForConditionalGeneration": "hermes",
+    "Qwen3_5ForConditionalGeneration":    "qwen3_coder",
+    "Qwen3_5MoeForConditionalGeneration": "qwen3_coder",
     # DeepSeek V-series — per-version parser
     "DeepseekV3ForCausalLM":          "deepseek_v3",
     "DeepseekV31ForCausalLM":         "deepseek_v31",
