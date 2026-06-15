@@ -15,18 +15,20 @@ from packaging.version import InvalidVersion, Version
 
 from vserve.model_files import is_weight_file_name, iter_recursive_files_with_suffix
 
-SUPPORTED_VLLM_RANGE = ">=0.20,<0.23"
-# 0.22 is supported, but the pinned "stable" runtime stays 0.21 — it serves
-# every bundled model unflagged, whereas Gemma-4 NVFP4 needs extra multimodal
-# caps on 0.22 (the video-profiling OOM; vserve auto-caps land in 0.6.4).
-PINNED_STABLE_VLLM = "0.21.0"
+SUPPORTED_VLLM_RANGE = ">=0.20,<0.24"
+# Pinned "stable" runtime tracks the latest tested vLLM (0.23.0). 0.23 makes
+# --language-model-only first-class (vllm#44500), which lets vserve serve the
+# Gemma-4 multimodal models text-only without the 0.22 video-profiling OOM;
+# full-multimodal Gemma-4 still wants the auto MM caps landing in 0.6.4.
+PINNED_STABLE_VLLM = "0.23.0"
 DETECTOR_SCHEMA_VERSION = 2
 _VLLM_MIN = Version("0.20")
-_VLLM_MAX = Version("0.23")
+_VLLM_MAX = Version("0.24")
 
 # vLLM 0.22 renamed --chat-template-kwargs to --default-chat-template-kwargs
-# and deprecated the FlashInfer MoE env vars (removal targeted 0.23). Every
-# version gate in vserve compares against this single boundary.
+# and deprecated the FlashInfer MoE env vars (still deprecated-not-removed as
+# of 0.23 — warn-and-redirect to --moe-backend). Every version gate in vserve
+# compares against this single boundary.
 VLLM_FLAG_MIGRATION_VERSION = Version("0.22")
 
 RUNTIME_CACHE_DIR = Path.home() / ".cache" / "vserve" / "runtime"

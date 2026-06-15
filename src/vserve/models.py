@@ -88,10 +88,11 @@ QUANT_FLAGS = {
 # systemd EnvironmentFile when the model uses one of these methods.
 # Sources: vLLM 0.21 release notes (FlashInfer MoE FP4 backend), R3 (Unsloth
 # Dynamic FP8 / NVFP4 artifacts).
-# vLLM >=0.22 deprecates these env vars (removal targeted 0.23) in favor of
-# the hardware-aware --moe-backend flag; serve.py suppresses them on a known
-# >=0.22 runtime (see _resolve_quant_envs) and `vserve run --moe-backend`
-# is the explicit replacement knob.
+# vLLM >=0.22 deprecates these env vars (still deprecated-not-removed as of
+# 0.23 — warn-and-redirect) in favor of the hardware-aware --moe-backend
+# flag; serve.py suppresses them on a known >=0.22 runtime (see
+# _resolve_quant_envs) and `vserve run --moe-backend` is the explicit
+# replacement knob.
 QUANT_ENV_VARS: dict[str, dict[str, str]] = {
     "nvfp4": {
         "VLLM_USE_FLASHINFER_MOE_FP4": "1",

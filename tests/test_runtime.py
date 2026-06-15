@@ -3,6 +3,7 @@ from pathlib import Path
 
 from vserve.runtime import (
     SUPPORTED_VLLM_RANGE,
+    PINNED_STABLE_VLLM,
     DETECTOR_SCHEMA_VERSION,
     RuntimeInfo,
     build_tuning_fingerprint,
@@ -63,7 +64,7 @@ def test_check_vllm_compatibility_rejects_beta_and_wrong_minor():
     assert check_vllm_compatibility(beta).supported is False
     assert "pre-release" in " ".join(check_vllm_compatibility(beta).errors)
     assert check_vllm_compatibility(older).supported is False
-    assert ">=0.20,<0.23" in " ".join(check_vllm_compatibility(older).errors)
+    assert ">=0.20,<0.24" in " ".join(check_vllm_compatibility(older).errors)
 
 
 def test_check_vllm_compatibility_accepts_stable_021():
@@ -88,12 +89,33 @@ def test_check_vllm_compatibility_accepts_stable_021():
     assert any("0.21.0" in message for message in result.messages)
 
 
-def test_check_vllm_compatibility_rejects_023():
-    too_new = RuntimeInfo(
+def test_check_vllm_compatibility_accepts_latest_023():
+    latest = RuntimeInfo(
         backend="vllm",
         executable=Path("/opt/vllm/venv/bin/vllm"),
         python=Path("/opt/vllm/venv/bin/python"),
         vllm_version="0.23.0",
+        torch_version="2.11.0",
+        torch_cuda="13.0",
+        transformers_version="5.7.0",
+        huggingface_hub_version="1.13.0",
+        pip_check_ok=True,
+        pip_check_output="No broken requirements found",
+    )
+
+    result = check_vllm_compatibility(latest)
+
+    assert result.supported is True
+    assert result.errors == []
+    assert any("0.23.0" in message for message in result.messages)
+
+
+def test_check_vllm_compatibility_rejects_024():
+    too_new = RuntimeInfo(
+        backend="vllm",
+        executable=Path("/opt/vllm/venv/bin/vllm"),
+        python=Path("/opt/vllm/venv/bin/python"),
+        vllm_version="0.24.0",
         torch_version="2.12.0",
         torch_cuda="13.1",
         transformers_version="5.7.0",
@@ -105,7 +127,7 @@ def test_check_vllm_compatibility_rejects_023():
     result = check_vllm_compatibility(too_new)
 
     assert result.supported is False
-    assert ">=0.20,<0.23" in " ".join(result.errors)
+    assert ">=0.20,<0.24" in " ".join(result.errors)
 
 
 def test_collect_vllm_runtime_info_uses_vllm_python(mocker, tmp_path):
@@ -156,7 +178,7 @@ def test_upgrade_vllm_stable_force_reinstalls_pinned_stable(mocker, tmp_path):
     cmd = run.call_args.args[0]
     assert cmd[:4] == [str(vllm_python), "-m", "pip", "install"]
     assert "--force-reinstall" in cmd
-    assert "vllm==0.21.0" in cmd
+    assert f"vllm=={PINNED_STABLE_VLLM}" in cmd
     invalidate.assert_called_once()
 
 

@@ -4,7 +4,7 @@ Hard-won lessons from running vLLM on NVIDIA workstation GPUs.
 
 ## Supported vLLM Runtime
 
-vserve currently supports stable vLLM `>=0.20,<0.23`. Release candidates, dev builds, and older minor versions should be replaced unless you intentionally bypass the guard for local testing.
+vserve currently supports stable vLLM `>=0.20,<0.24`. Release candidates, dev builds, and older minor versions should be replaced unless you intentionally bypass the guard for local testing.
 
 ```bash
 vserve runtime check vllm
@@ -13,7 +13,7 @@ vserve runtime upgrade vllm --stable
 
 `vserve runtime check vllm` reports the external vLLM version plus torch, torch CUDA, Transformers, Hugging Face Hub, and `pip check` results. Tuning caches include these runtime facts, so changing vLLM or torch causes vserve to recalculate limits instead of reusing stale capacity numbers.
 
-`vserve runtime upgrade vllm --stable` requires a configured vLLM virtualenv, a stopped backend service, and installs vserve's pinned runtime (`vllm==0.21.0`). vLLM 0.22 is supported (`runtime check` accepts it), but the pinned stable stays 0.21 because Gemma-4 NVFP4 needs extra multimodal caps to start on 0.22. It refuses to mutate the environment if backend state is active or uncertain.
+`vserve runtime upgrade vllm --stable` requires a configured vLLM virtualenv, a stopped backend service, and installs vserve's pinned runtime (`vllm==0.23.0`). The full range `>=0.20,<0.24` is accepted by `runtime check`. On 0.22+, serving Gemma-4 multimodal can OOM during vision/video profiling — use `--language-model-only` for text-only (first-class in 0.23) or pass manual `--limit-mm-per-prompt`/`--mm-processor-kwargs` caps until vserve auto-emits them (0.6.4). It refuses to mutate the environment if backend state is active or uncertain.
 
 For beta/pre-release vserve builds:
 
