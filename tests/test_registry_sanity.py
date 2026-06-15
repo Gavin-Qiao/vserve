@@ -214,3 +214,40 @@ class TestUnslothQuantTiersTable:
     def test_mxfp4_moe_flagged_moe_only(self):
         from vserve.models import UNSLOTH_QUANT_TIERS
         assert UNSLOTH_QUANT_TIERS["MXFP4_MOE"].get("moe_only") is True
+
+
+class TestCanonicalQwen35ArchCoverage:
+    """Real Qwen3.5 AND Qwen3.6 checkpoints both report arch
+    `Qwen3_5MoeForConditionalGeneration` (model_type qwen3_5_moe). It must be
+    present in every behavior-driving arch-keyed registry — the synthetic
+    Qwen35/Qwen36* short-names only match the GGUF path. A missing canonical
+    entry is the exact bug class that bit the tool parser (b94a823) and the 3.6
+    reasoning parser (0.6.3 bug fix 1).
+
+    NOTE: SAMPLING_DEFAULTS is intentionally excluded — Qwen3.5 and Qwen3.6
+    share this arch but want different samplers (temp 0.6/pp 1.0 vs 1.0/pp 1.5),
+    so it can't be keyed by arch alone; pending a maintainer decision the
+    canonical arch falls back to engine-default sampling.
+    """
+
+    ARCH = "Qwen3_5MoeForConditionalGeneration"
+
+    def test_present_in_tool_parser_table(self):
+        from vserve.backends.vllm import _ARCH_TO_TOOL_PARSER
+        assert _ARCH_TO_TOOL_PARSER[self.ARCH] == "qwen3_coder"
+
+    def test_present_in_reasoning_parser_table(self):
+        from vserve.backends.vllm import _ARCH_TO_REASONING_PARSER
+        assert _ARCH_TO_REASONING_PARSER[self.ARCH] == "qwen3"
+
+    def test_present_in_family_table(self):
+        from vserve.arch_registry import family_of
+        assert family_of(self.ARCH) == "qwen3"
+
+    def test_is_thinking_default(self):
+        from vserve.arch_registry import is_thinking_default
+        assert is_thinking_default(self.ARCH) is True
+
+    def test_present_in_spec_decode_table(self):
+        from vserve.recipes.spec_decode import SPEC_METHOD_BY_ARCH
+        assert SPEC_METHOD_BY_ARCH[self.ARCH] == "mtp"

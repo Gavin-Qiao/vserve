@@ -2932,6 +2932,15 @@ def _scripted_config(
         "language_model_only": language_model_only,
     }
     cfg = backend.build_config(m, vllm_choices)
+    if language_model_only:
+        # KV capacity is sized against the full checkpoint weights
+        # (available_kv = usable - model_size_gb), but language-model-only
+        # doesn't load the vision/audio tower — so the sizing is conservative.
+        console.print(
+            "  [dim]Note: --language-model-only skips the vision/audio encoder, but "
+            "context/slots were sized against the full checkpoint — you can likely raise "
+            "--context/--slots.[/dim]"
+        )
     profile_name = save_profile or "custom"
     cfg_path = config_module.profile_path(m.provider, m.model_name, profile_name)
     config_module.write_profile_yaml(cfg_path, cfg, comment=f"vserve run — {profile_name} profile")

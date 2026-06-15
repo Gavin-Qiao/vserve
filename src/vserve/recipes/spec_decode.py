@@ -35,6 +35,15 @@ class SpecConfig:
 SPEC_METHOD_BY_ARCH: dict[str, str] = {
     "Qwen36ForCausalLM":  "mtp",
     "Qwen36MoeForCausalLM": "mtp",
+    # Canonical arch that real Qwen3.5/3.6 checkpoints actually report (both
+    # Qwen3.5 and Qwen3.6 register as Qwen3_5MoeForConditionalGeneration). The
+    # synthetic Qwen36* keys above only match GGUF short-names, so without
+    # these the safetensors/vLLM path got no MTP recommendation — the same
+    # gap b94a823 closed for the tool/reasoning-parser tables. Still gated by
+    # find_mtp_variant(), so checkpoints without an MTP variant fall through
+    # to draft/ngram and are unaffected.
+    "Qwen3_5ForConditionalGeneration":    "mtp",
+    "Qwen3_5MoeForConditionalGeneration": "mtp",
 }
 
 # Architectures where spec decoding is net-negative on common consumer GPUs.
