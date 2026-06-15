@@ -18,6 +18,21 @@ class RuntimeIdentity:
     version: str | None = None
     details: Mapping[str, Any] = field(default_factory=dict)
 
+    def fingerprint(self) -> dict[str, str | None]:
+        """Runtime fields that invalidate tuning caches when they drift.
+
+        Mirrors :meth:`vserve.runtime.RuntimeInfo.fingerprint` so
+        ``build_tuning_fingerprint`` can treat either runtime descriptor
+        uniformly. The llama.cpp backend returns a ``RuntimeIdentity`` (0.6.3
+        changed it from a dict), which previously raised ``AttributeError:
+        'RuntimeIdentity' object has no attribute 'fingerprint'`` during tune
+        (and any uncached run).
+        """
+        return {
+            "runtime_executable": str(self.executable) if self.executable is not None else None,
+            "runtime_version": self.version,
+        }
+
 
 @dataclass(frozen=True)
 class CompatibilityResult:

@@ -356,6 +356,52 @@ def test_build_tuning_fingerprint_includes_template_detector_runtime_and_files(t
     assert fp1["model_file_identity"][0]["path"] == "model.safetensors"
 
 
+def test_build_tuning_fingerprint_accepts_runtime_identity(tmp_path):
+    """Regression: the llama.cpp backend passes a RuntimeIdentity (0.6.3 changed
+    it from a dict). build_tuning_fingerprint called ``.fingerprint()`` — a
+    method only RuntimeInfo had — raising ``AttributeError: 'RuntimeIdentity'
+    object has no attribute 'fingerprint'`` and breaking every uncached GGUF
+    tune (and run)."""
+    from vserve.models import ModelInfo
+    from vserve.backends.protocol import RuntimeIdentity
+
+    model_dir = tmp_path / "models" / "provider" / "Model"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.safetensors").write_bytes(b"weights-v1")
+    model = ModelInfo(
+        path=model_dir,
+        provider="provider",
+        model_name="Model",
+        architecture="gguf",
+        model_type="gguf",
+        quant_method=None,
+        max_position_embeddings=4096,
+        is_moe=False,
+        model_size_gb=1.0,
+    )
+    gpu = type("GPU", (), {
+        "name": "GPU",
+        "driver": "590",
+        "cuda": "13.1",
+        "vram_total_gb": 48.0,
+    })()
+    rid = RuntimeIdentity(
+        backend="llamacpp",
+        executable=Path("/opt/llama-cpp/llama-server"),
+        version="b1234",
+    )
+
+    fp = build_tuning_fingerprint(
+        model_info=model,
+        gpu=gpu,
+        backend="llamacpp",
+        gpu_mem_util=0.92,
+        runtime_info=rid,
+    )
+    assert fp["runtime_version"] == "b1234"
+    assert str(fp["runtime_executable"]).endswith("llama-server")
+
+
 def test_build_tuning_fingerprint_includes_gguf_metadata_hash(tmp_path):
     from vserve.models import ModelInfo
 
