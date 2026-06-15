@@ -39,6 +39,30 @@ class TestSamplingDefaults:
         assert d.temp == 0.6
         assert d.presence_penalty == 1.0
 
+    def test_canonical_qwen35_arch_defaults_to_qwen35_sampler(self):
+        """Real Qwen3.5/3.6 report Qwen3_5MoeForConditionalGeneration. Without a
+        name to disambiguate, default to the Qwen3.5 sampler (the arch is 3_5)."""
+        from vserve.recipes.sampling import get_sampling_defaults
+        d = get_sampling_defaults("Qwen3_5MoeForConditionalGeneration")
+        assert d is not None
+        assert d.temp == 0.6
+        assert d.presence_penalty == 1.0
+
+    def test_canonical_qwen35_arch_disambiguates_qwen36_by_name(self):
+        """Qwen3.5 and Qwen3.6 share the arch; the model name picks the sampler.
+        Guards against the digits in '397B'/'A17B'/'35B'/'A3B' being mistaken
+        for the '3.6' version token."""
+        from vserve.recipes.sampling import get_sampling_defaults
+        arch = "Qwen3_5MoeForConditionalGeneration"
+        d36 = get_sampling_defaults(arch, "Qwen3.6-35B-A3B")
+        assert d36 is not None
+        assert d36.temp == 1.0
+        assert d36.presence_penalty == 1.5
+        d35 = get_sampling_defaults(arch, "Qwen3.5-397B-A17B")
+        assert d35 is not None
+        assert d35.temp == 0.6
+        assert d35.presence_penalty == 1.0
+
     def test_qwen3_coder_repeat_penalty(self):
         from vserve.recipes.sampling import get_sampling_defaults
         d = get_sampling_defaults("Qwen3CoderForCausalLM")

@@ -14,6 +14,7 @@ model in loops; greedy is explicitly banned on thinking variants by Unsloth.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 # `_GGUF_ARCH_TO_HF_ARCH` moved to vserve.arch_registry in 0.6.3 — the
@@ -69,8 +70,27 @@ SAMPLING_DEFAULTS: dict[str, SamplingDefaults] = {
 }
 
 
-def get_sampling_defaults(architecture: str | None) -> SamplingDefaults | None:
+# Qwen3.5 and Qwen3.6 ship under the SAME canonical arch
+# (Qwen3_5(Moe)ForConditionalGeneration) but want different samplers, so for
+# that arch the choice is disambiguated by the version in the model name. The
+# synthetic Qwen35*/Qwen36* entries above hold the actual values.
+_QWEN35_CANONICAL_ARCHS = frozenset({
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+})
+# Matches the "3.6" / "3_6" version token; not "35B" / "A3B" / "397B" / "A17B".
+_QWEN36_NAME_RE = re.compile(r"3[._]6")
+
+
+def get_sampling_defaults(
+    architecture: str | None, model_name: str | None = None
+) -> SamplingDefaults | None:
     """Return recipe defaults for the given architecture or None when unknown.
+
+    Qwen3.5 and Qwen3.6 share one canonical arch but want different samplers,
+    so for that arch the choice is disambiguated by the version in
+    ``model_name`` (Qwen3.6 prefers higher temperature / presence penalty).
+    Without a recognizable name it defaults to the Qwen3.5 sampler.
 
     Callers should treat None as "do not emit sampler flags" — the engine's
     default sampler applies. Per-request sampler overrides via the OpenAI
@@ -78,6 +98,10 @@ def get_sampling_defaults(architecture: str | None) -> SamplingDefaults | None:
     """
     if not architecture:
         return None
+    if architecture in _QWEN35_CANONICAL_ARCHS:
+        if model_name and _QWEN36_NAME_RE.search(model_name):
+            return SAMPLING_DEFAULTS["Qwen36MoeForCausalLM"]
+        return SAMPLING_DEFAULTS["Qwen35ForCausalLM"]
     return SAMPLING_DEFAULTS.get(architecture)
 
 

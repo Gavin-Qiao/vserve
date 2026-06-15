@@ -683,7 +683,7 @@ print(json.dumps({
         if choices.get("recipe_sampling", True) and not choices.get("override_generation_config"):
             from vserve.recipes.sampling import get_sampling_defaults
             arch = (_read_model_config(model.path).get("architectures") or [None])[0]
-            defaults = get_sampling_defaults(arch if isinstance(arch, str) else None)
+            defaults = get_sampling_defaults(arch if isinstance(arch, str) else None, model.model_name)
             if defaults is not None:
                 gen_cfg: dict = {"temperature": defaults.temp}
                 if defaults.top_p is not None:

@@ -224,10 +224,10 @@ class TestCanonicalQwen35ArchCoverage:
     entry is the exact bug class that bit the tool parser (b94a823) and the 3.6
     reasoning parser (0.6.3 bug fix 1).
 
-    NOTE: SAMPLING_DEFAULTS is intentionally excluded — Qwen3.5 and Qwen3.6
-    share this arch but want different samplers (temp 0.6/pp 1.0 vs 1.0/pp 1.5),
-    so it can't be keyed by arch alone; pending a maintainer decision the
-    canonical arch falls back to engine-default sampling.
+    NOTE: SAMPLING_DEFAULTS has no direct key for this arch because Qwen3.5 and
+    Qwen3.6 share it but want different samplers (temp 0.6/pp 1.0 vs 1.0/pp 1.5);
+    get_sampling_defaults() disambiguates by model name instead (covered in
+    test_recipes_sampling).
     """
 
     ARCH = "Qwen3_5MoeForConditionalGeneration"
