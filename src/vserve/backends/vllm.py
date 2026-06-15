@@ -541,9 +541,23 @@ print(json.dumps({
         }
         if choices.get("trust_remote_code"):
             cfg["trust-remote-code"] = True
+        if choices.get("language_model_only"):
+            # Text-only serving of a natively-multimodal checkpoint (the
+            # Qwen3.5/3.6 #text-only recipe): vLLM zeroes the multimodal
+            # modalities so the vision/audio encoder is never loaded, freeing
+            # VRAM for KV cache. Passed through verbatim — vLLM validates it at
+            # launch, like moe-backend below.
+            cfg["language-model-only"] = True
         bt = choices.get("batched_tokens")
         min_bt = self._minimum_batched_tokens(model)
-        mm_floor = _mm_batched_tokens_floor(model.path)
+        # With language-model-only the MM encoder isn't loaded, so the
+        # multimodal max-num-batched-tokens floor (which guards single image /
+        # audio item size) no longer applies — skip it.
+        mm_floor = (
+            None
+            if choices.get("language_model_only")
+            else _mm_batched_tokens_floor(model.path)
+        )
         # Combine: scheduler floor (hybrid-attn) AND multimodal floor.
         # Use max of both so a multimodal hybrid-attn model gets the larger.
         floors = [v for v in (min_bt, mm_floor) if isinstance(v, int)]

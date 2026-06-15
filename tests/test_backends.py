@@ -320,6 +320,59 @@ class TestVllmBackend:
 
         assert cfg["max-num-batched-tokens"] == 4096
 
+    def test_build_config_language_model_only_emits_flag_and_skips_mm_floor(self, tmp_path):
+        """--language-model-only serves a natively-multimodal checkpoint as
+        text-only: vLLM skips the vision/audio encoder, so we emit the flag and
+        drop the multimodal max-num-batched-tokens floor. Uses a non-hybrid
+        vision arch so the MM floor is the *only* floor in play (a hybrid arch
+        would keep its own 4096 scheduler floor and mask the effect)."""
+        import json
+        from vserve.models import ModelInfo
+        from vserve.backends.vllm import _mm_batched_tokens_floor
+
+        model_dir = tmp_path / "models" / "vendor" / "Vision-MM"
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text(json.dumps({
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1024},
+        }))
+        m = ModelInfo(
+            path=model_dir,
+            provider="vendor",
+            model_name="Vision-MM",
+            architecture="Gemma4ForConditionalGeneration",
+            model_type="gemma4",
+            quant_method=None,
+            max_position_embeddings=8192,
+            is_moe=False,
+            model_size_gb=10.0,
+        )
+        # Sanity: this fixture would otherwise trigger the vision floor.
+        assert _mm_batched_tokens_floor(model_dir) == 4096
+
+        b = VllmBackend()
+        base_choices = {
+            "context": 8192,
+            "kv_dtype": "auto",
+            "slots": 4,
+            "batched_tokens": None,
+            "gpu_mem_util": 0.90,
+            "port": 8888,
+            "tools": False,
+            "tool_parser": None,
+            "reasoning_parser": None,
+        }
+
+        # Default: multimodal floor applies, flag absent.
+        cfg_mm = b.build_config(m, dict(base_choices))
+        assert cfg_mm["max-num-batched-tokens"] == 4096
+        assert "language-model-only" not in cfg_mm
+
+        # language-model-only: emit the flag and drop the MM floor.
+        cfg_lmo = b.build_config(m, {**base_choices, "language_model_only": True})
+        assert cfg_lmo["language-model-only"] is True
+        assert "max-num-batched-tokens" not in cfg_lmo
+
     def test_build_config_reasoning_without_tools(self, fake_model_dir):
         b = VllmBackend()
         b.available_reasoning_parsers = Mock(return_value={"qwen3"})  # type: ignore[method-assign]

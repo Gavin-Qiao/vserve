@@ -45,8 +45,12 @@ _ARCH_TO_TOOL_PARSER: dict[str, str] = {
     "Qwen36MoeForCausalLM":           "qwen3_coder",
     "Qwen3CoderForCausalLM":          "qwen3_coder",
     "Qwen3XmlForCausalLM":            "qwen3_xml",
-    # vLLM 0.21+ canonical names for Qwen 3.5 / 3.6 family (the *ForConditionalGeneration
-    # suffix with underscore-digit version is what HF and vLLM actually register).
+    # vLLM 0.21+ canonical names for the Qwen 3.5 / 3.6 family (the
+    # *ForConditionalGeneration suffix with underscore-digit version is what HF
+    # and vLLM actually register). NOTE: Qwen 3.6 reuses the Qwen3_5* arch
+    # classes — both Qwen/Qwen3.5-397B-A17B and Qwen/Qwen3.6-35B-A3B register as
+    # Qwen3_5MoeForConditionalGeneration (model_type qwen3_5_moe), so there is no
+    # separate Qwen3_6* arch to add here.
     # Verified against ModelRegistry.get_supported_archs() in 0.6.3b3 (0.21)
     # and re-verified at the 0.22.0 fixture refresh.
     "Qwen3_5ForConditionalGeneration":    "qwen3_coder",
