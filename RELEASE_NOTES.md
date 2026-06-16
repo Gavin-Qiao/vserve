@@ -36,17 +36,20 @@ RTX PRO 5000 (Blackwell / sm120) across both backends and four model families:
 
 See the 0.6.4b1 notes below for full detail on the carried items.
 
+## Gemma-4 multimodal
+
+`Gemma-4-31B-IT-NVFP4` serves full omni-modal (text + image, both verified) on
+a single Blackwell card on the pinned **0.23.0** with no special flags — no
+vserve change required. The previously-planned `--limit-mm-per-prompt`
+auto-emit proved unnecessary on 0.23 (the 0.22-era multimodal-profiling OOM
+does not reproduce) and has been dropped. (vLLM *nightlies* after 0.23.0 carry
+a temporary `tie_weights` regression —
+[vllm#45543](https://github.com/vllm-project/vllm/issues/45543), fixed by
+[#45544](https://github.com/vllm-project/vllm/pull/45544) — that breaks
+quantized Gemma-4 load; the pinned stable 0.23.0 is unaffected.)
+
 ## Known follow-ups
 
-- **Gemma-4 multimodal** is gated on upstream vLLM, not on vserve. On 0.23.x,
-  quantized Gemma-4 checkpoints with tied embeddings crash at load
-  (`tie_weights` `NotImplementedError`); the one-line upstream fix
-  [vllm#45544](https://github.com/vllm-project/vllm/pull/45544) resolves it,
-  after which `Gemma-4-31B-IT-NVFP4` serves full omni-modal (text + vision
-  verified) on a single Blackwell card with no special flags. The
-  previously-planned `--limit-mm-per-prompt` auto-emit proved unnecessary on
-  0.23 (the 0.22-era multimodal-profiling OOM does not reproduce) and has been
-  dropped.
 - Minor: precise vision/audio tower-size subtraction in the
   `--language-model-only` capacity estimate.
 
