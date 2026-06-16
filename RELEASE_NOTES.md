@@ -1,3 +1,55 @@
+# vserve 0.6.4 Release Notes
+
+**Stable.** Promotes 0.6.4b1 after an on-GPU sweep, and adds support for the
+vLLM 0.23 line. Install with `pip install vserve` or `uv tool install vserve`.
+
+## vLLM 0.23 support
+
+- **0.23 is now supported and is the pinned stable runtime.** The accepted
+  range widens to `>=0.20,<0.24`, and fresh installs pin **vLLM 0.23.0**. The
+  upgrade is drop-in: 0.23 changes none of the serve flags, tool/reasoning
+  parser names, or KV-cache dtypes vserve emits, and its dependencies are
+  unchanged from 0.22 (`torch==2.11.0`, Python `>=3.10,<3.15`). The deprecated
+  FlashInfer MoE env vars remain warn-and-redirect shims in 0.23 and stay
+  suppressed. The bundled vLLM architecture fixture is refreshed to 0.23
+  (365 archs).
+
+## Verified on-GPU
+
+This clears the beta's on-GPU gate. The 0.23 runtime was soak-tested on an
+RTX PRO 5000 (Blackwell / sm120) across both backends and four model families:
+
+- **vLLM** — Qwen3.6-35B-A3B FP8 (text + vision, 127 tok/s), gpt-oss-20b mxfp4
+  (177 tok/s), Qwen3.5 smoke.
+- **llama.cpp** — Qwen3.6-35B-A3B-MTP GGUF (122 tok/s), which exercises the
+  GGUF `RuntimeIdentity.fingerprint` fix at serve time, not just tune.
+
+## Carried from 0.6.4b1
+
+- **GGUF tune/run crash fix** — no more `AttributeError: 'RuntimeIdentity'
+  object has no attribute 'fingerprint'` on `vserve tune` / uncached
+  `vserve run` for llama.cpp models.
+- **`vserve run --language-model-only`** — serve a natively-multimodal model
+  (Gemma-4, Qwen3.5/3.6) text-only, skipping the vision/audio encoder.
+- **Qwen3.5 / 3.6 sampler disambiguation** by model name, with canonical-arch
+  coverage for the spec-decode recipe and a sniffer↔arch-table drift guard.
+
+See the 0.6.4b1 notes below for full detail on the carried items.
+
+## Known follow-ups
+
+- **Gemma-4 multimodal** is gated on upstream vLLM, not on vserve. On 0.23.x,
+  quantized Gemma-4 checkpoints with tied embeddings crash at load
+  (`tie_weights` `NotImplementedError`); the one-line upstream fix
+  [vllm#45544](https://github.com/vllm-project/vllm/pull/45544) resolves it,
+  after which `Gemma-4-31B-IT-NVFP4` serves full omni-modal (text + vision
+  verified) on a single Blackwell card with no special flags. The
+  previously-planned `--limit-mm-per-prompt` auto-emit proved unnecessary on
+  0.23 (the 0.22-era multimodal-profiling OOM does not reproduce) and has been
+  dropped.
+- Minor: precise vision/audio tower-size subtraction in the
+  `--language-model-only` capacity estimate.
+
 # vserve 0.6.4b1 Release Notes
 
 **Beta — not yet verified on-GPU.** Bundles the llama.cpp runtime fix plus the
