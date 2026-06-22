@@ -1,7 +1,10 @@
 """Speculative-decoding recipe selection (item M).
 
 Three independent shapes:
-- ``ngram``: vLLM-only prompt-lookup based prediction; zero extra-model cost.
+- ``ngram``: prompt-lookup prediction; zero extra-model cost. Enabled on vLLM.
+  llama.cpp also has it (``--spec-type ngram-*``) as of the pinned runtime, but
+  vserve keeps it off there — benchmarked net-negative for batched serving
+  (docs/research/2026-06-19-llamacpp-throughput-goedel.md).
 - ``draft``: pair a small (≤1.5B) same-family model as the speculator.
 - ``mtp``: Multi-Token Prediction variant GGUF (Unsloth Qwen3.6 family).
 
@@ -161,7 +164,13 @@ def pick_spec_config(
         if vocab_compatible(architecture, bos_token_id, eos_token_id, draft):
             return SpecConfig(method="draft", draft_model_path=draft.path, n_max=3, p_min=0.6)
 
-    # ngram is vLLM-only (llama.cpp doesn't have an equivalent zero-cost mode).
+    # ngram (prompt-lookup) is the zero-extra-model fallback. llama.cpp DOES
+    # support it as of the pinned runtime (--spec-type ngram-mod/ngram-simple/…),
+    # but it's benchmarked net-negative for batched llama.cpp serving on this
+    # fleet — Goedel-Prover-V2-32B (Qwen2.5 dense) at np=5 lost ~9% decode tok/s
+    # (ngram-mod, default n-match=24, ~26% accept) and barely activated even
+    # single-stream — so it stays disabled there, mirroring the A3B-MoE
+    # blocklist. See docs/research/2026-06-19-llamacpp-throughput-goedel.md.
     if backend == "vllm":
         return SpecConfig(method="ngram", n_max=5, n_min=1)
     return None

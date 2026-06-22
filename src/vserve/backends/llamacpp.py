@@ -1196,7 +1196,10 @@ class LlamaCppBackend:
             spec_dict: dict | None = None
             if spec_cls is not None and isinstance(spec, spec_cls):
                 if spec.method == "ngram":
-                    # llama.cpp has no equivalent zero-cost ngram path; skip.
+                    # llama.cpp gained --spec-type ngram-* in the pinned runtime,
+                    # but it's benchmarked net-negative for batched serving
+                    # (docs/research/2026-06-19-llamacpp-throughput-goedel.md), so
+                    # vserve leaves ngram disabled on llama.cpp. Skip.
                     spec_dict = None
                 elif spec.draft_model_path is not None:
                     spec_dict = {

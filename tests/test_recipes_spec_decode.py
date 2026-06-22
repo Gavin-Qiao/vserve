@@ -56,7 +56,7 @@ class TestPickSpecConfig:
             architecture="LlamaForCausalLM", backend="llamacpp",
             model_path=tmp_path, available_drafts=[],
         )
-        assert out is None  # llama.cpp has no zero-cost fallback
+        assert out is None  # llama.cpp ngram exists but is disabled (net-negative, batched)
 
     def test_picks_draft_model_when_compatible(self, tmp_path):
         from vserve.recipes.spec_decode import DraftCandidate, pick_spec_config
@@ -88,7 +88,7 @@ class TestPickSpecConfig:
             model_path=tmp_path, available_drafts=[draft],
             bos_token_id=1, eos_token_id=2,
         )
-        # Vocab mismatch → can't use draft. llama.cpp has no ngram. → None.
+        # Vocab mismatch → can't use draft; ngram disabled on llama.cpp → None.
         assert out is None
 
     def test_rejects_draft_over_1_5b(self, tmp_path):
