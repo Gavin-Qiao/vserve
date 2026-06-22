@@ -1,3 +1,55 @@
+# vserve 0.6.5 Release Notes
+
+**Patch.** Adds serving support for block-diffusion language models
+(DiffusionGemma), hardens `vserve run` against startup crash-loops, and keeps
+ngram speculative decoding off on llama.cpp where it costs throughput. Install
+with `pip install vserve` or `uv tool install vserve`.
+
+## Block-diffusion (dLLM) serving
+
+- **vserve now serves block-diffusion LLMs** such as
+  `RedHatAI/diffusiongemma-26B-A4B-it-NVFP4`. These are not autoregressive
+  causal LMs — they ride vLLM's V2 model-runner ModelState hooks — so `vserve
+  run` now detects them (from `model_type` / architecture) and emits the right
+  serve recipe instead of the causal-LM config that fails at load with
+  `ValueError: Argument input_ids not found`:
+  - `VLLM_USE_V2_MODEL_RUNNER=1` (written to the systemd EnvironmentFile),
+    `--trust-remote-code`, the entropy-bound diffusion sampler (via
+    `--hf-overrides`), `--attention-backend TRITON_ATTN`, and a host-RAM-bounded
+    `runai_streamer` load.
+  - Autoregressive-only knobs are suppressed for these models: the NVFP4
+    fp8-KV-cache forcing (KV stays `auto`) and ngram speculative decoding.
+  - **Tuned defaults** for the diffusion-state VRAM profile: `max-num-seqs 16`
+    and `gpu-memory-utilization 0.70`. On a 48 GB sm120 GPU at 16k context this
+    is the throughput knee — ~540 tok/s vs ~373 at the model card's `ns=4`
+    (+45%). The KV cache is not the concurrency limiter (it supports ~24×); the
+    large diffusion-state tensors are, so utilization is lowered to leave room.
+- **Runtime note:** native block-diffusion support requires a vLLM build newer
+  than the pinned stable 0.23.0 (a 0.23.1+ nightly, or 0.24 when it ships).
+  vserve emits the correct config regardless — point the runtime at a capable
+  build to actually serve.
+
+## `vserve run` no longer spins on a failed start
+
+- A model that fails fatally at startup (e.g. an unsupported architecture) could
+  put the systemd unit into an unbounded `Restart=on-failure` loop: because a
+  mid-restart service reads as "active", `vserve run` treated it as "still
+  warming" and returned, leaving it to restart roughly once a minute forever
+  (the `StartLimitBurst` guard is tuned for fast storms and a slow ~60 s-cycle
+  failure slips under it).
+- `vserve run` now tracks the unit's restart counter and, when it climbs during
+  the health wait, **stops the unit and prints the engine diagnosis** instead of
+  spinning. Every non-ready exit path now best-effort stops the unit, so a
+  failed launch can no longer keep auto-restarting after the command returns.
+
+## llama.cpp speculative decoding
+
+- **ngram speculative decoding stays off on llama.cpp.** The pinned runtime
+  gained `--spec-type ngram-*`, but benchmarking (Goedel-Prover-V2 / Qwen2.5-32B
+  at batch 5) showed it costs ~9% decode throughput for batched serving, so
+  vserve keeps it disabled there. It remains enabled on vLLM, where it is a net
+  win. See `docs/research/2026-06-19-llamacpp-throughput-goedel.md`.
+
 # vserve 0.6.4 Release Notes
 
 **Stable.** Promotes 0.6.4b1 after an on-GPU sweep, and adds support for the
