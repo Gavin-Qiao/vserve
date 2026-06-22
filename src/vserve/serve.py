@@ -202,6 +202,32 @@ def _resolve_quant_envs(config_path: Path) -> dict[str, str]:
     return envs
 
 
+def _resolve_model_runtime_envs(config_path: Path) -> dict[str, str]:
+    """Model-architecture env vars (not quant-driven).
+
+    Block-diffusion LLMs (dLLMs, e.g. DiffusionGemma) need
+    ``VLLM_USE_V2_MODEL_RUNNER=1`` so vLLM routes them through the V2
+    model-runner ModelState hooks instead of the autoregressive path (without
+    it the model hits the causal-LM ``input_ids`` torch.compile contract and
+    fails to load). Silent fallthrough — env vars are advisory.
+    """
+    try:
+        data = read_profile_yaml(config_path) or {}
+    except Exception:
+        return {}
+    model = data.get("model") if isinstance(data, dict) else None
+    if not isinstance(model, str) or not model:
+        return {}
+    try:
+        from vserve.backends.vllm import _is_block_diffusion
+
+        if _is_block_diffusion(Path(model)):
+            return {"VLLM_USE_V2_MODEL_RUNNER": "1"}
+    except Exception:
+        return {}
+    return {}
+
+
 def _service_uses_env_file(env_path: Path) -> bool:
     unit = find_systemd_unit_path(cfg().service_name)
     if unit is None:
@@ -229,12 +255,39 @@ def is_vllm_running() -> bool:
     return False
 
 
+def vllm_restart_count() -> int | None:
+    """systemd ``NRestarts`` for the vLLM unit, or None if unavailable.
+
+    Lets the launch flow tell a genuinely slow-warming start (count stable)
+    apart from a crash-loop (count climbing). A warming engine keeps its main
+    PID, so ``NRestarts`` only moves when the process has died and been
+    auto-restarted — i.e. it is failing, not warming. Read-only; no sudo.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", f"{cfg().service_name}.service",
+             "--property=NRestarts", "--value"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    raw = result.stdout.strip()
+    return int(raw) if raw.isdigit() else None
+
+
 def start_vllm(config_path: Path, *, non_interactive: bool = False) -> None:
     snapshot = _snapshot_active_config()
     # Quant-specific env vars (Q): write VLLM_USE_FLASHINFER_MOE_FP4 etc.
     # alongside the base CUDA/TMP/RPC values so the systemd service picks
     # them up from the EnvironmentFile.
-    env_path = _upsert_env_file(_resolve_quant_envs(config_path))
+    env_path = _upsert_env_file({
+        **_resolve_quant_envs(config_path),
+        **_resolve_model_runtime_envs(config_path),
+    })
     if not _service_uses_env_file(env_path):
         raise RuntimeError(
             f"{cfg().service_name}.service must reference EnvironmentFile={env_path} "

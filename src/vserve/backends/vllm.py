@@ -49,6 +49,44 @@ def _read_model_config(model_path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+# Block-diffusion (dLLM) serve recipe — DiffusionGemma & friends are NOT
+# autoregressive causal LMs; they ride vLLM's V2 model-runner ModelState hooks
+# and need the diffusion sampler + a host-RAM-bounded load. See the
+# vserve-diffusiongemma-serve notes and recipes.vllm.ai/Google/diffusiongemma.
+_DLLM_SAMPLER_HF_OVERRIDES: dict[str, object] = {
+    "diffusion_sampler": "entropy_bound",
+    "diffusion_entropy_bound": 0.1,
+}
+_DLLM_RUNAI_MEMORY_LIMIT = 8589934592  # 8 GiB host streaming buffer (runai_streamer)
+# Concurrency + utilization: diffusion state tensors are large, so the AR-default
+# gpu-util (0.85+) leaves no room past ns=4 (CUDA-OOM). Lowering utilization
+# shrinks the (24x-oversized) KV pool and lets ns=16 fit for ~+45% throughput on
+# a 48 GB sm120 GPU at 16k (tuned 2026-06-22 — see throughput sweep, configs A/D).
+_DLLM_MAX_NUM_SEQS = 16
+_DLLM_GPU_MEM_UTIL = 0.70
+
+
+def _is_block_diffusion(model_path: Path) -> bool:
+    """True for block-diffusion LLMs (dLLMs) like DiffusionGemma.
+
+    These ride vLLM's V2 model-runner ModelState hooks, not the autoregressive
+    causal-LM path, so vserve emits a distinct serve recipe (V2 runner env var,
+    diffusion sampler, trust-remote-code, TRITON_ATTN, runai_streamer) and skips
+    the AR-only knobs (NVFP4 fp8-KV forcing, ngram spec-decode). Detected from
+    config.json ``model_type`` / ``architectures``.
+    """
+    cfg = _read_model_config(model_path)
+    if not cfg:
+        return False
+    mt = cfg.get("model_type")
+    if isinstance(mt, str) and "diffusion" in mt.lower():
+        return True
+    archs = cfg.get("architectures")
+    if isinstance(archs, list):
+        return any(isinstance(a, str) and "Diffusion" in a for a in archs)
+    return False
+
+
 def _architecture_forces_triton_attn(model_path: Path) -> bool:
     """True when the architecture has heterogeneous per-layer head dimensions,
     in which case vLLM forces the TRITON_ATTN backend to prevent mixed-backend
@@ -100,7 +138,10 @@ def _forced_attention_backend(model_path: Path, gpu_compute_cap: int) -> str | N
       sm>=100 (Blackwell) — MLA architectures prefer TOKENSPEED_MLA
       sm<100             — MLA architectures prefer FLASHMLA
       sm==120 + GptOss   — TRITON_ATTN required (vllm#40153)
+      block-diffusion    — TRITON_ATTN (dLLM dynamic per-seq causal attention)
     """
+    if _is_block_diffusion(model_path):
+        return "TRITON_ATTN"
     cfg = _read_model_config(model_path)
     archs = cfg.get("architectures") if cfg else None
     if not isinstance(archs, list):
@@ -539,6 +580,34 @@ print(json.dumps({
             "kv-cache-dtype": choices["kv_dtype"],
             "enable-prefix-caching": True,
         }
+        is_dllm = _is_block_diffusion(model.path)
+        if is_dllm:
+            # Block-diffusion LLM (dLLM, e.g. DiffusionGemma): emit the V2-runner
+            # serve recipe. VLLM_USE_V2_MODEL_RUNNER=1 is written to the env file
+            # by serve.py; trust-remote-code, the diffusion sampler, a host-RAM-
+            # bounded streamed load, and TRITON_ATTN (via _forced_attention_backend)
+            # go here. The AR-only knobs (NVFP4 fp8-KV forcing, ngram spec-decode)
+            # are skipped below — block diffusion uses bidirectional attention.
+            cfg["trust-remote-code"] = True
+            cfg["kv-cache-dtype"] = "auto"
+            # dLLM dynamic per-seq causal attention needs TRITON_ATTN (also set
+            # via _forced_attention_backend; pinned here so a failed GPU probe
+            # can't drop it). A user-passed attention_backend still wins below.
+            cfg.setdefault("attention-config", {"backend": "TRITON_ATTN"})
+            cfg.setdefault("hf-overrides", dict(_DLLM_SAMPLER_HF_OVERRIDES))
+            cfg.setdefault("load-format", "runai_streamer")
+            cfg.setdefault(
+                "model-loader-extra-config", {"memory_limit": _DLLM_RUNAI_MEMORY_LIMIT}
+            )
+            gu = cfg.get("gpu-memory-utilization")
+            if not isinstance(gu, (int, float)) or isinstance(gu, bool) or gu > _DLLM_GPU_MEM_UTIL:
+                cfg["gpu-memory-utilization"] = _DLLM_GPU_MEM_UTIL
+            slots = cfg.get("max-num-seqs")
+            cfg["max-num-seqs"] = (
+                min(slots, _DLLM_MAX_NUM_SEQS)
+                if isinstance(slots, int) and not isinstance(slots, bool)
+                else _DLLM_MAX_NUM_SEQS
+            )
         if choices.get("trust_remote_code"):
             cfg["trust-remote-code"] = True
         if choices.get("language_model_only"):
@@ -614,7 +683,8 @@ print(json.dumps({
         # caller hasn't pinned a KV dtype. The user can still override
         # explicitly by passing kv_dtype="auto" with their own override.
         if (
-            model.quant_method in {"nvfp4", "modelopt"}
+            not is_dllm
+            and model.quant_method in {"nvfp4", "modelopt"}
             and (cfg.get("kv-cache-dtype") in {"auto", None, ""})
         ):
             cfg["kv-cache-dtype"] = "fp8"
@@ -731,7 +801,7 @@ print(json.dumps({
         # M: speculative-config block. Accept either a SpecConfig instance
         # (auto-picked recipe) or a pre-built dict (caller knows what they
         # want). vllm#41967 — refuse MTP + Gemma-4 + tools.
-        spec = choices.get("spec")
+        spec = None if is_dllm else choices.get("spec")
         if spec:
             spec_cls: type | None
             try:
@@ -799,6 +869,10 @@ print(json.dumps({
     def is_running(self) -> bool:
         from vserve.serve import is_vllm_running
         return is_vllm_running()
+
+    def restart_count(self) -> int | None:
+        from vserve.serve import vllm_restart_count
+        return vllm_restart_count()
 
     def health_url(self, port: int) -> str:
         return f"http://localhost:{port}/health"

@@ -2241,11 +2241,13 @@ def _wait_for_health(
     service_running_fn,
     sleep_fn=None,
     urlopen_fn=None,
+    restart_count_fn=None,
+    baseline_restarts=None,
 ):
-    """Poll health_url until 200 / service dies / timeout, deduping log output.
+    """Poll health_url until 200 / service dies / crash-loops / timeout, deduping log output.
 
-    Returns one of: "ready", "stopped", "timeout". The caller renders the
-    final-state banner so output is byte-stable across changes here.
+    Returns one of: "ready", "stopped", "crashloop", "timeout". The caller
+    renders the final-state banner so output is byte-stable across changes here.
 
     Dedup rule: the journal tail is printed only when its hash changes, so the
     user sees each fresh block once instead of every 3 s. Between unchanged
@@ -2295,6 +2297,18 @@ def _wait_for_health(
             if dots_printed:
                 console.print()
             return "stopped"
+
+        # Crash-loop guard: a warming engine keeps its PID, so a climbing
+        # restart counter means the process died and systemd auto-restarted
+        # it — failing, not warming. Bail early so the caller can stop the
+        # storm instead of mis-reading auto-restart "active" as warmup and
+        # waiting out the full timeout (the bug that let vllm.service spin).
+        if restart_count_fn is not None and baseline_restarts is not None:
+            rc = restart_count_fn()
+            if isinstance(rc, int) and rc > baseline_restarts:
+                if dots_printed:
+                    console.print()
+                return "crashloop"
 
         if elapsed_s % 30 == 0:
             if dots_printed:
@@ -2438,6 +2452,23 @@ def _launch_backend(
                 return backend.is_running()
             except Exception:
                 return None
+
+        def _restart_count() -> int | None:
+            fn = getattr(backend, "restart_count", None)
+            if fn is None:
+                return None
+            try:
+                return fn()
+            except Exception:
+                return None
+
+        def _halt_unit() -> None:
+            # Best-effort stop so a failed start can't keep auto-restarting
+            # (systemd Restart=on-failure) after vserve returns — the spin fix.
+            try:
+                backend.stop(non_interactive=non_interactive)
+            except Exception:
+                pass
 
         def _recent_service_log_tail() -> str | None:
             try:
@@ -2592,6 +2623,10 @@ def _launch_backend(
 
         write_session(label)
 
+        # Baseline restart counter — a climbing count during the health wait
+        # means the engine is crash-looping, not warming (see _wait_for_health).
+        baseline_restarts = _restart_count()
+
         port = launch_port
         health = backend.health_url(port)
 
@@ -2602,7 +2637,29 @@ def _launch_backend(
             poll_s=health_poll_s,
             log_tail_fn=_recent_service_log_tail,
             service_running_fn=_service_running_state,
+            restart_count_fn=_restart_count,
+            baseline_restarts=baseline_restarts,
         )
+        if outcome == "crashloop":
+            clear_session()
+            _halt_unit()
+            _record_backend_manifest(
+                backend,
+                cfg_path,
+                label=label,
+                status="failed",
+                port=port,
+                error="service crash-looped on startup (stopped to halt the restart storm)",
+            )
+            console.print(
+                "\n[red]Service is crash-looping on startup — stopped it to prevent a restart storm.[/red]"
+            )
+            had_diagnosis = _print_engine_diagnosis(
+                backend, header="  [yellow]Diagnosed from the engine log:[/yellow]"
+            )
+            if not had_diagnosis:
+                console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
+            raise typer.Exit(1)
         if outcome == "ready":
             _record_backend_manifest(backend, cfg_path, label=label, status="ready", port=port)
             console.print(f"\n[bold green]{backend.display_name} is running[/bold green] at http://localhost:{port}/v1")
@@ -2629,6 +2686,7 @@ def _launch_backend(
             return
         if outcome == "stopped":
             clear_session()
+            _halt_unit()
             _record_backend_manifest(
                 backend,
                 cfg_path,
@@ -2649,6 +2707,7 @@ def _launch_backend(
 
         if service_running is False:
             clear_session()
+            _halt_unit()
             _record_backend_manifest(
                 backend,
                 cfg_path,
@@ -2665,6 +2724,29 @@ def _launch_backend(
                 console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
             raise typer.Exit(1)
         if service_running is True:
+            rc = _restart_count()
+            if (
+                isinstance(rc, int)
+                and isinstance(baseline_restarts, int)
+                and rc > baseline_restarts
+            ):
+                # "Active" only because systemd is mid-auto-restart — it's
+                # crash-looping, not warming. Stop it instead of returning.
+                clear_session()
+                _halt_unit()
+                _record_backend_manifest(
+                    backend, cfg_path, label=label, status="failed", port=port,
+                    error="service crash-looped on startup (stopped to halt the restart storm)",
+                )
+                console.print(
+                    "\n[red]Service is crash-looping on startup — stopped it to prevent a restart storm.[/red]"
+                )
+                had_diagnosis = _print_engine_diagnosis(
+                    backend, header="  [yellow]Diagnosed from the engine log:[/yellow]"
+                )
+                if not had_diagnosis:
+                    console.print(f"  Check: sudo journalctl -u {backend.service_name} --no-pager -n 50")
+                raise typer.Exit(1)
             _record_backend_manifest(backend, cfg_path, label=label, status="warming", port=port)
             console.print("[yellow]Health endpoint is still warming up, but the service remains active.[/yellow]")
             if needs_precache:
