@@ -87,6 +87,23 @@ def _is_block_diffusion(model_path: Path) -> bool:
     return False
 
 
+def resolve_vllm_service_name() -> str:
+    """Service for the active vLLM config — the dLLM runtime for block-diffusion
+    models, else the stable one. Thin alias over ``serve._resolve_vllm_service``;
+    the implementation lives in serve.py so it shares serve's ``cfg``."""
+    from vserve.serve import _resolve_vllm_service
+
+    return _resolve_vllm_service()
+
+
+def configured_vllm_service_names() -> list[str]:
+    """All vLLM services vserve may have running (stable + dLLM). Thin alias
+    over ``serve._configured_vllm_services``."""
+    from vserve.serve import _configured_vllm_services
+
+    return _configured_vllm_services()
+
+
 def _architecture_forces_triton_attn(model_path: Path) -> bool:
     """True when the architecture has heterogeneous per-layer head dimensions,
     in which case vLLM forces the TRITON_ATTN backend to prevent mixed-backend
@@ -345,9 +362,7 @@ class VllmBackend:
 
     @property
     def service_name(self) -> str:
-        from vserve.config import cfg
-
-        return cfg().service_name
+        return resolve_vllm_service_name()
 
     @property
     def service_user(self) -> str:

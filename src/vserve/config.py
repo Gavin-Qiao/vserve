@@ -229,6 +229,10 @@ class VserveConfig:
     llamacpp_root: Path | None = None
     llamacpp_service_name: str = "llama-cpp"
     llamacpp_service_user: str = "llama-cpp"
+    # Separate systemd service for block-diffusion (dLLM) models that need a
+    # runtime newer than the pinned-stable one. None = feature off (dLLMs use
+    # the default vLLM service). See backends.vllm.resolve_vllm_service_name.
+    dllm_service_name: str | None = None
     backends: dict[str, BackendConfig] = field(default_factory=dict)
 
     @property
@@ -321,7 +325,8 @@ def _build_config(vllm_root: Path, cuda_home: Path, service_name: str,
                   gpu_overhead_gb: float | None = None,
                   llamacpp_root: Path | None = None,
                   llamacpp_service_name: str = "llama-cpp",
-                  llamacpp_service_user: str = "llama-cpp") -> VserveConfig:
+                  llamacpp_service_user: str = "llama-cpp",
+                  dllm_service_name: str | None = None) -> VserveConfig:
     vllm_venv_bin = _vllm_venv_bin(vllm_root)
     backends = {
         "vllm": BackendConfig(
@@ -357,6 +362,7 @@ def _build_config(vllm_root: Path, cuda_home: Path, service_name: str,
         llamacpp_root=llamacpp_root,
         llamacpp_service_name=llamacpp_service_name,
         llamacpp_service_user=llamacpp_service_user,
+        dllm_service_name=dllm_service_name,
         backends=backends,
     )
 
@@ -401,6 +407,7 @@ def load_config() -> VserveConfig:
                 gpu_overhead_raw = gpu.get("overhead_gb", raw.get("gpu_overhead_gb"))
                 gpu_index_raw = gpu.get("index", raw.get("gpu_index", 0))
                 llamacpp_root_raw = llamacpp_raw.get("root", raw.get("llamacpp_root"))
+                dllm_svc_raw = vllm_raw.get("dllm_service_name", raw.get("dllm_service_name"))
                 return _build_config(
                     vllm_root=root,
                     cuda_home=Path(str(raw.get("cuda_home", _DEFAULT_CUDA_HOME))),
@@ -413,6 +420,7 @@ def load_config() -> VserveConfig:
                     llamacpp_root=Path(str(llamacpp_root_raw)) if llamacpp_root_raw else None,
                     llamacpp_service_name=str(llamacpp_raw.get("service_name", raw.get("llamacpp_service_name", "llama-cpp"))),
                     llamacpp_service_user=str(llamacpp_raw.get("service_user", raw.get("llamacpp_service_user", "llama-cpp"))),
+                    dllm_service_name=str(dllm_svc_raw) if dllm_svc_raw else None,
                 )
             _log.warning("Ignoring invalid config format in %s: expected mapping", CONFIG_FILE)
 
@@ -439,6 +447,8 @@ def save_config(cfg: VserveConfig) -> Path:
             },
         },
     }
+    if cfg.dllm_service_name:
+        data["backends"]["vllm"]["dllm_service_name"] = cfg.dllm_service_name
     gpu: dict[str, float | int] = {"index": cfg.gpu_index}
     if cfg.gpu_memory_utilization is not None:
         gpu["memory_utilization"] = cfg.gpu_memory_utilization

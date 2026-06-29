@@ -42,14 +42,14 @@ def test_stop_vllm(mocker):
     _mock_cfg(mocker)
     mock_run = mocker.patch("vserve.serve._systemctl", return_value=(True, "", ""))
     stop_vllm()
-    mock_run.assert_called_once_with("stop", non_interactive=False)
+    mock_run.assert_called_once_with("stop", non_interactive=False, service_name="vllm")
 
 
 def test_stop_vllm_noninteractive_uses_noninteractive_systemctl(mocker):
     _mock_cfg(mocker)
     mock_run = mocker.patch("vserve.serve._systemctl", return_value=(True, "", ""))
     stop_vllm(non_interactive=True)
-    mock_run.assert_called_once_with("stop", non_interactive=True)
+    mock_run.assert_called_once_with("stop", non_interactive=True, service_name="vllm")
 
 
 def test_start_vllm_with_config(mocker, tmp_path):

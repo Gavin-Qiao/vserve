@@ -12,32 +12,70 @@ from vserve.config import (
 )
 
 
-def _assert_vllm_unit_safe_for_privileged_action() -> None:
+def _resolve_vllm_service() -> str:
+    """systemd service for the *currently active* vLLM config.
+
+    Block-diffusion (dLLM) models resolve to ``dllm_service_name`` (a runtime
+    newer than the pinned-stable one); everything else — no dLLM service
+    configured, an AR model, or any read error — resolves to ``service_name``.
+    """
+    c = cfg()
+    dllm = getattr(c, "dllm_service_name", None)
+    if not isinstance(dllm, str) or not dllm:
+        return c.service_name
+    try:
+        from vserve.backends.vllm import _is_block_diffusion
+
+        data = read_profile_yaml(c.active_yaml) or {}
+        model = data.get("model") if isinstance(data, dict) else None
+        if isinstance(model, str) and model and _is_block_diffusion(Path(model)):
+            return dllm
+    except Exception:
+        pass
+    return c.service_name
+
+
+def _configured_vllm_services() -> list[str]:
+    """Every vLLM service vserve may have running (stable + dLLM), so that
+    stop / is-running operate on whichever runtime is currently live."""
+    c = cfg()
+    names = [c.service_name]
+    dllm = getattr(c, "dllm_service_name", None)
+    if isinstance(dllm, str) and dllm and dllm not in names:
+        names.append(dllm)
+    return names
+
+
+def _assert_vllm_unit_safe_for_privileged_action(service_name: str | None = None) -> None:
     """vLLM-specific wrapper around the shared :func:`assert_unit_safe`."""
     from vserve.systemd_helpers import assert_unit_safe
 
     c = cfg()
     assert_unit_safe(
-        service_name=c.service_name,
+        service_name=service_name or c.service_name,
         backend_name="vllm",
         root=c.vllm_root,
         expected_paths=[c.active_yaml],
     )
 
 
-def _systemctl(action: str, timeout: int = 30, *, non_interactive: bool = False) -> tuple[bool, str, str]:
-    """Thin wrapper over :func:`systemctl_call` pinned to vLLM's service name.
+def _systemctl(action: str, timeout: int = 30, *, non_interactive: bool = False,
+               service_name: str | None = None) -> tuple[bool, str, str]:
+    """Thin wrapper over :func:`systemctl_call` for a vLLM service.
 
-    Extracted in 0.6.3 — see ``vserve.systemd_helpers``.
+    ``service_name`` defaults to the service for the *currently active* config
+    — the dLLM runtime for block-diffusion models, else the stable one (see
+    ``backends.vllm.resolve_vllm_service_name``). Extracted in 0.6.3.
     """
     from vserve.systemd_helpers import systemctl_call
 
+    svc = service_name or _resolve_vllm_service()
     return systemctl_call(
-        cfg().service_name,
+        svc,
         action,
         timeout=timeout,
         non_interactive=non_interactive,
-        asserter=_assert_vllm_unit_safe_for_privileged_action,
+        asserter=lambda: _assert_vllm_unit_safe_for_privileged_action(svc),
     )
 
 
@@ -240,18 +278,23 @@ def _service_uses_env_file(env_path: Path) -> bool:
 
 
 def is_vllm_running() -> bool:
-    ok, output, err = _systemctl("is-active", timeout=5)
-    status = output.strip().lower()
-    if ok and status == "active":
-        return True
-    if status in {"inactive", "failed"}:
-        return False
-    if status in {"activating", "deactivating", "reloading"}:
-        raise RuntimeError(f"systemctl is-active {cfg().service_name} is transitional: {status}")
-    if "could not be found" in err.lower():
-        return False
-    if err:
-        raise RuntimeError(f"systemctl is-active {cfg().service_name} failed: {err}")
+    """True if any vLLM runtime (stable or dLLM) is active.
+
+    Checks every configured vLLM service so vserve sees a running backend
+    regardless of which runtime the active config currently points at.
+    """
+    transitional: str | None = None
+    for svc in _configured_vllm_services():
+        ok, output, err = _systemctl("is-active", timeout=5, service_name=svc)
+        status = output.strip().lower()
+        if ok and status == "active":
+            return True
+        if status in {"activating", "deactivating", "reloading"}:
+            transitional = transitional or f"{svc} is transitional: {status}"
+        elif status not in {"inactive", "failed"} and "could not be found" not in err.lower() and err:
+            raise RuntimeError(f"systemctl is-active {svc} failed: {err}")
+    if transitional is not None:
+        raise RuntimeError(f"systemctl is-active {transitional}")
     return False
 
 
@@ -267,7 +310,7 @@ def vllm_restart_count() -> int | None:
 
     try:
         result = subprocess.run(
-            ["systemctl", "show", f"{cfg().service_name}.service",
+            ["systemctl", "show", f"{_resolve_vllm_service()}.service",
              "--property=NRestarts", "--value"],
             capture_output=True, text=True, timeout=5,
         )
@@ -303,6 +346,15 @@ def start_vllm(config_path: Path, *, non_interactive: bool = False) -> None:
 
 
 def stop_vllm(*, non_interactive: bool = False) -> None:
-    ok, _out, err = _systemctl("stop", non_interactive=non_interactive)
-    if not ok:
-        raise RuntimeError(f"systemctl stop failed: {err}")
+    """Stop every configured vLLM runtime (stable and dLLM).
+
+    Stopping an already-inactive service is a no-op, so this is safe; it
+    guarantees no vLLM runtime is left occupying the GPU after a stop.
+    """
+    errors: list[str] = []
+    for svc in _configured_vllm_services():
+        ok, _out, err = _systemctl("stop", non_interactive=non_interactive, service_name=svc)
+        if not ok and "could not be found" not in err.lower():
+            errors.append(f"{svc}: {err}")
+    if errors:
+        raise RuntimeError("systemctl stop failed: " + "; ".join(errors))

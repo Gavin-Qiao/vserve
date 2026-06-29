@@ -1,3 +1,31 @@
+# vserve 0.6.6 Release Notes
+
+**Patch.** Adds per-model vLLM runtime selection so block-diffusion (dLLM)
+models can serve on a separate, newer vLLM service while the pinned-stable
+runtime stays untouched. Install with `pip install vserve` or `uv tool install
+vserve`.
+
+## Per-model vLLM runtime (dLLM on a separate service)
+
+- vserve can now drive a **second vLLM systemd service** for block-diffusion
+  models, configured via a new optional `dllm_service_name`:
+  ```yaml
+  backends:
+    vllm:
+      service_name: vllm               # stable runtime — used for everything by default
+      dllm_service_name: vllm-nightly  # used only for block-diffusion (dLLM) models
+  ```
+- When `vserve run` launches a dLLM (e.g. DiffusionGemma), it resolves to the
+  `dllm_service_name` service; every other model uses the stable `service_name`.
+  `vserve stop`/`status` operate on whichever runtime is live (both services are
+  checked), and a stop tears down both so the GPU is never left occupied.
+- This lets you serve a dLLM on a vLLM build newer than the pinned-stable one
+  (native block-diffusion support needs vLLM ≥ 0.23.1) **without changing your
+  stable runtime** — the default `vllm.service` is never touched. The second
+  service is operator-provided: a copy of `vllm.service` whose `ExecStart` points
+  at the newer venv. Leaving `dllm_service_name` unset preserves the previous
+  single-runtime behavior exactly.
+
 # vserve 0.6.5 Release Notes
 
 **Patch.** Adds serving support for block-diffusion language models
