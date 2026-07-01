@@ -1,3 +1,40 @@
+# vserve 0.6.8b1 Release Notes (beta)
+
+**Beta.** Makes the pre-launch tuner **model-aware** so the auto
+`gpu-memory-utilization` leaves headroom for transient runtime memory — fixing
+serve-time CUDA OOMs on MoE and multimodal models that the old fixed-overhead math
+couldn't see. Not yet GPU-validated across the model zoo, hence beta; install with
+`pip install --pre vserve` or `uv tool install vserve --prerelease allow`.
+
+## Model-aware GPU-memory headroom
+
+The tuner derived `gpu-memory-utilization` as `(vram_total − fixed_overhead) /
+vram_total` and then handed *all* the remaining VRAM to the KV cache. That fixed
+reserve (base 3.5 GB) can't cover the transient memory the static KV math never
+models — per-step activations, the CUDA-graph capture pool, and the FlashInfer
+fp8/NVFP4 kernel autotuner workspace. These spike under concurrent load (MoE expert
+dispatch) and at multimodal vision/audio encoder profiling, so an over-filled GPU
+boots fine single-stream but OOMs under real load.
+
+- **`runtime_headroom_gb(model)`** reserves extra VRAM by model class on top of the
+  base overhead: **+1.5 GB for MoE**, **+2.5 GB for multimodal** (cumulative). On a
+  48 GB card this lands auto util at ~0.895 for a MoE and ~0.843 for a MoE+vision
+  model — matching configs verified stable under load (0.90 / 0.85). The old math
+  produced ~0.93–0.96, which OOM'd under concurrency.
+- **`resolve_gpu_memory_utilization(..., model=...)`** applies the headroom on the
+  **auto path only** — an explicit `--gpu-util` or a configured
+  `gpu.memory_utilization` is honored unchanged (backward compatible).
+- **Multimodal detection** — new `ModelInfo.is_multimodal`, from the standard HF
+  config keys (`vision_config` / `audio_config` / `image_token_id` / …).
+- `vserve run` and `vserve tune` now resolve util **per-model**.
+
+**Not yet validated (why beta):** the headroom constants are calibrated on RTX PRO
+5000 (48 GB, sm120) and not re-benchmarked across other GPUs/models; they err toward
+more headroom. Serving a multimodal model text-only (`--language-model-only`) still
+receives the multimodal reserve — harmless, just leaves extra headroom.
+
+---
+
 # vserve 0.6.7 Release Notes
 
 **Patch.** Moves the pinned-stable vLLM runtime to **0.24.0**, which serves

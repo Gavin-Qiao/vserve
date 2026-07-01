@@ -105,8 +105,14 @@ def get_gpu_info(config: object | None = None) -> GpuInfo:
     )
 
 
+# Base VRAM (GiB) reserved before KV cache for the CUDA context, sampler, and a
+# floor of activation / CUDA-graph memory. Model-class extras (MoE, multimodal) are
+# added on top by resolve_gpu_memory_utilization via models.runtime_headroom_gb.
+DEFAULT_GPU_OVERHEAD_GB = 3.5
+
+
 def compute_gpu_memory_utilization(
-    vram_total_gb: float, overhead_gb: float = 3.5
+    vram_total_gb: float, overhead_gb: float = DEFAULT_GPU_OVERHEAD_GB
 ) -> float:
     """Reserve overhead for CUDA context, activations, CUDA graphs, and sampler."""
     if vram_total_gb <= 0:
@@ -119,8 +125,14 @@ def resolve_gpu_memory_utilization(
     *,
     requested: float | None = None,
     config: object | None = None,
+    model: object | None = None,
 ) -> float:
-    """Resolve the effective GPU memory policy used by add, tune, and run."""
+    """Resolve the effective GPU memory policy used by add, tune, and run.
+
+    When ``model`` is given and the util is auto-derived (no ``requested`` and no
+    configured util), MoE / multimodal models get extra headroom on top of the base
+    overhead so the auto util doesn't OOM under concurrent load or encoder profiling.
+    """
     def _validate(value: float, label: str) -> float:
         if not 0.5 <= value <= 0.99:
             raise ValueError(f"{label} must resolve to a GPU memory utilization between 0.5 and 0.99, got {value:.3f}")
@@ -132,12 +144,21 @@ def resolve_gpu_memory_utilization(
     if configured_util is not None:
         return _validate(float(configured_util), "gpu.memory_utilization")
     configured_overhead = getattr(config, "gpu_overhead_gb", None)
-    if configured_overhead is not None:
-        return _validate(
-            compute_gpu_memory_utilization(vram_total_gb, float(configured_overhead)),
-            "gpu.overhead_gb",
-        )
-    return _validate(compute_gpu_memory_utilization(vram_total_gb), "gpu.overhead_gb")
+    overhead_gb = (
+        float(configured_overhead)
+        if configured_overhead is not None
+        else DEFAULT_GPU_OVERHEAD_GB
+    )
+    # Model-class headroom (MoE / multimodal) on top of the base overhead: the auto
+    # util must leave room for transient activation / CUDA-graph / autotuner memory
+    # or it OOMs under concurrent load. An explicit --gpu-util or a configured
+    # gpu.memory_utilization (both handled above) intentionally skip this.
+    from vserve.models import runtime_headroom_gb
+    overhead_gb += runtime_headroom_gb(model)
+    return _validate(
+        compute_gpu_memory_utilization(vram_total_gb, overhead_gb),
+        "gpu.overhead_gb",
+    )
 
 
 def _configured_gpu_index() -> int:

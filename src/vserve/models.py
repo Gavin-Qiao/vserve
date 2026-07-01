@@ -29,6 +29,7 @@ class ModelInfo:
     quant_tier: str | None = None  # Unsloth Dynamic 2.0 tier (e.g. Q4_K_XL, IQ4_XS, MXFP4_MOE)
     mmproj_path: Path | None = None  # llama.cpp vision/audio projector (mmproj-*.gguf)
     global_head_dim: int | None = None  # Gemma-4 global-attn layer head_dim (when != head_dim)
+    is_multimodal: bool = False  # has a vision/audio tower (needs encoder-profiling VRAM headroom)
 
     @property
     def full_name(self) -> str:
@@ -108,6 +109,35 @@ QUANT_ENV_VARS: dict[str, dict[str, str]] = {
     "mxfp4": {},
     "mxfp4_moe": {},
 }
+
+
+# Extra VRAM (GiB) to hold back from the KV pool, on top of the base CUDA/context
+# overhead, for transient runtime memory the static KV math can't see: per-step
+# activations, the CUDA-graph capture pool, and kernel autotuner (FlashInfer fp8 /
+# NVFP4) workspace. These spike under *concurrent* load (MoE expert dispatch) and at
+# multimodal encoder profiling — the two ways an over-filled GPU OOMs at serve time.
+# Calibrated on RTX PRO 5000 (48 GB, sm120): MoE-only reserve lands util ~0.895 and
+# MoE+vision ~0.843 — matching the empirically-stable 0.90 / 0.85 configs.
+_MOE_RUNTIME_HEADROOM_GB = 1.5
+_MULTIMODAL_RUNTIME_HEADROOM_GB = 2.5
+
+
+def runtime_headroom_gb(model: object | None = None) -> float:
+    """Model-class VRAM headroom (GiB) to reserve beyond the base overhead.
+
+    Returned value is *added* to the GPU overhead before deriving the auto
+    gpu-memory-utilization, so MoE / multimodal models get the transient-memory
+    slack that a single fixed reserve doesn't. Zero for plain dense text models
+    (and when ``model`` is None, preserving the prior behaviour).
+    """
+    if model is None:
+        return 0.0
+    reserve = 0.0
+    if getattr(model, "is_moe", False):
+        reserve += _MOE_RUNTIME_HEADROOM_GB
+    if getattr(model, "is_multimodal", False):
+        reserve += _MULTIMODAL_RUNTIME_HEADROOM_GB
+    return reserve
 
 
 def recommend_quant_for_arch(sm: int, is_moe: bool, available_quants: set[str] | None = None) -> str | None:
@@ -284,6 +314,19 @@ def detect_model(model_dir: Path) -> ModelInfo:
     )
     is_moe = num_experts is not None and num_experts > 0
 
+    # Multimodal = ships a vision/audio tower. vLLM runs a real encoder forward on
+    # dummy items at startup (profiling), and the encoder weights + that transient
+    # need VRAM the KV math doesn't reserve — so these need extra headroom (or
+    # --language-model-only). Detect from the standard HF multimodal config keys.
+    is_multimodal = (
+        config.get("vision_config") is not None
+        or config.get("audio_config") is not None
+        or any(
+            k in config
+            for k in ("image_token_id", "image_token_index", "video_token_id", "audio_token_id")
+        )
+    )
+
     # Architecture fields for KV cache calculation
     num_kv_heads = text_config.get(
         "num_key_value_heads",
@@ -339,6 +382,7 @@ def detect_model(model_dir: Path) -> ModelInfo:
         quant_method=qmethod,
         max_position_embeddings=max_pos,
         is_moe=is_moe,
+        is_multimodal=is_multimodal,
         model_size_gb=size_gb,
         num_kv_heads=num_kv_heads,
         num_layers=num_layers,

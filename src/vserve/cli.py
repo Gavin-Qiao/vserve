@@ -1352,7 +1352,7 @@ def _auto_tune_downloaded_model(info: ModelInfo) -> None:
 
         backend = get_backend(info)
         gpu = get_gpu_info()
-        gpu_mem_util = resolve_gpu_memory_utilization(gpu.vram_total_gb, config=_cfg3())
+        gpu_mem_util = resolve_gpu_memory_utilization(gpu.vram_total_gb, config=_cfg3(), model=info)
         console.print(f"\n[dim]Auto-tuning for {gpu.name}...[/dim]")
         limits_data = backend.tune(info, gpu, gpu_mem_util=gpu_mem_util)
         runtime_info = None
@@ -1481,6 +1481,8 @@ def tune(
         console.print("[red]--bench-requests must be between 1 and 32[/red]")
         raise typer.Exit(1)
 
+    requested_gpu_util = gpu_util  # explicit --gpu-util (None = auto); kept before reassignment below
+
     from vserve.gpu import get_gpu_info, compute_gpu_memory_utilization, resolve_gpu_memory_utilization
     from vserve.config import limits_cache_matches, write_limits
     from vserve.runtime import build_tuning_fingerprint
@@ -1549,6 +1551,17 @@ def tune(
             console.print(f"[bold]{m.full_name}[/bold]  [red]No backend available[/red]")
             continue
 
+        # Per-model auto util: MoE / multimodal get transient-memory headroom so the
+        # served util doesn't OOM under load. An explicit --gpu-util is honored as-is;
+        # a configured util is picked up by resolve() from cfg() with no headroom.
+        if requested_gpu_util is None:
+            from vserve.config import cfg as _cfg_tune
+            gpu_util_m = resolve_gpu_memory_utilization(
+                gpu.vram_total_gb, config=_cfg_tune(), model=m
+            )
+        else:
+            gpu_util_m = gpu_util
+
         runtime_info = None
         runtime_info_fn = getattr(backend, "runtime_info", None)
         if callable(runtime_info_fn):
@@ -1560,7 +1573,7 @@ def tune(
             model_info=m,
             gpu=gpu,
             backend=backend.name,
-            gpu_mem_util=gpu_util,
+            gpu_mem_util=gpu_util_m,
             runtime_info=runtime_info,
         )
 
@@ -1588,7 +1601,7 @@ def tune(
                 continue
 
             try:
-                limits_data = backend.tune(m, gpu, gpu_mem_util=gpu_util)
+                limits_data = backend.tune(m, gpu, gpu_mem_util=gpu_util_m)
             except Exception as e:
                 console.print(f"[bold]{m.full_name}[/bold]  [red]{e}[/red]")
                 continue
@@ -1601,7 +1614,7 @@ def tune(
                 m,
                 backend,
                 limits_data,
-                gpu_mem_util=gpu_util,
+                gpu_mem_util=gpu_util_m,
                 bench_seconds=bench_seconds,
                 bench_candidates=bench_candidates,
                 bench_requests=bench_requests,
@@ -2845,6 +2858,7 @@ def _scripted_config(
         gpu.vram_total_gb,
         requested=gpu_util,
         config=config_module.cfg(),
+        model=m,
     )
     need_tuned_defaults = context is None or slots is None
     if backend.name == "vllm":

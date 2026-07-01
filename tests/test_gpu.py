@@ -229,3 +229,57 @@ def test_compute_cap_falls_back_to_none_when_garbled(mocker):
     mocker.patch("vserve.gpu._get_cuda_version", return_value="13.0")
     info = get_gpu_info()
     assert info.compute_cap is None
+
+
+def _headroom_model(*, is_moe=False, is_multimodal=False):
+    from vserve.models import ModelInfo
+    from pathlib import Path
+    return ModelInfo(
+        path=Path("/fake"),
+        provider="p",
+        model_name="m",
+        architecture="Arch",
+        model_type="t",
+        quant_method=None,
+        max_position_embeddings=32768,
+        is_moe=is_moe,
+        model_size_gb=20.0,
+        is_multimodal=is_multimodal,
+    )
+
+
+def test_resolve_gpu_util_auto_no_model_matches_base_overhead():
+    # model=None preserves the prior behaviour: base 3.5 GB overhead, no extra.
+    assert resolve_gpu_memory_utilization(47.8, model=None) == pytest.approx((47.8 - 3.5) / 47.8)
+
+
+def test_resolve_gpu_util_moe_reserves_extra_headroom():
+    base = resolve_gpu_memory_utilization(47.8, model=None)
+    moe = resolve_gpu_memory_utilization(47.8, model=_headroom_model(is_moe=True))
+    assert moe < base
+    assert moe == pytest.approx((47.8 - 5.0) / 47.8)  # 3.5 base + 1.5 MoE
+
+
+def test_resolve_gpu_util_multimodal_reserves_most():
+    moe = resolve_gpu_memory_utilization(47.8, model=_headroom_model(is_moe=True))
+    mm = resolve_gpu_memory_utilization(47.8, model=_headroom_model(is_multimodal=True))
+    mm_moe = resolve_gpu_memory_utilization(
+        47.8, model=_headroom_model(is_moe=True, is_multimodal=True)
+    )
+    assert mm == pytest.approx((47.8 - 6.0) / 47.8)      # 3.5 + 2.5
+    assert mm_moe == pytest.approx((47.8 - 7.5) / 47.8)  # 3.5 + 2.5 + 1.5
+    assert mm_moe < mm and mm_moe < moe
+
+
+def test_resolve_gpu_util_explicit_request_ignores_model_headroom():
+    # An explicit --gpu-util wins as-is; model headroom is not applied.
+    got = resolve_gpu_memory_utilization(
+        47.8, requested=0.95, model=_headroom_model(is_moe=True, is_multimodal=True)
+    )
+    assert got == pytest.approx(0.95)
+
+
+def test_resolve_gpu_util_configured_util_ignores_model_headroom():
+    cfg = MagicMock(gpu_memory_utilization=0.88, gpu_overhead_gb=None)
+    got = resolve_gpu_memory_utilization(47.8, config=cfg, model=_headroom_model(is_moe=True))
+    assert got == pytest.approx(0.88)

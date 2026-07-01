@@ -7,6 +7,8 @@ from vserve.models import (
     scan_models,
     fuzzy_match,
     quant_flag,
+    runtime_headroom_gb,
+    ModelInfo,
 )
 
 
@@ -46,6 +48,95 @@ def test_detect_model_head_dim_from_hidden_size(tmp_path):
     (model_dir / "model.safetensors").write_bytes(b"\0" * 512)
     info = detect_model(model_dir)
     assert info.head_dim == 128  # 8192 / 64
+
+
+def test_detect_model_multimodal_from_vision_config(tmp_path):
+    """A vision_config marks the model multimodal → needs encoder VRAM headroom."""
+    import json
+    model_dir = tmp_path / "models" / "test" / "VisionMoe"
+    model_dir.mkdir(parents=True)
+    config = {
+        "architectures": ["SomeMoeForConditionalGeneration"],
+        "model_type": "some_moe",
+        "vision_config": {"hidden_size": 1152},
+        "image_token_id": 12345,
+        "text_config": {
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 40,
+            "head_dim": 128,
+            "num_experts": 128,
+        },
+    }
+    (model_dir / "config.json").write_text(json.dumps(config))
+    (model_dir / "model.safetensors").write_bytes(b"\0" * 512)
+    info = detect_model(model_dir)
+    assert info.is_multimodal is True
+    assert info.is_moe is True
+
+
+def test_detect_model_multimodal_from_image_token_only(tmp_path):
+    """image_token_index alone (no vision_config block) still flags multimodal."""
+    import json
+    model_dir = tmp_path / "models" / "test" / "ImgToken"
+    model_dir.mkdir(parents=True)
+    config = {
+        "architectures": ["XForConditionalGeneration"],
+        "model_type": "x",
+        "image_token_index": 32000,
+        "text_config": {"num_key_value_heads": 8, "num_hidden_layers": 32, "head_dim": 128},
+    }
+    (model_dir / "config.json").write_text(json.dumps(config))
+    (model_dir / "model.safetensors").write_bytes(b"\0" * 512)
+    assert detect_model(model_dir).is_multimodal is True
+
+
+def test_detect_model_text_only_not_multimodal(tmp_path):
+    import json
+    model_dir = tmp_path / "models" / "test" / "PlainText"
+    model_dir.mkdir(parents=True)
+    config = {
+        "architectures": ["PlainForCausalLM"],
+        "model_type": "plain",
+        "text_config": {"num_key_value_heads": 8, "num_hidden_layers": 32, "head_dim": 128},
+    }
+    (model_dir / "config.json").write_text(json.dumps(config))
+    (model_dir / "model.safetensors").write_bytes(b"\0" * 512)
+    assert detect_model(model_dir).is_multimodal is False
+
+
+def _headroom_model(*, is_moe=False, is_multimodal=False):
+    from pathlib import Path
+    return ModelInfo(
+        path=Path("/fake"),
+        provider="p",
+        model_name="m",
+        architecture="Arch",
+        model_type="t",
+        quant_method=None,
+        max_position_embeddings=32768,
+        is_moe=is_moe,
+        model_size_gb=20.0,
+        is_multimodal=is_multimodal,
+    )
+
+
+def test_runtime_headroom_none_and_plain_are_zero():
+    assert runtime_headroom_gb(None) == 0.0
+    assert runtime_headroom_gb(_headroom_model()) == 0.0
+
+
+def test_runtime_headroom_moe():
+    assert runtime_headroom_gb(_headroom_model(is_moe=True)) == pytest.approx(1.5)
+
+
+def test_runtime_headroom_multimodal():
+    assert runtime_headroom_gb(_headroom_model(is_multimodal=True)) == pytest.approx(2.5)
+
+
+def test_runtime_headroom_moe_and_multimodal_stack():
+    assert runtime_headroom_gb(
+        _headroom_model(is_moe=True, is_multimodal=True)
+    ) == pytest.approx(4.0)
 
 
 def test_detect_model_size_includes_bin_weights(tmp_path):
