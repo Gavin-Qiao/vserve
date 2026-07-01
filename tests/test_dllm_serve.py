@@ -142,48 +142,23 @@ class TestCrashLoopGuard:
         assert self._wait(restart_seq=[0], timeout_s=5) == "timeout"
 
 
-class TestPerModelServiceResolution:
-    """vserve drives a separate dLLM service so dLLMs run on a newer runtime
-    while the pinned-stable service stays untouched."""
+class TestServiceResolutionSingleRuntime:
+    """A single vLLM runtime serves everything: dLLMs serve natively on the
+    pinned-stable service (vLLM 0.24.0+), so there is no separate dLLM service."""
 
-    def _cfg(self, mocker, tmp_path, *, dllm_service_name, model_path):
+    def _cfg(self, mocker, *, service_name="vllm"):
         from unittest.mock import Mock
-        active = tmp_path / "active.yaml"
-        if model_path is not None:
-            active.write_text(f"model: {model_path}\n")
         c = Mock()
-        c.service_name = "vllm"
-        c.dllm_service_name = dllm_service_name
-        c.active_yaml = active
+        c.service_name = service_name
         mocker.patch("vserve.serve.cfg", return_value=c)
         return c
 
-    def test_dllm_model_resolves_to_nightly_service(self, mocker, tmp_path):
+    def test_dllm_resolves_to_stable_service(self, mocker):
         from vserve.serve import _resolve_vllm_service
-        m = _make_dllm_model(tmp_path)
-        self._cfg(mocker, tmp_path, dllm_service_name="vllm-nightly", model_path=m.path)
-        assert _resolve_vllm_service() == "vllm-nightly"
-
-    def test_ar_model_resolves_to_stable_service(self, mocker, tmp_path):
-        from vserve.serve import _resolve_vllm_service
-        ar = tmp_path / "ar"
-        ar.mkdir()
-        (ar / "config.json").write_text(json.dumps({"architectures": ["Gemma4ForCausalLM"]}))
-        self._cfg(mocker, tmp_path, dllm_service_name="vllm-nightly", model_path=ar)
+        self._cfg(mocker)
         assert _resolve_vllm_service() == "vllm"
 
-    def test_no_dllm_service_configured_stays_stable(self, mocker, tmp_path):
-        from vserve.serve import _resolve_vllm_service
-        m = _make_dllm_model(tmp_path)
-        self._cfg(mocker, tmp_path, dllm_service_name=None, model_path=m.path)
-        assert _resolve_vllm_service() == "vllm"
-
-    def test_configured_services_lists_both(self, mocker, tmp_path):
+    def test_configured_services_is_single(self, mocker):
         from vserve.serve import _configured_vllm_services
-        self._cfg(mocker, tmp_path, dllm_service_name="vllm-nightly", model_path=None)
-        assert _configured_vllm_services() == ["vllm", "vllm-nightly"]
-
-    def test_configured_services_stable_only(self, mocker, tmp_path):
-        from vserve.serve import _configured_vllm_services
-        self._cfg(mocker, tmp_path, dllm_service_name=None, model_path=None)
+        self._cfg(mocker)
         assert _configured_vllm_services() == ["vllm"]

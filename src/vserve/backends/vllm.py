@@ -88,20 +88,11 @@ def _is_block_diffusion(model_path: Path) -> bool:
 
 
 def resolve_vllm_service_name() -> str:
-    """Service for the active vLLM config — the dLLM runtime for block-diffusion
-    models, else the stable one. Thin alias over ``serve._resolve_vllm_service``;
+    """The vLLM backend service. Thin alias over ``serve._resolve_vllm_service``;
     the implementation lives in serve.py so it shares serve's ``cfg``."""
     from vserve.serve import _resolve_vllm_service
 
     return _resolve_vllm_service()
-
-
-def configured_vllm_service_names() -> list[str]:
-    """All vLLM services vserve may have running (stable + dLLM). Thin alias
-    over ``serve._configured_vllm_services``."""
-    from vserve.serve import _configured_vllm_services
-
-    return _configured_vllm_services()
 
 
 def _architecture_forces_triton_attn(model_path: Path) -> bool:

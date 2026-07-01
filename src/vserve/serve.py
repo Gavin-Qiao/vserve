@@ -13,37 +13,20 @@ from vserve.config import (
 
 
 def _resolve_vllm_service() -> str:
-    """systemd service for the *currently active* vLLM config.
+    """systemd service for the vLLM backend.
 
-    Block-diffusion (dLLM) models resolve to ``dllm_service_name`` (a runtime
-    newer than the pinned-stable one); everything else — no dLLM service
-    configured, an AR model, or any read error — resolves to ``service_name``.
+    A single vLLM runtime serves everything. Block-diffusion (dLLM) models like
+    DiffusionGemma serve natively on the pinned-stable runtime (vLLM 0.24.0+),
+    so they use the same ``service_name`` as autoregressive models.
     """
-    c = cfg()
-    dllm = getattr(c, "dllm_service_name", None)
-    if not isinstance(dllm, str) or not dllm:
-        return c.service_name
-    try:
-        from vserve.backends.vllm import _is_block_diffusion
-
-        data = read_profile_yaml(c.active_yaml) or {}
-        model = data.get("model") if isinstance(data, dict) else None
-        if isinstance(model, str) and model and _is_block_diffusion(Path(model)):
-            return dllm
-    except Exception:
-        pass
-    return c.service_name
+    return cfg().service_name
 
 
 def _configured_vllm_services() -> list[str]:
-    """Every vLLM service vserve may have running (stable + dLLM), so that
-    stop / is-running operate on whichever runtime is currently live."""
-    c = cfg()
-    names = [c.service_name]
-    dllm = getattr(c, "dllm_service_name", None)
-    if isinstance(dllm, str) and dllm and dllm not in names:
-        names.append(dllm)
-    return names
+    """The vLLM service(s) vserve may have running — a single runtime now that
+    dLLMs serve on the pinned-stable service alongside everything else. Kept as
+    a list so ``stop`` / ``is-running`` share one iteration point."""
+    return [cfg().service_name]
 
 
 def _assert_vllm_unit_safe_for_privileged_action(service_name: str | None = None) -> None:
@@ -63,8 +46,7 @@ def _systemctl(action: str, timeout: int = 30, *, non_interactive: bool = False,
                service_name: str | None = None) -> tuple[bool, str, str]:
     """Thin wrapper over :func:`systemctl_call` for a vLLM service.
 
-    ``service_name`` defaults to the service for the *currently active* config
-    — the dLLM runtime for block-diffusion models, else the stable one (see
+    ``service_name`` defaults to the vLLM backend service (see
     ``backends.vllm.resolve_vllm_service_name``). Extracted in 0.6.3.
     """
     from vserve.systemd_helpers import systemctl_call

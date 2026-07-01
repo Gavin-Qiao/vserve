@@ -525,7 +525,7 @@ class TestVllmBackend:
     def test_configured_service_identity(self, mocker):
         b = VllmBackend()
         m = Mock(service_name="custom-vllm", service_user="svc-vllm",
-                 vllm_root=Path("/opt/vllm"), dllm_service_name=None)
+                 vllm_root=Path("/opt/vllm"))
         # service_name resolves via serve._resolve_vllm_service (serve's cfg);
         # service_user reads config.cfg. Point both at the same config.
         mocker.patch("vserve.config.cfg", return_value=m)

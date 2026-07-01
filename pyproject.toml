@@ -1,6 +1,6 @@
 [project]
 name = "vserve"
-version = "0.6.6"
+version = "0.6.7"
 description = "CLI for managing LLM inference on GPU workstations"
 readme = "README.md"
 license = "MIT"
@@ -18,20 +18,20 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "typer>=0.15",
-    "rich>=14",
-    "huggingface-hub>=0.30",
+    "typer>=0.25",
+    "rich>=15",
+    "huggingface-hub>=1.21",
     "pyyaml>=6",
-    "nvidia-ml-py>=13.595.45",
+    "nvidia-ml-py>=13.610.43",
     "simple-term-menu>=1.6",
-    "packaging>=24",
+    "packaging>=26",
 ]
 
 [project.optional-dependencies]
-llamacpp = ["gguf>=0.6"]
+llamacpp = ["gguf>=0.19"]
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-mock>=3", "ruff>=0.15", "mypy>=1.15", "types-PyYAML>=6", "types-requests>=2.33"]
+dev = ["pytest>=9", "pytest-mock>=3", "ruff>=0.15", "mypy>=2.1", "types-PyYAML>=6", "types-requests>=2.33"]
 
 [project.urls]
 Homepage = "https://github.com/Gavin-Qiao/vserve"

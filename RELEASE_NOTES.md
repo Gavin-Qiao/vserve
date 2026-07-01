@@ -1,3 +1,64 @@
+# vserve 0.6.7 Release Notes
+
+**Patch.** Moves the pinned-stable vLLM runtime to **0.24.0**, which serves
+block-diffusion (dLLM) models like DiffusionGemma natively — so dLLMs no longer
+need a separate newer runtime. Install with `pip install vserve` or `uv tool
+install vserve`.
+
+## vLLM 0.24.0 support
+
+- Support range widens to `>=0.20,<0.25` and the pinned-stable runtime moves
+  from `0.23.0` to **`0.24.0`** (`vserve runtime upgrade vllm --stable`).
+- **Native block-diffusion (dLLM) on the stable runtime.** vLLM 0.24 lands
+  DiffusionGemma in-tree on the V2 model-runner ModelState hooks (vllm#45163).
+  vserve's dLLM serve recipe is unchanged and now runs on the *stable* service:
+  `VLLM_USE_V2_MODEL_RUNNER=1`, `--trust-remote-code`, the entropy-bound
+  diffusion sampler (via `--hf-overrides`), `--attention-backend TRITON_ATTN`, a
+  host-RAM-bounded `runai_streamer` load, and the tuned `max-num-seqs 16` /
+  `gpu-memory-utilization 0.70` diffusion-state caps.
+- **Removed the `dllm_service_name` second-service compromise (added 0.6.6).**
+  With native dLLM support in the stable runtime, the separate newer-vLLM
+  service is gone — dLLMs serve on the single `service_name` like every other
+  model. The `dllm_service_name` config key is no longer read; a leftover key in
+  an existing `config.yaml` is silently ignored. Operational cleanup once on
+  0.24.0: drop `dllm_service_name` from your config and decommission the
+  `vllm-nightly` service and its venv (the temporary runtime is no longer
+  needed).
+
+## vLLM 0.24.0 compatibility notes
+
+- **`CUDA_VISIBLE_DEVICES` (vllm#45026):** vLLM 0.24 no longer *sets* it
+  internally (it adds an optional `--device-ids` for topology) but still
+  *respects* an externally-set value. vserve pins the GPU via
+  `CUDA_VISIBLE_DEVICES` in the systemd EnvironmentFile, so single-GPU serving
+  is unaffected.
+- **Transformers v5 required:** 0.24 drops the Transformers v4 compatibility
+  shim (the box already runs 5.12.1). Point the runtime at a Transformers 5.x
+  environment.
+- **Removed models:** 0.24 removes ERNIE, Xverse, Dots1, Bamba, Mono-InternVL,
+  and first-generation Qwen/QwenVL. vserve's arch-registry entries for these are
+  inert unless such a model is present, so no action is needed.
+
+## Runtime note
+
+- Bumping the pinned-stable runtime assumes a GPU soak-test of vLLM 0.24.0 on
+  the target box (the same gate used for the 0.23.0 pin). vserve emits the
+  correct config regardless of the installed build; `vserve runtime check vllm`
+  accepts the full `>=0.20,<0.25` range.
+
+## Dependencies
+
+- Bumped dependency floors to the newest compatible versions and refreshed the
+  lockfile — verified against the full test suite, `ruff`, and `mypy`. Runtime:
+  `huggingface-hub>=1.21` (was `>=0.30`), `rich>=15` (was `>=14`), `typer>=0.25`
+  (was `>=0.15`; capped below 0.26 by huggingface-hub 1.21's own `typer<0.26`
+  pin), `packaging>=26` (was `>=24`), `nvidia-ml-py>=13.610.43`. Optional:
+  `gguf>=0.19` (was `>=0.6`). Dev: `pytest>=9` (was `>=8`), `mypy>=2.1` (was
+  `>=1.15`; pulls the new `ast-serialize` transitive). `rich` 15 and `mypy` 2
+  are major bumps — `ruff` and `mypy` both pass clean on the bumped versions.
+- vLLM is not a declared dependency (it's detected at runtime); its pin already
+  tracks the newest release, 0.24.0 (no 0.24.x patch or 0.25 exists yet).
+
 # vserve 0.6.6 Release Notes
 
 **Patch.** Adds per-model vLLM runtime selection so block-diffusion (dLLM)
