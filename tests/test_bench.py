@@ -320,3 +320,71 @@ class TestReasoningDeltaCounting:
         assert result.requests_completed >= 1
         assert result.ttft_ms_p50 is not None
         assert result.tpot_ms_p50 is not None
+
+
+class TestSpecDecodeCounters:
+    """0.6.8: /metrics spec-decode counter scrape used by `vserve bench`."""
+
+    METRICS = "\n".join([
+        "# HELP vllm:spec_decode_num_drafts_total ...",
+        'vllm:spec_decode_num_drafts_total{engine="0",model_name="m"} 6620.0',
+        'vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="m"} 19860.0',
+        'vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="m"} 11905.0',
+        'vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",position="0"} 5183.0',
+        'vllm:num_requests_running{engine="0"} 1.0',
+    ])
+
+    def test_parses_labeled_counters(self):
+        from vserve.bench import read_spec_decode_counters
+        out = read_spec_decode_counters("http://x", fetch=lambda url: self.METRICS)
+        assert out == {"drafts": 6620.0, "draft_tokens": 19860.0, "accepted_tokens": 11905.0}
+
+    def test_returns_none_without_spec_counters(self):
+        from vserve.bench import read_spec_decode_counters
+        out = read_spec_decode_counters("http://x", fetch=lambda url: "vllm:num_requests_running 0.0")
+        assert out is None
+
+    def test_returns_none_on_fetch_error(self):
+        from vserve.bench import read_spec_decode_counters
+
+        def boom(url):
+            raise OSError("refused")
+
+        assert read_spec_decode_counters("http://x", fetch=boom) is None
+
+    def test_sums_across_label_sets(self):
+        from vserve.bench import read_spec_decode_counters
+        text = (
+            'vllm:spec_decode_num_drafts_total{engine="0"} 10.0\n'
+            'vllm:spec_decode_num_drafts_total{engine="1"} 5.0\n'
+            'vllm:spec_decode_num_draft_tokens_total{engine="0"} 30.0\n'
+        )
+        out = read_spec_decode_counters("http://x", fetch=lambda url: text)
+        assert out is not None
+        assert out["drafts"] == 15.0
+
+
+class TestSpecDecodeStats:
+    def test_window_delta_and_rates(self):
+        from vserve.bench import spec_decode_stats
+        before = {"drafts": 100.0, "draft_tokens": 300.0, "accepted_tokens": 200.0}
+        after = {"drafts": 200.0, "draft_tokens": 600.0, "accepted_tokens": 380.0}
+        stats = spec_decode_stats(before, after)
+        assert stats is not None
+        assert stats["drafts"] == 100
+        assert stats["draft_tokens"] == 300
+        assert stats["accepted_tokens"] == 180
+        assert stats["acceptance_rate"] == 180 / 300
+        assert stats["mean_accepted_per_step"] == 1.8
+
+    def test_none_before_degrades_to_lifetime(self):
+        from vserve.bench import spec_decode_stats
+        after = {"drafts": 10.0, "draft_tokens": 30.0, "accepted_tokens": 18.0}
+        stats = spec_decode_stats(None, after)
+        assert stats is not None and stats["acceptance_rate"] == 0.6
+
+    def test_no_activity_returns_none(self):
+        from vserve.bench import spec_decode_stats
+        same = {"drafts": 100.0, "draft_tokens": 300.0, "accepted_tokens": 200.0}
+        assert spec_decode_stats(same, dict(same)) is None
+        assert spec_decode_stats(None, None) is None

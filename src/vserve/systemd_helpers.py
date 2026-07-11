@@ -115,6 +115,36 @@ def systemctl_call(
     return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
 
 
+def unit_memory_max(service_name: str) -> str | None:
+    """The unit's effective ``MemoryMax`` (e.g. ``"50G"``), or None.
+
+    None means "no cap": the property is unset/``infinity``, the unit is
+    unknown, or systemctl failed. Read-only (`systemctl show`), no sudo.
+    This is the host-RAM OOM guard vserve expects on managed inference
+    units — an uncapped vLLM boot can freeze the host via JIT/compile
+    storms (see docs/plans/2026-07-10-qwen36-64k-mtp-speed.md, RAM notes).
+    """
+    try:
+        validate_systemd_service_name(service_name)
+    except Exception:
+        return None
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", service_name, "-p", "MemoryMax", "--value"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    value = (result.stdout or "").strip()
+    if not value or value == "infinity":
+        return None
+    return value
+
+
 def parse_is_active_output(stdout: str, stderr: str, ok: bool, *, service_name: str) -> bool | None:
     """Interpret ``systemctl is-active`` output as a tri-state.
 

@@ -6,7 +6,15 @@ Three independent shapes:
   vserve keeps it off there — benchmarked net-negative for batched serving
   (docs/research/2026-06-19-llamacpp-throughput-goedel.md).
 - ``draft``: pair a small (≤1.5B) same-family model as the speculator.
-- ``mtp``: Multi-Token Prediction variant GGUF (Unsloth Qwen3.6 family).
+- ``mtp``: Multi-Token Prediction. Two flavors:
+  * in-checkpoint (vLLM >= 0.24 unified ``method: mtp``): the checkpoint
+    itself carries the MTP draft layers — Qwen3.5/3.6 ``mtp_num_hidden_layers``,
+    DeepSeek/GLM/Qwen3-Next-style ``num_nextn_predict_layers``, MiniMax
+    ``num_mtp_modules``. No draft model path; vLLM loads the layers from the
+    target checkpoint (see :func:`native_mtp_layers`).
+  * sibling variant: a separate ``-MTP``-suffixed checkpoint next to the model
+    dir used as the draft (Unsloth Qwen3.6 MTP-GGUF family; the only MTP
+    flavor llama.cpp supports).
 
 Blocklists:
 - A3B-style MoE: spec-decode is net-negative on RTX 3090 per llamacpp#19493
@@ -19,6 +27,7 @@ Blocklists:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -31,6 +40,64 @@ class SpecConfig:
     n_max: int = 5        # max speculated tokens per step
     n_min: int = 1        # min speculated tokens per step
     p_min: float = 0.6    # acceptance threshold
+
+
+# Default MTP speculation depth. num_speculative_tokens=1 is the worst
+# non-zero setting (-19% decode on Qwen3.6-27B FP8; min useful depth is 2)
+# and k=3 wins on the acceptance-vs-depth curve — see
+# docs/research/2026-05-20-spec-decode-acceptance.md §5/§6 + action item 1.
+MTP_NUM_SPECULATIVE_TOKENS = 3
+
+# ngram (prompt-lookup) default depth — vLLM's own ngram default range.
+NGRAM_NUM_SPECULATIVE_TOKENS = 5
+
+# config.json keys that mark in-checkpoint MTP draft layers, mirroring the
+# detection in vLLM 0.24's SpeculativeConfig (which rewrites these into
+# ``n_predict`` per model family).
+_NATIVE_MTP_LAYER_KEYS: tuple[str, ...] = (
+    "mtp_num_hidden_layers",     # Qwen3.5/3.6 (top-level or text_config)
+    "num_nextn_predict_layers",  # DeepSeek V3/V4, GLM-4.x MoE, Qwen3-Next,
+                                 # Nemotron-H, ERNIE, LongCat, HY-V3, Exaone-MoE
+    "num_mtp_modules",           # MiniMax M3
+)
+
+
+def native_mtp_layers(model_path: Path) -> int | None:
+    """Number of in-checkpoint MTP draft layers (``n_predict``), or None.
+
+    Reads config.json at the top level and inside ``text_config`` (VLM-style
+    checkpoints such as Qwen3.5/3.6 keep the MTP keys on the text sub-config).
+    Only a positive integer counts — 0 means the checkpoint shipped without
+    its MTP head.
+    """
+    try:
+        cfg = json.loads((model_path / "config.json").read_text())
+    except Exception:
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    subconfigs = [cfg]
+    text_config = cfg.get("text_config")
+    if isinstance(text_config, dict):
+        subconfigs.append(text_config)
+    for sub in subconfigs:
+        for key in _NATIVE_MTP_LAYER_KEYS:
+            n = sub.get(key)
+            if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                return n
+    return None
+
+
+def _default_mtp_tokens(n_predict: int | None) -> int:
+    """Speculation depth for MTP given the checkpoint's draft-layer count.
+
+    n_predict=1 (the common case — Qwen3.5/3.6 ship one MTP layer) reuses the
+    module 3× per the acceptance research; deeper native stacks run at their
+    own depth so no reuse (and no divisibility constraint) is involved.
+    """
+    if n_predict is None or n_predict <= 1:
+        return MTP_NUM_SPECULATIVE_TOKENS
+    return n_predict
 
 
 # Architecture → recommended spec method. ``mtp`` is only chosen if a
@@ -54,6 +121,14 @@ SPEC_METHOD_BY_ARCH: dict[str, str] = {
 SPEC_BLOCKLIST: frozenset[str] = frozenset({
     "Qwen3A3BForCausalLM",
     "Qwen3MoeForCausalLM",
+    # Qwen3.5/3.6 MoE-A3B: measured 2026-07-10 on RTX PRO 5000 (sm120),
+    # vLLM 0.24, NVFP4 — in-checkpoint MTP k=3 hit 60% acceptance yet decoded
+    # at −52% (c1) / −53% (c8) vs no-spec: the (k+1)-token verify step
+    # multiplies MoE expert weight traffic and the bf16 (quant-excluded)
+    # draft layer adds sequential forwards. Expert saturation dominates even
+    # on Blackwell. Explicit `--mtp` / force=True still allow it.
+    "Qwen3_5MoeForConditionalGeneration",
+    "Qwen36MoeForCausalLM",  # GGUF short-name twin of the same A3B family
     "GptOssForCausalLM",  # was misspelled as GptOssMoeForCausalLM — never matched any model
     "MixtralForCausalLM",
     "DeepseekV2ForCausalLM",
@@ -120,6 +195,123 @@ def find_mtp_variant(model_path: Path) -> Path | None:
     return None
 
 
+def resolve_mtp_request(
+    *,
+    backend: str,
+    model_path: Path,
+    num_tokens: int | None = None,
+) -> SpecConfig:
+    """Resolve an explicit MTP request (``vserve run --mtp``) into a SpecConfig.
+
+    Unlike :func:`pick_spec_config` (the recommendation engine), an explicit
+    request skips the blocklist — the user asked for MTP, so they get MTP or
+    a ``ValueError`` explaining exactly why it can't work here. It never
+    silently substitutes another spec method.
+
+    vLLM: prefer in-checkpoint MTP layers (draft_model_path=None → the
+    ``speculative-config`` block carries no ``model`` key and vLLM loads the
+    draft layers from the target checkpoint); fall back to a sibling ``-MTP``
+    variant checkpoint. llama.cpp: sibling MTP-variant GGUF only — GGUF
+    conversions don't carry the safetensors MTP head.
+    """
+    if num_tokens is not None and num_tokens < 1:
+        raise ValueError("MTP speculation depth (--mtp-tokens) must be >= 1.")
+    if backend == "vllm":
+        n_predict = native_mtp_layers(model_path)
+        if n_predict is not None:
+            tokens = num_tokens if num_tokens is not None else _default_mtp_tokens(n_predict)
+            if tokens > n_predict and tokens % n_predict != 0:
+                # vLLM reuses the MTP module for depths beyond n_predict and
+                # requires divisibility — fail here instead of at engine boot.
+                raise ValueError(
+                    f"--mtp-tokens {tokens} must be a multiple of the checkpoint's "
+                    f"{n_predict} MTP layer(s) (vLLM MTP module reuse)."
+                )
+            return SpecConfig(method="mtp", draft_model_path=None, n_max=tokens)
+        variant = find_mtp_variant(model_path)
+        if variant is not None:
+            return SpecConfig(
+                method="mtp",
+                draft_model_path=variant,
+                n_max=num_tokens if num_tokens is not None else MTP_NUM_SPECULATIVE_TOKENS,
+            )
+        raise ValueError(
+            "This checkpoint has no MTP weights: config.json has none of "
+            f"{'/'.join(_NATIVE_MTP_LAYER_KEYS)} and no MTP-variant sibling "
+            "checkpoint exists next to the model directory."
+        )
+    variant = find_mtp_variant(model_path)
+    if variant is None:
+        raise ValueError(
+            "MTP on llama.cpp needs an MTP-variant GGUF sibling next to the "
+            "model directory (e.g. Unsloth *-MTP-GGUF); none was found."
+        )
+    return SpecConfig(
+        method="mtp",
+        draft_model_path=variant,
+        n_max=num_tokens if num_tokens is not None else MTP_NUM_SPECULATIVE_TOKENS,
+    )
+
+
+def resolve_spec_request(
+    *,
+    method: str,
+    backend: str,
+    model_path: Path,
+    architecture: str | None = None,
+    bos_token_id: int | None = None,
+    eos_token_id: int | None = None,
+    tools_enabled: bool = False,
+    available_drafts: Iterable[DraftCandidate] = (),
+    num_tokens: int | None = None,
+) -> SpecConfig | None:
+    """Resolve an explicit ``vserve run --spec METHOD`` request.
+
+    ``method`` is one of ``auto | ngram | mtp | draft`` (``off`` never reaches
+    here — the CLI short-circuits it). Explicit methods return exactly that
+    method or raise ValueError with the precise reason; ``auto`` delegates to
+    :func:`pick_spec_config` (the recommendation engine, blocklist included)
+    and may return None, meaning "no net-positive method for this
+    model/backend" — which is a valid answer, not an error.
+    """
+    if method == "mtp":
+        return resolve_mtp_request(
+            backend=backend, model_path=model_path, num_tokens=num_tokens,
+        )
+    if method == "ngram":
+        if backend != "vllm":
+            raise ValueError(
+                "ngram (prompt-lookup) spec-decode is vLLM-only in vserve — "
+                "benchmarked net-negative for batched llama.cpp serving "
+                "(docs/research/2026-06-19-llamacpp-throughput-goedel.md)."
+            )
+        return SpecConfig(method="ngram", n_max=NGRAM_NUM_SPECULATIVE_TOKENS, n_min=1)
+    if method == "draft":
+        for draft in available_drafts:
+            if draft.size_b > 1.5:
+                continue
+            if vocab_compatible(architecture or "", bos_token_id, eos_token_id, draft):
+                return SpecConfig(
+                    method="draft", draft_model_path=draft.path, n_max=3, p_min=0.6,
+                )
+        raise ValueError(
+            "No compatible draft model found locally: spec-decode needs a "
+            "same-family model <= 1.5B with an identical tokenizer "
+            "(matching BOS/EOS ids)."
+        )
+    if method == "auto":
+        return pick_spec_config(
+            architecture=architecture,
+            backend=backend,
+            model_path=model_path,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tools_enabled=tools_enabled,
+            available_drafts=available_drafts,
+        )
+    raise ValueError(f"Unknown spec method {method!r} — use auto, off, ngram, mtp, or draft.")
+
+
 def pick_spec_config(
     *,
     architecture: str | None,
@@ -138,7 +330,7 @@ def pick_spec_config(
 
     Walks:
       1. Blocklist → None unless force
-      2. MTP variant (Qwen3.6) → method=mtp
+      2. MTP — in-checkpoint layers (vLLM) or sibling MTP variant → method=mtp
       3. Same-family ≤1.5B draft model → method=draft
       4. vLLM-only ngram fallback (zero extra-model cost)
       5. llama.cpp without a draft → None
@@ -153,9 +345,24 @@ def pick_spec_config(
 
     recommended = SPEC_METHOD_BY_ARCH.get(architecture)
     if recommended == "mtp" and not (is_gemma4 and tools_enabled):
+        # In-checkpoint MTP first (vLLM-only; llama.cpp can't load the
+        # safetensors MTP head). Before 0.6.8 this path was gated on
+        # find_mtp_variant() alone, so Qwen3.5/3.6 safetensors checkpoints —
+        # whose MTP layers live INSIDE the checkpoint (mtp_num_hidden_layers),
+        # with no sibling dir — never got their MTP recommendation.
+        if backend == "vllm":
+            n_predict = native_mtp_layers(model_path)
+            if n_predict is not None:
+                return SpecConfig(
+                    method="mtp", draft_model_path=None,
+                    n_max=_default_mtp_tokens(n_predict),
+                )
         variant = find_mtp_variant(model_path)
         if variant is not None:
-            return SpecConfig(method="mtp", draft_model_path=variant, n_max=5)
+            return SpecConfig(
+                method="mtp", draft_model_path=variant,
+                n_max=MTP_NUM_SPECULATIVE_TOKENS,
+            )
 
     # Try a same-family ≤1.5B draft model.
     for draft in available_drafts:

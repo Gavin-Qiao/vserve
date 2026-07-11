@@ -1744,3 +1744,92 @@ class TestMoeBackendKnob:
 
         cfg = VllmBackend().build_config(self._make_model(tmp_path), self._base_choices())
         assert "moe-backend" not in cfg
+
+
+class TestVllmDoctorRamGuards:
+    """0.6.8: doctor verifies the host-RAM OOM guards (standing fleet rule) —
+    MemoryMax on the unit + JIT compile caps in configs/.env."""
+
+    @pytest.fixture(autouse=True)
+    def _preimport_systemd_helpers(self):
+        # Bind systemd_helpers' module-level `from vserve.config import
+        # find_systemd_unit_path` to the REAL function before this class
+        # patches vserve.config — a first import inside the patch window
+        # would capture the Mock permanently and poison later tests
+        # (test_serve's unit-safety asserter saw the leaked MagicMock).
+        import vserve.systemd_helpers  # noqa: F401
+
+    def _checks(self):
+        from vserve.backends.vllm import VllmBackend
+        return dict(VllmBackend().doctor_checks())
+
+    def test_ram_guard_passes_when_memorymax_set(self, mocker, tmp_path):
+        unit = tmp_path / "vllm.service"
+        unit.write_text("[Service]\n")
+        mocker.patch("vserve.config.find_systemd_unit_path", return_value=unit)
+        mocker.patch("vserve.systemd_helpers.unit_memory_max", return_value="50G")
+        checks = self._checks()
+        name = next(n for n in checks if "RAM guard" in n)
+        assert checks[name]() is True
+
+    def test_ram_guard_fails_when_uncapped(self, mocker, tmp_path):
+        unit = tmp_path / "vllm.service"
+        unit.write_text("[Service]\n")
+        mocker.patch("vserve.config.find_systemd_unit_path", return_value=unit)
+        mocker.patch("vserve.systemd_helpers.unit_memory_max", return_value=None)
+        checks = self._checks()
+        name = next(n for n in checks if "RAM guard" in n)
+        assert checks[name]() is False
+
+    def test_ram_guard_vacuous_without_unit(self, mocker):
+        mocker.patch("vserve.config.find_systemd_unit_path", return_value=None)
+        checks = self._checks()
+        name = next(n for n in checks if "RAM guard" in n)
+        assert checks[name]() is True
+
+    def test_jit_env_caps_checks_env_file(self, mocker, tmp_path):
+        from unittest.mock import PropertyMock
+        from vserve.backends.vllm import VllmBackend
+        mocker.patch.object(VllmBackend, "root_dir", new_callable=PropertyMock, return_value=tmp_path)
+        checks = dict(VllmBackend().doctor_checks())
+        name = next(n for n in checks if "JIT compile caps" in n)
+        # No configs dir → vacuous pass (not an installed layout).
+        assert checks[name]() is True
+        configs = tmp_path / "configs"
+        configs.mkdir()
+        # configs exists but no .env → the caps are missing → fail.
+        assert checks[name]() is False
+        (configs / ".env").write_text("MAX_JOBS=6\nNVCC_THREADS=1\n")
+        assert checks[name]() is True
+
+
+class TestUnitMemoryMax:
+    def test_parses_value(self, mocker):
+        from unittest.mock import Mock
+        from vserve.systemd_helpers import unit_memory_max
+        mocker.patch(
+            "vserve.systemd_helpers.subprocess.run",
+            return_value=Mock(returncode=0, stdout="50G\n", stderr=""),
+        )
+        assert unit_memory_max("vllm") == "50G"
+
+    def test_infinity_means_no_cap(self, mocker):
+        from unittest.mock import Mock
+        from vserve.systemd_helpers import unit_memory_max
+        mocker.patch(
+            "vserve.systemd_helpers.subprocess.run",
+            return_value=Mock(returncode=0, stdout="infinity\n", stderr=""),
+        )
+        assert unit_memory_max("vllm") is None
+
+    def test_systemctl_failure_means_none(self, mocker):
+        from vserve.systemd_helpers import unit_memory_max
+        mocker.patch(
+            "vserve.systemd_helpers.subprocess.run",
+            side_effect=OSError("no systemctl"),
+        )
+        assert unit_memory_max("vllm") is None
+
+    def test_invalid_service_name_means_none(self):
+        from vserve.systemd_helpers import unit_memory_max
+        assert unit_memory_max("../evil") is None

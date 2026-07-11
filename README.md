@@ -114,6 +114,19 @@ The default for transformer models in safetensors format. Optimized for high-thr
 - Calculates PagedAttention block-rounded capacity for native, FP8, and TurboQuant KV-cache dtypes
 - Recommends scheduler profiles with chunked-prefill-oriented token budgets and vLLM 0.20 optimization knobs
 - Tool calling with parser auto-detection (Qwen, Llama, Mistral, DeepSeek, Gemma, GPT-OSS)
+- MTP speculative decoding on demand (`--mtp`, vLLM ≥ 0.24): uses the checkpoint's own
+  Multi-Token-Prediction draft layers (Qwen3.5/3.6, DeepSeek-style) — detected at tune
+  time and shown as an `mtp` tag in the model picker. Off by default; depth defaults to
+  3 (`--mtp-tokens` to override) because depth 1 is net-negative on consumer GPUs
+- Broader speculative decoding via `--spec auto|off|ngram|mtp|draft`: `auto` recommends
+  per model/backend (blocklist-aware), `ngram` is the zero-extra-model prompt-lookup
+  method, `draft` pairs a same-family ≤1.5B local model with a matching tokenizer
+- Spec-decode observability: `vserve bench` reports the window's draft acceptance rate
+  and accepted-tokens-per-step; `vserve status` shows the active speculative method and
+  text-only mode; `vserve doctor` verifies the host-RAM OOM guards (unit `MemoryMax`,
+  JIT compile caps)
+- Multimodal checkpoints can serve text-only (`--language-model-only`, also offered in
+  the interactive wizard) — skips the vision/audio encoder to free VRAM for KV cache
 - Systemd service management via `vllm.service`
 
 ### llama.cpp
@@ -160,6 +173,8 @@ For GGUF quantized models. Serves via `llama-server` with an OpenAI-compatible A
 | `vserve run MODEL... --profile NAME_OR_PATH` | Serve a saved profile by name or explicit path |
 | `vserve run MODEL... --tools --tool-parser hermes --reasoning-parser qwen3` | Start with explicit parsers |
 | `vserve run MODEL... --trust-remote-code` | Opt in to vLLM remote model code execution |
+| `vserve run MODEL... --mtp [--mtp-tokens N]` | Toggle MTP speculative decoding (`--no-mtp` to force off) |
+| `vserve run MODEL... --spec auto\|off\|ngram\|mtp\|draft` | Pick a speculative-decoding method (auto = recommend per model) |
 | `vserve run MODEL... --backend llamacpp --gpu-layers 999` | Force llama.cpp for GGUF |
 | `vserve profile list\|show\|rm` | Manage saved serving profiles |
 | `vserve stop` | Stop the running server |

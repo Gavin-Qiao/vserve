@@ -2916,3 +2916,83 @@ class TestDiagnoseEngineFailure:
         """
         findings = _diagnose_engine_failure(log, "vllm")
         assert len(findings) == 1  # not 3
+
+
+def test_status_json_reports_spec_and_multimodal_mode(mocker, tmp_path):
+    """0.6.8: status surfaces the active speculative-config and text-only mode."""
+    import json
+
+    active = tmp_path / "active.yaml"
+    active.write_text(
+        "model: /models/test\n"
+        "port: 8888\n"
+        "language-model-only: true\n"
+        "speculative-config:\n"
+        "  method: mtp\n"
+        "  num_speculative_tokens: 3\n"
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text('{"backend":"vllm","status":"ready","port":8888}\n')
+
+    vllm = mocker.Mock()
+    vllm.name = "vllm"
+    vllm.display_name = "vLLM"
+    vllm.is_running.return_value = True
+    vllm.active_manifest_path.return_value = manifest_path
+    vllm.health_url.return_value = "http://localhost:8888/health"
+
+    mocker.patch("vserve.backends._BACKENDS", [vllm])
+    mocker.patch("vserve.config.active_yaml_path", return_value=active)
+
+    result = runner.invoke(app, ["status", "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["speculative_config"] == {"method": "mtp", "num_speculative_tokens": 3}
+    assert data["language_model_only"] is True
+
+
+def test_status_text_shows_spec_and_text_only_lines(mocker, tmp_path):
+    active = tmp_path / "active.yaml"
+    active.write_text(
+        "model: /models/test\n"
+        "port: 8888\n"
+        "max-model-len: 65536\n"
+        "language-model-only: true\n"
+        "speculative-config:\n"
+        "  method: mtp\n"
+        "  num_speculative_tokens: 3\n"
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text('{"backend":"vllm","status":"ready","port":8888}\n')
+
+    vllm = mocker.Mock()
+    vllm.name = "vllm"
+    vllm.display_name = "vLLM"
+    vllm.is_running.return_value = True
+    vllm.active_manifest_path.return_value = manifest_path
+    vllm.health_url.return_value = "http://localhost:8888/health"
+
+    mocker.patch("vserve.backends._BACKENDS", [vllm])
+    mocker.patch("vserve.config.active_yaml_path", return_value=active)
+
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    from _helpers import strip_ansi
+    flat = " ".join(strip_ansi(result.output).split())
+    assert "Speculative: mtp (k=3)" in flat
+    assert "Multimodal: text-only (encoder skipped)" in flat
+
+
+def test_run_scripted_trigger_covers_wizard_unknown_flags():
+    """0.6.8 regression guard: flags the interactive wizard doesn't consume
+    must force the scripted path — --thinking and --moe-backend were silently
+    dropped before this. If this test fails after adding a new run() flag,
+    either add the flag to the scripted trigger or thread it into the wizard."""
+    import inspect
+    from vserve.cli import run
+
+    source = inspect.getsource(run)
+    trigger_start = source.index("elif yes or any(")
+    trigger_block = source[trigger_start:source.index(":", source.index("):", trigger_start))]
+    for fragment in ("spec is not None", "thinking is not None", "moe_backend is not None"):
+        assert fragment in trigger_block, f"{fragment!r} missing from the scripted trigger"

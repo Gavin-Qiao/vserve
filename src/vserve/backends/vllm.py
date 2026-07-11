@@ -420,6 +420,15 @@ class VllmBackend:
         if rp_suggested is not None:
             result["reasoning_parser"] = rp_suggested
             result["supports_reasoning"] = True
+        # In-checkpoint MTP draft layers (Qwen3.5/3.6 `mtp_num_hidden_layers`
+        # & friends) — stamp so the run picker can tag the model and users
+        # discover `vserve run --mtp`.
+        from vserve.recipes.spec_decode import native_mtp_layers
+
+        mtp_layers = native_mtp_layers(model.path)
+        if mtp_layers is not None:
+            result["supports_mtp"] = True
+            result["mtp_num_layers"] = mtp_layers
         return result
 
     def available_tool_parsers(self) -> set[str] | None:
@@ -904,7 +913,33 @@ print(json.dumps({
         def check_service() -> bool:
             return find_systemd_unit_path(self.service_name) is not None
 
+        def check_ram_guard() -> bool:
+            # Host-RAM OOM guard: an uncapped vLLM boot can freeze the host
+            # (FlashInfer/nvcc JIT storms, weight-load peaks). Require
+            # MemoryMax on the unit. Vacuously true when the unit doesn't
+            # exist — the service check above already covers that.
+            from vserve.systemd_helpers import unit_memory_max
+
+            if find_systemd_unit_path(self.service_name) is None:
+                return True
+            return unit_memory_max(self.service_name) is not None
+
+        def check_jit_env_caps() -> bool:
+            # MAX_JOBS / NVCC_THREADS caps live in configs/.env (often
+            # root-readable only) — existence + non-empty is the best
+            # unprivileged proxy. Vacuously true when the configs layout
+            # doesn't exist (not an installed vserve-managed runtime).
+            configs_dir = self.root_dir / "configs"
+            try:
+                if not configs_dir.is_dir():
+                    return True
+                return (configs_dir / ".env").stat().st_size > 0
+            except OSError:
+                return False
+
         return [
             (f"{self.display_name} binary", check_binary),
             (f"{self.service_name}.service unit", check_service),
+            (f"{self.service_name} RAM guard (MemoryMax)", check_ram_guard),
+            ("JIT compile caps (configs/.env)", check_jit_env_caps),
         ]

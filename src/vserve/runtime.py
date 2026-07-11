@@ -33,6 +33,14 @@ _VLLM_MAX = Version("0.25")
 # compares against this single boundary.
 VLLM_FLAG_MIGRATION_VERSION = Version("0.22")
 
+# In-checkpoint MTP speculative decoding: vserve emits the unified
+# ``speculative-config: {method: mtp}`` form and relies on the Qwen3.5-family
+# MTP draft modules, both verified on the pinned 0.24.0 runtime. Older
+# runtimes used per-family method names (now deprecated aliases) whose
+# per-arch availability vserve can't verify, so `vserve run --mtp` refuses
+# below this boundary instead of risking a crash-looping service.
+VLLM_UNIFIED_MTP_VERSION = Version("0.24")
+
 RUNTIME_CACHE_DIR = Path.home() / ".cache" / "vserve" / "runtime"
 VLLM_RUNTIME_CACHE_FILE = RUNTIME_CACHE_DIR / "vllm.json"
 _RUNTIME_CACHE_SCHEMA_VERSION = 1

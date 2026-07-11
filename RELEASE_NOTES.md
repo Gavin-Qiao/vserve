@@ -1,3 +1,106 @@
+# vserve 0.6.8b2 Release Notes (beta)
+
+**Beta.** Adds a user-facing **MTP speculative-decoding toggle** to `vserve run`,
+riding the in-checkpoint Multi-Token-Prediction draft layers that Qwen3.5/3.6-class
+checkpoints ship (`mtp_num_hidden_layers`) via vLLM ≥ 0.24's unified
+`speculative-config: {method: mtp}`. Install with `pip install --pre vserve` or
+`uv tool install vserve --prerelease allow`.
+
+## MTP on/off toggle for `vserve run`
+
+- **`--mtp` / `--no-mtp`** — explicit toggle, off by default (speculative decoding
+  shifts the perf profile toward low-concurrency latency and costs a little VRAM,
+  so it stays a deliberate choice). **`--mtp-tokens N`** sets the speculation depth
+  and implies `--mtp`.
+- **In-checkpoint detection** mirrors vLLM 0.24's `SpeculativeConfig` rewriting:
+  `mtp_num_hidden_layers` (Qwen3.5/3.6), `num_nextn_predict_layers`
+  (DeepSeek/GLM/Qwen3-Next/Nemotron-H-style), `num_mtp_modules` (MiniMax) — read
+  from `config.json` top level and `text_config`. The emitted block carries **no
+  `model` key**, so vLLM loads the draft layers from the target checkpoint itself.
+  Checkpoints without native layers fall back to a sibling `-MTP` variant directory;
+  on llama.cpp that sibling GGUF is the only supported flavor.
+- **Depth default is 3, not 1** — depth 1 is the worst non-zero setting on this
+  class of hardware (−19% decode on Qwen3.6-27B-FP8) and k=3 wins the
+  acceptance-vs-depth curve (docs/research/2026-05-20-spec-decode-acceptance.md).
+  Explicit depths beyond the checkpoint's layer count are validated for vLLM's
+  module-reuse divisibility rule at config time instead of crashing at engine boot.
+- **Guard rails:** requires a *known* vLLM runtime ≥ 0.24
+  (`runtime.VLLM_UNIFIED_MTP_VERSION`) — older or undeterminable runtimes are
+  refused with the repair command rather than risking a crash-looping service.
+  Models with no MTP weights get a precise refusal, never a silent substitute
+  method. The existing Gemma-4 + tools + MTP refusal (vllm#41967) and the
+  spec-decode × quantized-KV CUDA-graph gate (vllm#41559/#42692) apply unchanged.
+- **Interactive wizard** offers MTP (default No) when the checkpoint carries draft
+  layers and the runtime supports them; `vserve tune` now stamps
+  `supports_mtp`/`mtp_num_layers` so the model picker shows an `mtp` tag and
+  `vserve list <model>` points at the flag.
+- **Recipe fix:** `pick_spec_config`'s MTP step was gated on a sibling `-MTP`
+  directory existing, so vLLM safetensors checkpoints whose draft layers live
+  *inside* the checkpoint never got their arch-table MTP recommendation. Native
+  layers are now checked first (vLLM only); auto-picked MTP depth drops 5 → 3 per
+  the research defaults.
+
+## `--spec` — the spec-decode recipe, wired into `vserve run`
+
+The recommendation engine (`pick_spec_config`) existed since 0.6.x but nothing in
+the CLI ever called it. `vserve run --spec METHOD` now exposes it:
+
+- **`auto`** — recommend per model/backend (blocklist-aware, best-effort): native
+  MTP → sibling MTP variant → same-family ≤1.5B local draft → ngram (vLLM only).
+  May resolve to nothing; that's a note, not an error. On a pre-0.24/unknown
+  runtime an mtp recommendation degrades to ngram instead of blocking the launch.
+- **`off` / `ngram` / `mtp` / `draft`** — explicit methods; precise refusal when
+  impossible (ngram is refused on llama.cpp — benchmarked net-negative for batched
+  serving). `--mtp`/`--no-mtp` remain as shorthand for `--spec mtp`/`--spec off`;
+  combining `--spec` with the shorthand is an error.
+- **Draft discovery** — `--spec draft`/`auto` scan local models for same-family
+  ≤1.5B candidates with an identical tokenizer (BOS/EOS from config.json /
+  generation_config.json, text_config included; size parsed from the `<N>B` name
+  token, largest wins so `35B-A3B` reads as 35B).
+
+## Spec-decode observability + host-RAM guard rails
+
+- **`vserve bench` reports acceptance** — it snapshots vLLM's cumulative
+  spec-decode counters around the run and prints the window's acceptance rate
+  and accepted-tokens-per-step (also in `--json` as a `spec_decode` block).
+  Silent when speculative decoding is off or the backend isn't vLLM. This is
+  the measurement loop the 64k validation used by hand.
+- **`vserve status` shows what the server is actually running** — a
+  `Speculative: mtp (k=3)` line (with the draft checkpoint name when one is
+  used) and `Multimodal: text-only (encoder skipped)` for
+  `language-model-only` configs; both surface in `--json` too.
+- **`vserve doctor` verifies the host-RAM OOM guards** — the managed unit must
+  carry a `MemoryMax` cap and `configs/.env` must exist with the JIT compile
+  caps (`MAX_JOBS`/`NVCC_THREADS`); both checks are vacuous on machines
+  without a vserve-managed unit. `vserve run` additionally warns (launch still
+  proceeds) when booting a vLLM unit with no `MemoryMax` — an uncapped boot
+  can freeze the host via nvcc/FlashInfer JIT storms.
+
+## Wizard parity: text-only serving + no more silently-dropped flags
+
+- The interactive wizard now offers **text-only serving** for multimodal
+  checkpoints (the `--language-model-only` recipe: vision/audio encoder never
+  loads, VRAM goes to KV cache; image/audio requests are rejected) and shows the
+  choice in the summary.
+- `--thinking` and `--moe-backend` used to be **silently dropped** unless `--yes`
+  (the wizard never consumed them). Any flag the wizard doesn't consume —
+  including the new `--spec`/`--mtp` — now forces the scripted path, so what you
+  pass is what you get.
+
+**GPU-validated (2026-07-10, RTX PRO 5000 sm120, vLLM 0.24.0):** the toggle
+boots, serves, and soaks cleanly end-to-end — `Qwen3.6-35B-A3B-NVFP4` at 64k ctx
+with `--mtp --mtp-tokens 3` loaded the in-checkpoint `Qwen3_5MoeMTP` draft
+(embeddings/lm_head shared) and survived a 54.8k-token prompt with no
+vllm#40756-class crash. **But the benchmark says keep it off for the MoE-A3B**:
+59.9% acceptance (τ≈2.8 tokens/step) still decoded at −52% (c1: 105 vs 220 tok/s)
+/ −53% (c8: 517 vs 1103 tok/s) — the (k+1)-token verify step multiplies MoE
+expert weight traffic and the bf16 quant-excluded draft layer adds sequential
+forwards. `Qwen3_5MoeForConditionalGeneration` (and its GGUF twin) is therefore
+in the auto blocklist; explicit `--mtp` remains available for experiments, and
+the dense Qwen3.5/3.6 recommendation stands (untested at k≥2 on this fleet).
+
+---
+
 # vserve 0.6.8b1 Release Notes (beta)
 
 **Beta.** Makes the pre-launch tuner **model-aware** so the auto

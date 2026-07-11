@@ -778,7 +778,12 @@ def _show_model_detail(m: ModelInfo):
 
     console.print(f"\n[bold]{m.full_name}[/bold]")
     console.print(f"  Arch: {m.architecture}  Quant: {m.quant_method or 'none'}  MoE: {m.is_moe}")
-    console.print(f"  Weight files: {m.model_size_gb} GB  Max positions: {m.max_position_embeddings}\n")
+    console.print(f"  Weight files: {m.model_size_gb} GB  Max positions: {m.max_position_embeddings}")
+    if lim and lim.get("supports_mtp"):
+        layers = lim.get("mtp_num_layers")
+        layer_note = f"{layers} in-checkpoint draft layer(s)" if layers else "in-checkpoint draft layers"
+        console.print(f"  MTP: {layer_note} — enable with [cyan]vserve run --mtp[/cyan]")
+    console.print()
 
     if not lim:
         console.print(f"  [dim]Not probed yet.[/dim] Run: vserve tune {m.model_name.lower()}\n")
@@ -2621,6 +2626,26 @@ def _launch_backend(
                 # Probe failures must not block launch.
                 pass
 
+        # Host-RAM OOM guard check (standing fleet rule): warn before booting
+        # a vLLM unit with no MemoryMax cap — an uncapped boot can freeze the
+        # host via JIT/compile storms. Warn-only: the launch proceeds.
+        if backend.name == "vllm":
+            try:
+                from vserve.config import find_systemd_unit_path
+                from vserve.systemd_helpers import unit_memory_max
+
+                if (
+                    find_systemd_unit_path(backend.service_name) is not None
+                    and unit_memory_max(backend.service_name) is None
+                ):
+                    console.print(
+                        f"  [yellow]RAM guard missing:[/yellow] {backend.service_name} has no "
+                        "MemoryMax cap — a JIT/compile storm can freeze the host. "
+                        "Add MemoryHigh/MemoryMax to the unit (see `vserve doctor`)."
+                    )
+            except Exception:
+                pass
+
         try:
             backend.start(cfg_path, non_interactive=non_interactive)
         except RuntimeError as e:
@@ -2788,6 +2813,141 @@ def _launch_backend(
 
 
 
+def _runtime_vllm_version():
+    """Parsed version of the configured vLLM runtime, or None.
+
+    Same seam as ``backends.vllm._runtime_vllm_version`` (the conftest
+    autouse fixture pins this to None suite-wide). None means "version
+    unknown" — the MTP gate below refuses on unknown, since emitting an
+    unverifiable speculative-config risks a crash-looping service.
+    """
+    try:
+        from vserve.runtime import installed_vllm_version
+
+        return installed_vllm_version()
+    except Exception:
+        return None
+
+
+_SPEC_CHOICES = frozenset({"auto", "off", "ngram", "mtp", "draft"})
+
+
+def _model_special_token_ids(model_path: "pathlib.Path") -> tuple[int | None, int | None]:
+    """(bos_token_id, eos_token_id) from config.json / generation_config.json.
+
+    Checks the top level and ``text_config`` (VLM-style checkpoints keep them
+    on the text sub-config); a list-valued eos collapses to its first int.
+    Used for draft-model vocab compatibility, so best-effort None is fine.
+    """
+    import json
+
+    def _norm(value) -> int | None:
+        if isinstance(value, list) and value:
+            value = value[0]
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return None
+
+    bos: int | None = None
+    eos: int | None = None
+    for fname in ("config.json", "generation_config.json"):
+        try:
+            data = json.loads((model_path / fname).read_text())
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        subconfigs = [data]
+        text_config = data.get("text_config")
+        if isinstance(text_config, dict):
+            subconfigs.append(text_config)
+        for sub in subconfigs:
+            if bos is None:
+                bos = _norm(sub.get("bos_token_id"))
+            if eos is None:
+                eos = _norm(sub.get("eos_token_id"))
+    return bos, eos
+
+
+def _params_b_from_name(model_name: str) -> float | None:
+    """Billions of parameters parsed from the model name, or None.
+
+    Names can carry several ``<N>B`` tokens (``Qwen3.6-35B-A3B`` = 35B total,
+    3B active); the max is the total-size proxy draft filtering needs.
+    """
+    import re
+
+    matches = re.findall(r"(\d+(?:\.\d+)?)B\b", model_name, flags=re.IGNORECASE)
+    if not matches:
+        return None
+    return max(float(v) for v in matches)
+
+
+def _discover_draft_candidates(target: "ModelInfo") -> list:
+    """Local models usable as spec-decode draft candidates for ``target``.
+
+    Size/vocab filtering happens in the recipe (``vocab_compatible`` +
+    the ≤1.5B rule); this only assembles the facts. Models whose parameter
+    count can't be parsed from the name are skipped — conservative, since a
+    mis-sized draft silently destroys throughput.
+    """
+    from vserve.recipes.spec_decode import DraftCandidate
+
+    candidates = []
+    for cand in _all_models():
+        if cand.path == target.path:
+            continue
+        size_b = _params_b_from_name(cand.model_name)
+        if size_b is None or not cand.architecture:
+            continue
+        bos, eos = _model_special_token_ids(cand.path)
+        candidates.append(DraftCandidate(
+            path=cand.path,
+            architecture=cand.architecture,
+            size_b=size_b,
+            bos_token_id=bos,
+            eos_token_id=eos,
+        ))
+    # Smallest first — pick_spec_config takes the first compatible one.
+    candidates.sort(key=lambda c: c.size_b)
+    return candidates
+
+
+def _vllm_mtp_gate_reason(runtime_info) -> str | None:
+    """Why MTP can't be honored on the configured vLLM runtime, or None if it can.
+
+    The unified in-checkpoint ``speculative-config: {method: mtp}`` form is
+    verified on vLLM >= 0.24 (``runtime.VLLM_UNIFIED_MTP_VERSION``); older
+    runtimes used per-family method names whose availability vserve can't
+    verify, so both "too old" and "unknown version" refuse.
+    """
+    from packaging.version import InvalidVersion, Version
+    from vserve.runtime import VLLM_UNIFIED_MTP_VERSION
+
+    ver = None
+    version_str = getattr(runtime_info, "vllm_version", None)
+    if isinstance(version_str, str) and version_str:
+        try:
+            ver = Version(version_str)
+        except InvalidVersion:
+            ver = None
+    if ver is None:
+        ver = _runtime_vllm_version()
+    if ver is None:
+        return (
+            f"MTP requires a known vLLM runtime >= {VLLM_UNIFIED_MTP_VERSION}, "
+            "but the installed version could not be determined. "
+            "Check with: vserve runtime check vllm"
+        )
+    if ver < VLLM_UNIFIED_MTP_VERSION:
+        return (
+            f"MTP (unified in-checkpoint speculative decoding) requires vLLM >= "
+            f"{VLLM_UNIFIED_MTP_VERSION}; installed: {ver}. "
+            "Upgrade with: vserve runtime upgrade vllm --stable"
+        )
+    return None
+
+
 def _custom_config(
     m: ModelInfo,
     backend,
@@ -2845,6 +3005,8 @@ def _scripted_config(
     thinking: bool | None = None,
     moe_backend: str | None = None,
     language_model_only: bool = False,
+    spec_request: str | None = None,
+    mtp_tokens: int | None = None,
 ) -> "pathlib.Path":
     """Build a launch config from CLI flags without prompting."""
     from vserve import config as config_module
@@ -2873,6 +3035,69 @@ def _scripted_config(
         required=need_tuned_defaults,
         runtime_info=runtime_info,
     )
+
+    # --spec / --mtp: resolve the request into a SpecConfig for either
+    # backend. Explicit methods fail fast with the precise reason when they
+    # can't work here (no MTP weights, runtime too old, no draft, ngram on
+    # llama.cpp); `auto` is best-effort and may resolve to nothing. `off`
+    # and the default both leave spec unset — speculative decoding stays
+    # opt-in.
+    spec_cfg = None
+    if spec_request and spec_request != "off":
+        from vserve.recipes.spec_decode import SpecConfig, resolve_spec_request
+
+        drafts = (
+            _discover_draft_candidates(m)
+            if spec_request in {"auto", "draft"}
+            else ()
+        )
+        bos, eos = _model_special_token_ids(m.path)
+        try:
+            spec_cfg = resolve_spec_request(
+                method=spec_request,
+                backend=backend.name,
+                model_path=m.path,
+                architecture=m.architecture,
+                bos_token_id=bos,
+                eos_token_id=eos,
+                tools_enabled=bool(tools or tool_parser),
+                available_drafts=drafts,
+                num_tokens=mtp_tokens,
+            )
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from None
+        # MTP needs the unified `method: mtp` form — verified on vLLM >= 0.24.
+        if spec_cfg is not None and spec_cfg.method == "mtp" and backend.name == "vllm":
+            gate_reason = _vllm_mtp_gate_reason(runtime_info)
+            if gate_reason is not None:
+                if spec_request == "auto":
+                    # Best-effort mode degrades to the zero-extra-model method
+                    # instead of blocking the launch.
+                    console.print(f"  [yellow]{gate_reason} — falling back to ngram.[/yellow]")
+                    from vserve.recipes.spec_decode import NGRAM_NUM_SPECULATIVE_TOKENS
+
+                    spec_cfg = SpecConfig(
+                        method="ngram", n_max=NGRAM_NUM_SPECULATIVE_TOKENS, n_min=1,
+                    )
+                else:
+                    console.print(f"[red]{gate_reason}[/red]")
+                    raise typer.Exit(1)
+        if spec_cfg is None:
+            console.print(
+                "  [dim]Speculative decoding: no net-positive method for this "
+                "model/backend — continuing without.[/dim]"
+            )
+        elif spec_cfg.draft_model_path is None:
+            console.print(
+                f"  [dim]Speculative decoding: {spec_cfg.method} "
+                f"(num_speculative_tokens={spec_cfg.n_max}).[/dim]"
+            )
+        else:
+            console.print(
+                f"  [dim]Speculative decoding: {spec_cfg.method} via "
+                f"{spec_cfg.draft_model_path.name} (n_max={spec_cfg.n_max}).[/dim]"
+            )
 
     if backend.name == "llamacpp":
         if need_tuned_defaults:
@@ -2948,6 +3173,7 @@ def _scripted_config(
             "n_cpu_moe": llamacpp_n_cpu_moe,
             "reasoning_budget": llamacpp_reasoning_budget,
             "thinking": thinking,
+            "spec": spec_cfg,
         }
         cfg = backend.build_config(m, choices)
         profile_name = save_profile or "custom"
@@ -3026,6 +3252,7 @@ def _scripted_config(
         "thinking": thinking,
         "moe_backend": moe_backend,
         "language_model_only": language_model_only,
+        "spec": spec_cfg,
     }
     cfg = backend.build_config(m, vllm_choices)
     if language_model_only:
@@ -3561,6 +3788,36 @@ def _custom_config_vllm(
             console.print("     [yellow]Tool markers found but parser unknown[/yellow]")
             console.print("     Use --tool-parser <name> to enable")
 
+    # 6. MTP speculative decoding — offered when the checkpoint carries its
+    # own draft layers and the runtime supports the unified mtp method.
+    # Off by default: it shifts the perf profile (helps low concurrency,
+    # costs a little VRAM), so opting in stays a deliberate choice.
+    from vserve.recipes.spec_decode import native_mtp_layers, resolve_mtp_request
+
+    spec_choice = None
+    mtp_layers = native_mtp_layers(m.path)
+    if mtp_layers is not None and _vllm_mtp_gate_reason(runtime_info) is None:
+        console.print("\n  [bold]6. MTP speculative decoding[/bold]")
+        console.print(
+            f"     Checkpoint carries {mtp_layers} in-checkpoint MTP draft layer(s) — "
+            "speeds up low-concurrency decoding."
+        )
+        if typer.confirm("     Enable MTP?", default=False):
+            spec_choice = resolve_mtp_request(backend="vllm", model_path=m.path)
+
+    # 7. Multimodal — natively-multimodal checkpoints can serve text-only
+    # (--language-model-only): the vision/audio encoder never loads, freeing
+    # VRAM for KV cache. Off by default so image/audio input keeps working
+    # unless the user opts out.
+    lm_only = False
+    if getattr(m, "is_multimodal", False):
+        console.print("\n  [bold]7. Multimodal[/bold]")
+        console.print(
+            "     Vision/audio encoder detected. Text-only serving skips it — "
+            "frees VRAM for KV cache; image/audio requests will be rejected."
+        )
+        lm_only = typer.confirm("     Serve text-only (image/audio off)?", default=False)
+
     # Build config via backend
     enable_tools = tools and bool(resolved_parser)
     choices = {
@@ -3574,6 +3831,8 @@ def _custom_config_vllm(
         "tool_parser": resolved_parser if enable_tools else None,
         "reasoning_parser": resolved_reasoning if enable_tools else None,
         "trust_remote_code": trust_remote_code,
+        "spec": spec_choice,
+        "language_model_only": lm_only,
     }
     cfg = backend.build_config(m, choices)
 
@@ -3584,6 +3843,13 @@ def _custom_config_vllm(
     console.print(f"    Slots:          {chosen_seqs}")
     console.print(f"    Batched tokens: {chosen_bt or 'auto'}")
     console.print("    Prefix:         always on")
+    if spec_choice is not None:
+        console.print(f"    MTP:            on (num_speculative_tokens={spec_choice.n_max})")
+    if getattr(m, "is_multimodal", False):
+        console.print(
+            "    Multimodal:     "
+            + ("text-only (encoder skipped)" if lm_only else "full (image/audio on)")
+        )
     if tools and resolved_parser:
         cap_parts = [f"tools=[green]{resolved_parser}[/green]"]
         if resolved_reasoning:
@@ -3628,8 +3894,11 @@ def run(
     override_tensor: list[str] = typer.Option([], "--override-tensor", "-ot", help="llama.cpp --override-tensor pattern (repeatable, e.g. '.ffn_.*_exps.=CPU')"),
     no_moe_offload: bool = typer.Option(False, "--no-moe-offload", help="Disable the auto-applied MoE expert-CPU offload (-ot)"),
     thinking: bool | None = typer.Option(None, "--thinking/--no-thinking", help="Enable/disable model thinking-mode (chat-template-kwargs: enable_thinking or thinking, depending on family)"),
-    moe_backend: str | None = typer.Option(None, "--moe-backend", help="vLLM 0.22+: pin the MoE kernel backend (e.g. flashinfer_trtllm, flashinfer_cutlass, humming); default lets vLLM auto-select. Scripted (--yes) runs only."),
+    moe_backend: str | None = typer.Option(None, "--moe-backend", help="vLLM 0.22+: pin the MoE kernel backend (e.g. flashinfer_trtllm, flashinfer_cutlass, humming); default lets vLLM auto-select."),
     language_model_only: bool = typer.Option(False, "--language-model-only", help="vLLM: serve a natively-multimodal model (e.g. Qwen3.5/3.6) in text-only mode — skip the vision/audio encoder to free VRAM for KV cache, and skip the multimodal batched-tokens floor."),
+    mtp: bool | None = typer.Option(None, "--mtp/--no-mtp", help="Toggle MTP speculative decoding. vLLM (>=0.24): uses the checkpoint's in-checkpoint MTP draft layers (Qwen3.5/3.6, DeepSeek-style); llama.cpp: uses an MTP-variant GGUF sibling as the draft. Shorthand for --spec mtp / --spec off. Default: off."),
+    mtp_tokens: int | None = typer.Option(None, "--mtp-tokens", help="MTP speculation depth (num_speculative_tokens); implies --mtp. Default 3 — depth 1 is net-negative on this class of hardware (docs/research/2026-05-20-spec-decode-acceptance.md)."),
+    spec: str | None = typer.Option(None, "--spec", help="Speculative decoding method: auto (recommend for this model/backend, best-effort), off, ngram (vLLM prompt-lookup), mtp, or draft (same-family <=1.5B local model)."),
     cache_reuse: int | None = typer.Option(None, "--cache-reuse", help="llama.cpp --cache-reuse N: enable prefix cache reuse with N-token min run"),
     cram_mb: int | None = typer.Option(None, "--cram-mb", help="llama.cpp --cram MB: swap-to-host limit for inactive slots (MB)"),
     slot_save_path: str | None = typer.Option(None, "--slot-save-path", help="llama.cpp --slot-save-path: persist slot KV-cache to this directory"),
@@ -3675,6 +3944,8 @@ def run(
                     tags.append("tools")
                 if rp:
                     tags.append("reasoning")
+                if lim.get("supports_mtp"):
+                    tags.append("mtp")
             else:
                 # Try live detect for untuned models
                 backend_obj = None
@@ -3744,6 +4015,26 @@ def run(
 
     if tool_parser and not tools:
         tools = True
+    # Fold the --mtp/--no-mtp shorthand and --spec into one request string.
+    if spec is not None:
+        spec = spec.lower()
+        if spec not in _SPEC_CHOICES:
+            console.print(
+                f"[red]Unknown --spec value {spec!r}.[/red] "
+                f"Use one of: {', '.join(sorted(_SPEC_CHOICES))}."
+            )
+            raise typer.Exit(1)
+        if mtp is not None:
+            console.print("[red]--spec conflicts with --mtp/--no-mtp — pass only one.[/red]")
+            raise typer.Exit(1)
+        if mtp_tokens is not None and spec not in {"mtp", "auto"}:
+            console.print(f"[red]--mtp-tokens only applies to '--spec mtp' or '--spec auto', not '--spec {spec}'.[/red]")
+            raise typer.Exit(1)
+    else:
+        if mtp_tokens is not None and mtp is None:
+            mtp = True
+        if mtp is not None:
+            spec = "mtp" if mtp else "off"
     if profile:
         if resolved_profile_path is None:
             resolved_profile_path, _profile_backend = _resolve_profile_path(
@@ -3760,7 +4051,12 @@ def run(
             reasoning_parser, gpu_layers, pooling,
             kv_cache_k, kv_cache_v, batch_size_lc, ubatch_size_lc,
         )
-    ) or embedding or override_tensor or no_moe_offload or language_model_only:
+    ) or embedding or override_tensor or no_moe_offload or language_model_only or (
+        # Flags the interactive wizard doesn't consume force the scripted
+        # path — otherwise they'd be silently dropped (pre-0.6.8, --thinking
+        # and --moe-backend without --yes were exactly that trap).
+        spec is not None or thinking is not None or moe_backend is not None
+    ):
         if m is None:
             console.print("[red]A model query is required when building a profile from flags.[/red]")
             raise typer.Exit(1)
@@ -3797,6 +4093,8 @@ def run(
             thinking=thinking,
             moe_backend=moe_backend,
             language_model_only=language_model_only,
+            spec_request=spec,
+            mtp_tokens=mtp_tokens,
         )
     else:
         if m is None:
@@ -4281,6 +4579,11 @@ def bench(
         raise typer.Exit(1)
 
     base_url = f"http://localhost:{port}"
+    # Snapshot vLLM's cumulative spec-decode counters around the run so the
+    # report can show acceptance for THIS window (None when spec is off).
+    from vserve.bench import read_spec_decode_counters, spec_decode_stats
+
+    spec_before = read_spec_decode_counters(base_url) if backend.name == "vllm" else None
     try:
         result = run_streaming_benchmark(
             base_url,
@@ -4294,12 +4597,20 @@ def bench(
     except Exception as exc:
         console.print(f"[red]Benchmark error:[/red] {exc}")
         raise typer.Exit(2) from exc
+    spec_stats = (
+        spec_decode_stats(spec_before, read_spec_decode_counters(base_url))
+        if backend.name == "vllm"
+        else None
+    )
 
     if json_output:
         from dataclasses import asdict
-        print(_json.dumps(asdict(result), indent=2))
+        payload = asdict(result)
+        if spec_stats is not None:
+            payload["spec_decode"] = spec_stats
+        print(_json.dumps(payload, indent=2))
     else:
-        _print_bench_result(backend, served, port, result)
+        _print_bench_result(backend, served, port, result, spec_stats=spec_stats)
 
     if not no_cache and result.requests_completed > 0:
         try:
@@ -4308,7 +4619,7 @@ def bench(
             pass
 
 
-def _print_bench_result(backend, served: str, port: int, result: BenchResult) -> None:
+def _print_bench_result(backend, served: str, port: int, result: BenchResult, *, spec_stats: dict | None = None) -> None:
     """Pretty-print a BenchResult for the `vserve bench` command."""
     console.print(
         f"\n[bold]{backend.display_name}[/bold] · {served} · "
@@ -4334,6 +4645,13 @@ def _print_bench_result(backend, served: str, port: int, result: BenchResult) ->
         f"  Throughput: [bold]{result.throughput_tokens_per_sec:.1f} tok/s[/bold]"
         f"    {result.throughput_requests_per_sec:.2f} req/s"
     )
+    if spec_stats:
+        console.print(
+            f"  Spec decode: acceptance [bold]{spec_stats['acceptance_rate']:.1%}[/bold]"
+            f"    +{spec_stats['mean_accepted_per_step']:.2f} accepted tok/step"
+            f"    [dim]({spec_stats['accepted_tokens']}/{spec_stats['draft_tokens']} drafted"
+            f" over {spec_stats['drafts']} steps)[/dim]"
+        )
 
     if result.errors:
         console.print(f"\n  [yellow]Errors ({len(result.errors)} shown):[/yellow]")
@@ -4555,6 +4873,8 @@ def status(
             "config_source": str(config_source) if config_source else None,
             "config_readable": True,
             "active_manifest": manifest,
+            "speculative_config": cfg.get("speculative-config"),
+            "language_model_only": bool(cfg.get("language-model-only")),
             "next_action": _running_next_action(),
         }, sort_keys=True))
         return
@@ -4624,6 +4944,18 @@ def status(
         gpu_util = cfg.get("gpu-memory-utilization")
         if isinstance(gpu_util, float):
             console.print(f"    GPU memory:        {gpu_util:.1%}")
+        spec_block = cfg.get("speculative-config")
+        if isinstance(spec_block, dict) and spec_block.get("method"):
+            desc = str(spec_block["method"])
+            k = spec_block.get("num_speculative_tokens")
+            if k is not None:
+                desc += f" (k={k})"
+            draft = spec_block.get("model")
+            if isinstance(draft, str) and draft:
+                desc += f" via {draft.rstrip('/').rsplit('/', 1)[-1]}"
+            console.print(f"    Speculative:       {desc}")
+        if cfg.get("language-model-only"):
+            console.print("    Multimodal:        text-only (encoder skipped)")
 
     # GPU memory bar (shared for both backends)
     try:

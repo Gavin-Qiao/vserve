@@ -152,3 +152,8 @@ def _pin_unknown_vllm_runtime_version(monkeypatch):
         lambda: None,
         raising=False,
     )
+    monkeypatch.setattr(
+        "vserve.cli._runtime_vllm_version",
+        lambda: None,
+        raising=False,
+    )

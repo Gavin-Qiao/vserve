@@ -74,6 +74,87 @@ class BenchResult:
     total_seconds: float
 
 
+# Cumulative spec-decode counters vLLM exposes on /metrics (V1 engine).
+# Suffixes only — the metric lines carry {engine=...,model_name=...} labels.
+_SPEC_COUNTER_KEYS: dict[str, str] = {
+    "vllm:spec_decode_num_drafts_total": "drafts",
+    "vllm:spec_decode_num_draft_tokens_total": "draft_tokens",
+    "vllm:spec_decode_num_accepted_tokens_total": "accepted_tokens",
+}
+
+
+def read_spec_decode_counters(
+    base_url: str,
+    *,
+    timeout: float = 5.0,
+    fetch: Callable[[str], str] | None = None,
+) -> dict[str, float] | None:
+    """Read vLLM's cumulative spec-decode counters from ``/metrics``.
+
+    Returns ``{"drafts": ..., "draft_tokens": ..., "accepted_tokens": ...}``
+    (values summed across engine/model label sets), or None when the endpoint
+    is unreachable or exposes no spec-decode counters — i.e. speculative
+    decoding is off, or the backend isn't vLLM. ``fetch`` injects the metrics
+    text in tests.
+    """
+    if fetch is not None:
+        try:
+            text = fetch(f"{base_url}/metrics")
+        except Exception:
+            return None
+    else:
+        try:
+            with urlopen(f"{base_url}/metrics", timeout=timeout) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            return None
+    out: dict[str, float] = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        key = _SPEC_COUNTER_KEYS.get(name)
+        if key is None:
+            continue
+        try:
+            value = float(line.rsplit(" ", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        out[key] = out.get(key, 0.0) + value
+    return out or None
+
+
+def spec_decode_stats(
+    before: dict[str, float] | None,
+    after: dict[str, float] | None,
+) -> dict | None:
+    """Acceptance stats over a bench window from two counter snapshots.
+
+    None when there was no spec-decode activity in the window. A missing
+    ``before`` snapshot (server started mid-session) degrades to lifetime
+    counters rather than dropping the signal.
+
+    ``mean_accepted_per_step`` is the accepted-draft-tokens-per-engine-step —
+    the bonus (verified) token is not included, so tokens per step is
+    ``1 + mean_accepted_per_step``.
+    """
+    if not after:
+        return None
+    base = before or {}
+    drafts = after.get("drafts", 0.0) - base.get("drafts", 0.0)
+    draft_tokens = after.get("draft_tokens", 0.0) - base.get("draft_tokens", 0.0)
+    accepted = after.get("accepted_tokens", 0.0) - base.get("accepted_tokens", 0.0)
+    if drafts <= 0 or draft_tokens <= 0:
+        return None
+    return {
+        "drafts": int(drafts),
+        "draft_tokens": int(draft_tokens),
+        "accepted_tokens": int(accepted),
+        "acceptance_rate": accepted / draft_tokens,
+        "mean_accepted_per_step": accepted / drafts,
+    }
+
+
 def _post_json(url: str, payload: dict, timeout: float) -> dict:
     request = Request(
         url,

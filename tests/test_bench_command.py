@@ -314,3 +314,68 @@ class TestBenchCommandPerfCacheWrite:
         result = runner.invoke(app, ["bench"])
         # Command exits cleanly; we still got the benchmark numbers.
         assert result.exit_code == 0
+
+
+def _patch_running_vllm_backend(mocker, *, port=8888, served="m-test"):
+    """vLLM-flavored twin of _patch_running_backend for the spec-stats flow."""
+    backend = MagicMock()
+    backend.name = "vllm"
+    backend.display_name = "vLLM"
+    backend.is_running.return_value = True
+    backend.active_manifest_path.return_value = "/tmp/active.json"
+
+    mocker.patch("vserve.backends._BACKENDS", [backend])
+    mocker.patch(
+        "vserve.config.read_active_manifest",
+        return_value={"port": port, "config_path": "/tmp/cfg.yaml"},
+    )
+    mocker.patch("vserve.cli._resolve_probe_model_name", return_value=served)
+    mocker.patch("pathlib.Path.exists", return_value=True)
+    mocker.patch("pathlib.Path.read_text", return_value="model: /models/test\nport: 8888\n")
+    return backend
+
+
+class TestBenchSpecDecodeStats:
+    """0.6.8: `vserve bench` snapshots spec-decode counters around the run
+    and reports window acceptance (vLLM only; silent when spec is off)."""
+
+    def test_prints_acceptance_line_when_spec_active(self, mocker):
+        _patch_running_vllm_backend(mocker)
+        mocker.patch("vserve.cli.run_streaming_benchmark", return_value=_stub_bench_result())
+        mocker.patch(
+            "vserve.bench.read_spec_decode_counters",
+            side_effect=[
+                {"drafts": 100.0, "draft_tokens": 300.0, "accepted_tokens": 200.0},
+                {"drafts": 200.0, "draft_tokens": 600.0, "accepted_tokens": 380.0},
+            ],
+        )
+        result = runner.invoke(app, ["bench", "--no-cache"])
+        assert result.exit_code == 0, result.output
+        flat = " ".join(strip_ansi(result.output).split())
+        assert "Spec decode: acceptance 60.0%" in flat
+        assert "+1.80 accepted tok/step" in flat
+
+    def test_json_includes_spec_decode_block(self, mocker):
+        import json
+        _patch_running_vllm_backend(mocker)
+        mocker.patch("vserve.cli.run_streaming_benchmark", return_value=_stub_bench_result())
+        mocker.patch(
+            "vserve.bench.read_spec_decode_counters",
+            side_effect=[
+                {"drafts": 0.0, "draft_tokens": 0.0, "accepted_tokens": 0.0},
+                {"drafts": 10.0, "draft_tokens": 30.0, "accepted_tokens": 18.0},
+            ],
+        )
+        result = runner.invoke(app, ["bench", "--no-cache", "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(strip_ansi(result.output))
+        assert data["spec_decode"]["acceptance_rate"] == 0.6
+        assert data["spec_decode"]["draft_tokens"] == 30
+
+    def test_silent_when_spec_decoding_off(self, mocker):
+        _patch_running_vllm_backend(mocker)
+        mocker.patch("vserve.cli.run_streaming_benchmark", return_value=_stub_bench_result())
+        mocker.patch("vserve.bench.read_spec_decode_counters", return_value=None)
+        result = runner.invoke(app, ["bench", "--no-cache"])
+        assert result.exit_code == 0, result.output
+        assert "Spec decode" not in strip_ansi(result.output)
