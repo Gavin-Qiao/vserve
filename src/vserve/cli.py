@@ -1457,10 +1457,161 @@ def remove(
     _model_rm_impl(_join_model_terms(model_terms), force=force)
 
 
+def _run_spec_sweep(
+    m: ModelInfo,
+    backend,
+    *,
+    concurrencies: list[int],
+    duration_s: int,
+    base_choices: dict,
+    runtime_info,
+    port: int,
+) -> int:
+    """A/B every speculative-decoding variant for a model and report the winner.
+
+    Boots the base profile once per variant (off / ngram / MTP depths), benches
+    each at the given concurrencies, records draft acceptance, ranks vs the off
+    baseline, and — critically — restores whatever profile was active before the
+    sweep in a ``finally`` so a mid-sweep failure never leaves the box down.
+    Returns a process exit code.
+    """
+    from vserve.bench import read_spec_decode_counters, run_streaming_benchmark, spec_decode_stats
+    from vserve.config import active_yaml_path, profile_path, write_profile_yaml
+    from vserve.recipes.spec_decode import native_mtp_layers
+    from vserve.sweep import SweepPoint, enumerate_spec_variants, recommend_variant
+
+    if backend.name != "vllm":
+        console.print("[red]--sweep spec is vLLM-only (speculative decoding is a vLLM feature here).[/red]")
+        return 1
+
+    layers = native_mtp_layers(m.path)
+    gate = _vllm_mtp_gate_reason(runtime_info)
+    include_mtp = layers is not None and gate is None
+    if layers is not None and gate is not None:
+        console.print(f"  [yellow]MTP variants skipped:[/yellow] {gate}")
+    variants = enumerate_spec_variants(
+        native_mtp_layers=layers if include_mtp else None, backend="vllm",
+    )
+    console.print(
+        f"\n[bold]vserve sweep spec[/bold]  {m.full_name}  "
+        f"[dim]{len(variants)} variants x concurrency {concurrencies}, {duration_s}s each[/dim]\n"
+    )
+
+    # Capture the pre-sweep active profile so we can restore it no matter what.
+    restore_target: pathlib.Path | None = None
+    try:
+        active = active_yaml_path()
+        if active.exists():
+            restore_target = active.resolve()
+    except Exception:
+        restore_target = None
+
+    served = _resolve_probe_model_name(backend, base_choices) or m.model_name
+    base_url = f"http://localhost:{port}"
+    points: list = []
+    try:
+        for v in variants:
+            console.print(f"  [cyan]>[/cyan] {v.label} …")
+            try:
+                cfg = backend.build_config(m, {**base_choices, "spec": v.spec})
+                cfg_path = profile_path(m.provider, m.model_name, f"sweep-{v.key}")
+                write_profile_yaml(cfg_path, cfg, comment=f"vserve sweep — {v.key}")
+                _launch_backend(backend, cfg_path, f"sweep {v.key}", non_interactive=True, replace=True)
+                served_v = _resolve_probe_model_name(backend, cfg) or served
+                for c in concurrencies:
+                    spec_before = read_spec_decode_counters(base_url) if v.spec is not None else None
+                    result = run_streaming_benchmark(
+                        base_url, model=served_v, concurrency=c,
+                        duration_s=duration_s, max_tokens=256,
+                    )
+                    stats = (
+                        spec_decode_stats(spec_before, read_spec_decode_counters(base_url))
+                        if v.spec is not None else None
+                    )
+                    points.append(SweepPoint(
+                        variant=v.key, concurrency=c,
+                        decode_tps=result.throughput_tokens_per_sec,
+                        tpot_ms_p50=result.tpot_ms_p50, ttft_ms_p50=result.ttft_ms_p50,
+                        acceptance_rate=(stats or {}).get("acceptance_rate"),
+                        accepted_per_step=(stats or {}).get("mean_accepted_per_step"),
+                    ))
+                    acc = points[-1].acceptance_rate
+                    acc_str = f", accept {acc:.0%}" if acc is not None else ""
+                    console.print(f"      c{c}: [bold]{result.throughput_tokens_per_sec:.0f}[/bold] tok/s{acc_str}")
+            except Exception as exc:  # noqa: BLE001 — one variant failing must not abort the sweep
+                console.print(f"      [yellow]variant '{v.key}' failed: {exc}[/yellow]")
+                for c in concurrencies:
+                    points.append(SweepPoint(variant=v.key, concurrency=c, decode_tps=0.0, error=str(exc)))
+    finally:
+        if restore_target is not None and restore_target.exists():
+            console.print(f"\n  [dim]Restoring pre-sweep profile: {restore_target.name}[/dim]")
+            try:
+                _launch_backend(backend, restore_target, "restore", non_interactive=True, replace=True)
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"  [red]Could not restore {restore_target.name}: {exc}[/red]")
+                console.print("  [yellow]Start a profile manually with `vserve run`.[/yellow]")
+
+    _print_spec_sweep_table(points, concurrencies)
+    pick, why = recommend_variant(points, concurrencies=tuple(concurrencies))
+    console.print(f"\n  [bold]Recommendation:[/bold] [green]{pick}[/green] — {why}")
+    return 0
+
+
+def _print_spec_sweep_table(points: list, concurrencies: list[int]) -> None:
+    """Render the sweep result matrix: variant x concurrency, delta vs off."""
+    from vserve.sweep import RankedVariant, rank_by_concurrency
+
+    if not points:
+        console.print("  [yellow]No measurements collected.[/yellow]")
+        return
+    variants_order: list[str] = []
+    for p in points:
+        if p.variant not in variants_order:
+            variants_order.append(p.variant)
+    ranks: dict[int, dict[str, RankedVariant]] = {}
+    for c in concurrencies:
+        ranks[c] = {r.key: r for r in rank_by_concurrency(points, concurrency=c)}
+
+    table = Table(title="Spec-decode sweep")
+    table.add_column("variant", justify="left")
+    for c in concurrencies:
+        table.add_column(f"c{c} tok/s", justify="right")
+        table.add_column(f"c{c} Δ", justify="right")
+    table.add_column("accept", justify="right")
+    for key in variants_order:
+        row = [key]
+        accept_val: float | None = None
+        for c in concurrencies:
+            r = ranks[c].get(key)
+            if r is None:
+                row += ["—", "—"]
+                continue
+            tps = f"{r.decode_tps:.0f}" if r.decode_tps > 0 else "err"
+            if key == "off":
+                delta = "base"
+            else:
+                delta = f"{r.delta_pct:+.0f}%"
+            row += [tps, delta]
+            if r.acceptance_rate is not None:
+                accept_val = r.acceptance_rate
+        row.append(f"{accept_val:.0%}" if accept_val is not None else "—")
+        table.add_row(*row)
+    console.print(table)
+
+
 @app.command()
 def tune(
     model_terms: list[str] = typer.Argument(None, help="Model name terms (fuzzy match)"),
     all_models: bool = typer.Option(False, "--all", help="Tune all downloaded models"),
+    sweep: str = typer.Option(None, "--sweep", help="Run a sweep instead of tuning. 'spec' A/Bs speculative-decoding variants (off/ngram/MTP depths) and reports the winner."),
+    sweep_concurrency: str = typer.Option("1,8", "--sweep-concurrency", help="Comma-separated concurrencies for --sweep (default 1,8)"),
+    sweep_duration: int = typer.Option(30, "--sweep-duration", help="Seconds to bench each --sweep variant at each concurrency"),
+    context: int = typer.Option(None, "--context", help="Base context for --sweep (default: tuned recommendation)"),
+    slots: int = typer.Option(None, "--slots", help="Base concurrent slots for --sweep (default: tuned recommendation)"),
+    kv_cache_dtype: str = typer.Option(None, "--kv-cache-dtype", help="Base KV dtype for --sweep"),
+    batched_tokens: int = typer.Option(None, "--batched-tokens", help="Base max batched tokens for --sweep"),
+    language_model_only: bool = typer.Option(False, "--language-model-only", help="Serve text-only during --sweep (skip vision/audio encoder)"),
+    port: int = typer.Option(8888, "--port", help="Serving port used during --sweep"),
     recalc: bool = typer.Option(False, "--recalc", help="Force recalculation even if cached"),
     gpu_util: float = typer.Option(None, "--gpu-util", help="GPU memory utilization (0.5-0.99, auto if omitted)"),
     bench: bool = typer.Option(False, "--bench", help="Run a bounded backend micro-benchmark after tuning"),
@@ -1485,6 +1636,57 @@ def tune(
     if not 1 <= bench_requests <= 32:
         console.print("[red]--bench-requests must be between 1 and 32[/red]")
         raise typer.Exit(1)
+
+    # --sweep: a measurement loop, not a static tune. Branch early — it cycles
+    # the live service, so it needs the session lock and a single resolved model.
+    if sweep is not None:
+        if sweep != "spec":
+            console.print(f"[red]Unknown --sweep '{sweep}'.[/red] Supported: spec")
+            raise typer.Exit(1)
+        try:
+            concurrencies = sorted({int(x) for x in sweep_concurrency.split(",") if x.strip()})
+        except ValueError:
+            console.print(f"[red]Invalid --sweep-concurrency '{sweep_concurrency}'.[/red] Use e.g. 1,8")
+            raise typer.Exit(1) from None
+        if not concurrencies:
+            console.print("[red]--sweep-concurrency must list at least one concurrency.[/red]")
+            raise typer.Exit(1)
+        if not 10 <= sweep_duration <= 300:
+            console.print("[red]--sweep-duration must be between 10 and 300 seconds.[/red]")
+            raise typer.Exit(1)
+        _session_or_exit()
+        sweep_query = _join_model_terms(model_terms)
+        if sweep_query is None:
+            console.print("[red]--sweep needs a model.[/red] e.g. vserve tune qwen3.6 --sweep spec")
+            raise typer.Exit(1)
+        m_sweep = _resolve_model(sweep_query)
+        from vserve.backends import get_backend
+
+        backend_sweep = get_backend(m_sweep)
+        runtime_info_sweep = _check_backend_runtime_or_exit(backend_sweep, prefer_cache=True)
+        from vserve.config import cfg as _cfg_sweep
+        from vserve.gpu import get_gpu_info as _ggi_sweep, resolve_gpu_memory_utilization as _rgu_sweep
+
+        gpu_sweep = _ggi_sweep()
+        util_sweep = _rgu_sweep(gpu_sweep.vram_total_gb, requested=gpu_util, config=_cfg_sweep(), model=m_sweep)
+        limits_sweep = _ensure_scripted_limits(
+            m_sweep, backend_sweep, gpu=gpu_sweep, gpu_mem_util=util_sweep,
+            required=True, runtime_info=runtime_info_sweep,
+        )
+        ctx_s, kv_s, slots_s, sched_s = _choose_vllm_scripted_defaults(
+            m_sweep, limits_sweep, context=context, slots=slots, kv_cache_dtype=kv_cache_dtype,
+        )
+        base_choices = {
+            "context": ctx_s, "kv_dtype": kv_s, "slots": slots_s,
+            "batched_tokens": batched_tokens if batched_tokens is not None else sched_s.get("max_num_batched_tokens"),
+            "gpu_mem_util": util_sweep, "port": port, "tools": False,
+            "language_model_only": language_model_only,
+        }
+        raise typer.Exit(_run_spec_sweep(
+            m_sweep, backend_sweep,
+            concurrencies=concurrencies, duration_s=sweep_duration,
+            base_choices=base_choices, runtime_info=runtime_info_sweep, port=port,
+        ))
 
     requested_gpu_util = gpu_util  # explicit --gpu-util (None = auto); kept before reassignment below
 

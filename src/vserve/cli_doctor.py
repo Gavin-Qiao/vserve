@@ -153,6 +153,20 @@ def run_doctor(
     except Exception:
         _fail("GPU not accessible", "Install NVIDIA drivers: https://www.nvidia.com/drivers  then check: nvidia-smi")
 
+    # Host hardening: driver-package hold + log rotation. Both guard failure
+    # modes that took the fleet down from outside the inference stack (an
+    # unattended driver bump broke NVML; an un-rotated log grew to 232 MB).
+    try:
+        from vserve.host_health import check_log_rotation, check_nvidia_driver_held
+
+        for result in (check_nvidia_driver_held(), check_log_rotation(VLLM_ROOT / "logs")):
+            if result["ok"]:
+                _ok(result["message"])
+            else:
+                _warn(result["message"], result.get("fix", ""))
+    except Exception:
+        _warn("Host hardening checks (driver hold / log rotation) could not run")
+
     # -- Backends --
     _emit("\n  [bold]Backends[/bold]")
     for b in _BACKENDS:

@@ -167,6 +167,7 @@ For GGUF quantized models. Serves via `llama-server` with an OpenAI-compatible A
 | `vserve rm <name>` | Remove a downloaded model |
 | `vserve tune [model]` | Calculate context/concurrency limits |
 | `vserve tune [model] --bench` | Run bounded benchmarks for tuned vLLM or llama.cpp profiles |
+| `vserve tune [model] --sweep spec` | A/B speculative-decoding variants (off/ngram/MTP depths) and report the winner |
 | `vserve run [model]` | Configure and start serving (auto-tunes if needed) |
 | `vserve run MODEL... --yes --context N --slots N` | Non-interactive serving from flags |
 | `vserve run MODEL... --yes --replace` | Non-interactive restart; without `--replace`, running backends are refused |

@@ -1,3 +1,53 @@
+# vserve 0.6.8b3 Release Notes (beta)
+
+**Beta.** Closes the measurement loop for speculative decoding and hardens the
+host against the two ways this box has gone down unattended. Install with
+`pip install --pre vserve` or `uv tool install vserve --prerelease allow`.
+
+## `vserve tune <model> --sweep spec` — the measurement loop, automated
+
+The 0.6.8b2 toggles let you *choose* a spec-decode method; this lets the box
+*tell you which one wins*. `--sweep spec` boots the base profile once per
+variant (off / ngram / MTP at depths 1-3, gated to what the checkpoint and
+runtime actually support), benches each at the concurrencies you name
+(`--sweep-concurrency 1,8`), records draft acceptance, ranks every variant
+against the off baseline, and prints a recommendation — then **restores the
+pre-sweep profile in a `finally`**, so a mid-sweep failure never leaves the box
+down. It automates exactly the manual boot→bench→scrape→compare that produced
+the two spec-decode findings below.
+
+- Recommends a spec variant only when it beats `off` by ≥5% at low concurrency
+  *and* doesn't regress high concurrency — encoding the fleet rule that
+  acceptance rate alone never justifies spec decoding on a bandwidth-bound MoE.
+- Reuses the crash-loop-guarded launch path, so a variant that won't boot is
+  recorded as an error and the sweep continues.
+
+**First run (GPU-validated, RTX PRO 5000 sm120, vLLM 0.24.0):** on
+`Qwen3.6-35B-A3B-NVFP4` at 64k, **every** spec method is net-negative — MTP k=1
+−38% at c1 despite 82% acceptance, k=2/k=3 worse, ngram −68% at c8. Off wins
+decisively. High acceptance doesn't save MTP: the cost is the verify-step
+expert-traffic tax, which is architectural for extreme-sparsity MoE, not an
+implementation artifact. The k=1 "~+27.5%" lead from the SGLang research does
+not transfer to this checkpoint. Full data:
+`docs/research/2026-07-11-a3b-spec-decode-sweep.md`.
+
+## `vserve doctor` — host-RAM/driver hardening checks
+
+Two failure modes that took the fleet down from *outside* the inference stack
+now have doctor checks (and helpers in the new `vserve.host_health`):
+
+- **Driver-package hold.** An unattended `apt upgrade` that bumps the NVIDIA
+  driver mid-session causes an NVML "Driver/library version mismatch" that
+  kills the GPU until reboot (observed 2026-06-15). Doctor warns when the
+  installed nvidia packages aren't `apt-mark hold`-ed, with the fix command.
+- **Log rotation.** vLLM/llama-server append to a single held-open log that
+  grows unbounded (observed 232 MB). Doctor warns when the log directory has no
+  logrotate rule, naming the largest current log.
+
+Both skip cleanly on hosts without apt / without a managed unit.
+
+---
+
 # vserve 0.6.8b2 Release Notes (beta)
 
 **Beta.** Adds a user-facing **MTP speculative-decoding toggle** to `vserve run`,
