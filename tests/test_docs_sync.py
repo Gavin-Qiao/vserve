@@ -26,6 +26,6 @@ def test_troubleshooting_states_live_range():
 
 def test_readme_badge_matches_range():
     text = (ROOT / "README.md").read_text()
-    # SUPPORTED_VLLM_RANGE ">=0.20,<0.25" → badge "0.20–0.24"
-    assert "vLLM-0.20%E2%80%930.24" in text, "README vLLM badge is stale"
+    # SUPPORTED_VLLM_RANGE ">=0.20,<0.26" → badge "0.20–0.25"
+    assert "vLLM-0.20%E2%80%930.25" in text, "README vLLM badge is stale"
     assert "0.20.x or 0.21.x" not in text, "README prerequisites row is stale"
