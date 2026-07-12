@@ -7,7 +7,7 @@
 Download models. Auto-tune limits. Serve with one command. Multiple backends.
 
 ![Python 3.12+](https://img.shields.io/badge/python-3.12+-3776ab?style=flat-square&logo=python&logoColor=white)
-![vLLM 0.20–0.24](https://img.shields.io/badge/vLLM-0.20%E2%80%930.24-ff6f00?style=flat-square)
+![vLLM 0.20–0.25](https://img.shields.io/badge/vLLM-0.20%E2%80%930.25-ff6f00?style=flat-square)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-GGUF-purple?style=flat-square)
 ![Tests](https://img.shields.io/badge/tests-1005%20passed-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -237,7 +237,7 @@ Uses `--jinja` to read the model's chat template directly. No parser selection n
 
 | Requirement | Check | Install |
 |:------------|:------|:--------|
-| stable vLLM 0.20.x–0.24.x | `vserve runtime check vllm` | `vserve runtime upgrade vllm --stable` or [docs.vllm.ai](https://docs.vllm.ai/en/latest/getting_started/installation.html) |
+| stable vLLM 0.20.x–0.25.x | `vserve runtime check vllm` | `vserve runtime upgrade vllm --stable` or [docs.vllm.ai](https://docs.vllm.ai/en/latest/getting_started/installation.html) |
 
 **For llama.cpp backend:**
 

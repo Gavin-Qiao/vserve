@@ -64,7 +64,7 @@ def test_check_vllm_compatibility_rejects_beta_and_wrong_minor():
     assert check_vllm_compatibility(beta).supported is False
     assert "pre-release" in " ".join(check_vllm_compatibility(beta).errors)
     assert check_vllm_compatibility(older).supported is False
-    assert ">=0.20,<0.25" in " ".join(check_vllm_compatibility(older).errors)
+    assert ">=0.20,<0.26" in " ".join(check_vllm_compatibility(older).errors)
 
 
 def test_check_vllm_compatibility_accepts_stable_021():
@@ -131,16 +131,37 @@ def test_check_vllm_compatibility_accepts_024():
     assert any("0.24.0" in message for message in result.messages)
 
 
-def test_check_vllm_compatibility_rejects_025():
-    too_new = RuntimeInfo(
+def test_check_vllm_compatibility_accepts_025():
+    latest = RuntimeInfo(
         backend="vllm",
         executable=Path("/opt/vllm/venv/bin/vllm"),
         python=Path("/opt/vllm/venv/bin/python"),
         vllm_version="0.25.0",
         torch_version="2.12.0",
         torch_cuda="13.1",
-        transformers_version="5.8.0",
-        huggingface_hub_version="1.13.0",
+        transformers_version="5.12.1",
+        huggingface_hub_version="1.22.0",
+        pip_check_ok=True,
+        pip_check_output="No broken requirements found",
+    )
+
+    result = check_vllm_compatibility(latest)
+
+    assert result.supported is True
+    assert result.errors == []
+    assert any("0.25.0" in message for message in result.messages)
+
+
+def test_check_vllm_compatibility_rejects_026():
+    too_new = RuntimeInfo(
+        backend="vllm",
+        executable=Path("/opt/vllm/venv/bin/vllm"),
+        python=Path("/opt/vllm/venv/bin/python"),
+        vllm_version="0.26.0",
+        torch_version="2.12.0",
+        torch_cuda="13.1",
+        transformers_version="5.12.1",
+        huggingface_hub_version="1.22.0",
         pip_check_ok=True,
         pip_check_output="No broken requirements found",
     )
@@ -148,7 +169,7 @@ def test_check_vllm_compatibility_rejects_025():
     result = check_vllm_compatibility(too_new)
 
     assert result.supported is False
-    assert ">=0.20,<0.25" in " ".join(result.errors)
+    assert ">=0.20,<0.26" in " ".join(result.errors)
 
 
 def test_collect_vllm_runtime_info_uses_vllm_python(mocker, tmp_path):

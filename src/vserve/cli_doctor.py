@@ -253,6 +253,14 @@ def run_doctor(
                 _warn(f".env missing: {', '.join(missing)}")
             else:
                 _ok(".env has required variables")
+            jit_caps_missing = [v for v in ["MAX_JOBS", "NVCC_THREADS"] if v not in env_content]
+            if jit_caps_missing:
+                _warn(
+                    f".env missing host-RAM JIT caps: {', '.join(jit_caps_missing)}",
+                    "an uncapped first-boot FlashInfer/nvcc JIT storm can host-OOM; `vserve run` re-adds MAX_JOBS/NVCC_THREADS",
+                )
+            else:
+                _ok(".env has host-RAM JIT caps")
         except PermissionError:
             _ok(".env exists (not readable — OK, contains secrets)")
         except (OSError, UnicodeDecodeError) as exc:

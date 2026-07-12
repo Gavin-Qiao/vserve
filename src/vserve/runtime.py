@@ -15,17 +15,21 @@ from packaging.version import InvalidVersion, Version
 
 from vserve.model_files import is_weight_file_name, iter_recursive_files_with_suffix
 
-SUPPORTED_VLLM_RANGE = ">=0.20,<0.25"
-# Pinned "stable" runtime tracks the latest tested vLLM (0.24.0). 0.24 lands
-# native block-diffusion (dLLM) support — DiffusionGemma rides the V2
-# model-runner ModelState hooks in-tree (vllm#45163) — so dLLMs now serve on
-# the pinned-stable runtime instead of a separate newer service (see
-# serve._resolve_vllm_service). It carries forward 0.23's first-class
-# --language-model-only (vllm#44500) for text-only Gemma-4 multimodal.
-PINNED_STABLE_VLLM = "0.24.0"
+SUPPORTED_VLLM_RANGE = ">=0.20,<0.26"
+# Pinned "stable" runtime tracks the latest tested vLLM (0.25.0), adopted
+# 2026-07-12. 0.25 keeps MARLIN as the auto-selected NVFP4 MoE kernel on sm120
+# (native flashinfer_b12x stays opt-in / oracle-excluded) and adds sm120
+# correctness fixes (skip-cooperative-top-K vllm#47164, restored NVFP4
+# swizzled-scale zero-init vllm#45739). It carries forward 0.24's native
+# block-diffusion (dLLM) support — DiffusionGemma rides the V2 model-runner
+# ModelState hooks in-tree (vllm#45163), so dLLMs serve on the pinned-stable
+# runtime instead of a separate newer service (see serve._resolve_vllm_service)
+# — and 0.23's first-class --language-model-only (vllm#44500) for text-only
+# Gemma-4 multimodal.
+PINNED_STABLE_VLLM = "0.25.0"
 DETECTOR_SCHEMA_VERSION = 2
 _VLLM_MIN = Version("0.20")
-_VLLM_MAX = Version("0.25")
+_VLLM_MAX = Version("0.26")
 
 # vLLM 0.22 renamed --chat-template-kwargs to --default-chat-template-kwargs
 # and deprecated the FlashInfer MoE env vars (still deprecated-not-removed as

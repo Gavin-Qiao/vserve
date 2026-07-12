@@ -332,6 +332,38 @@ def test_upsert_env_file_includes_extra(mocker, tmp_path):
     assert "VLLM_USE_FLASHINFER_MOE_FP4=1" in text
 
 
+def test_upsert_env_file_adds_jit_caps_when_absent(mocker, tmp_path):
+    """Host-RAM JIT caps are written when missing — an uncapped first-boot
+    FlashInfer/nvcc JIT storm has OOM-frozen (and later OOM-killed) this host."""
+    from vserve.serve import _upsert_env_file
+    mock_cfg = Mock()
+    mock_cfg.vllm_root = tmp_path
+    mock_cfg.cuda_home = Path("/usr/local/cuda")
+    mock_cfg.gpu_index = 0
+    mocker.patch("vserve.serve.cfg", return_value=mock_cfg)
+    text = _upsert_env_file().read_text()
+    assert "MAX_JOBS=4" in text
+    assert "NVCC_THREADS=1" in text
+
+
+def test_upsert_env_file_preserves_custom_jit_caps(mocker, tmp_path):
+    """A hand-tuned MAX_JOBS/NVCC_THREADS is never clobbered by the writer."""
+    from vserve.serve import _upsert_env_file
+    mock_cfg = Mock()
+    mock_cfg.vllm_root = tmp_path
+    mock_cfg.cuda_home = Path("/usr/local/cuda")
+    mock_cfg.gpu_index = 0
+    mocker.patch("vserve.serve.cfg", return_value=mock_cfg)
+    env_path = tmp_path / "configs" / ".env"
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text("MAX_JOBS=6\nNVCC_THREADS=2\n")
+    text = _upsert_env_file().read_text()
+    assert "MAX_JOBS=6" in text
+    assert "NVCC_THREADS=2" in text
+    assert "MAX_JOBS=4" not in text
+    assert text.count("MAX_JOBS=") == 1
+
+
 def test_recommend_quant_blackwell_dense():
     from vserve.models import recommend_quant_for_arch
     assert recommend_quant_for_arch(sm=120, is_moe=False) == "nvfp4"

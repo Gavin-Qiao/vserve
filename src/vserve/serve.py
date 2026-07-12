@@ -129,6 +129,13 @@ def _upsert_env_file(extra: dict[str, str] | None = None) -> Path:
     }
     if extra:
         values.update(extra)
+    # Host-RAM JIT-storm caps. A first-boot FlashInfer/nvcc JIT compile with
+    # uncapped parallelism (one cicc ~3.5-4 GB × ncpu) has OOM-frozen this host;
+    # once the systemd MemoryMax guard was added it OOM-killed the boot instead
+    # (see docs/troubleshooting.md "JIT Compilation"). Written only when absent
+    # so a hand-tuned value is never clobbered — the systemd MemoryMax guard is
+    # the backstop, these caps keep the JIT compile under it.
+    jit_caps: dict[str, str] = {"MAX_JOBS": "4", "NVCC_THREADS": "1"}
     lines: list[str] = []
     seen: set[str] = set()
     if env_path.exists():
@@ -136,6 +143,11 @@ def _upsert_env_file(extra: dict[str, str] | None = None) -> Path:
             lines = env_path.read_text().splitlines()
         except OSError:
             lines = []
+    existing_keys = {
+        line.split("=", 1)[0].strip()
+        for line in lines
+        if "=" in line and not line.strip().startswith("#")
+    }
     updated: list[str] = []
     for line in lines:
         stripped = line.strip()
@@ -150,6 +162,9 @@ def _upsert_env_file(extra: dict[str, str] | None = None) -> Path:
             updated.append(line)
     for key, value in values.items():
         if key not in seen:
+            updated.append(f"{key}={value}")
+    for key, value in jit_caps.items():
+        if key not in existing_keys:
             updated.append(f"{key}={value}")
     env_path.write_text("\n".join(updated) + "\n")
     return env_path

@@ -1,3 +1,59 @@
+# vserve 0.6.8b4 Release Notes (beta)
+
+**Beta.** Adopts **vLLM 0.25.0** as the pinned-stable runtime and closes the
+host-RAM JIT-cap gap that this exact upgrade exposed. Install with
+`pip install --pre vserve` or `uv tool install vserve --prerelease allow`.
+
+## vLLM 0.25.0 is the pinned-stable runtime
+
+Supported range bumped to `>=0.20,<0.26`, pinned-stable `vllm==0.25.0`
+(`vserve runtime upgrade vllm --stable`). Validated end-to-end on the sm120
+RTX PRO 5000 workhorse (`Qwen3.6-35B-A3B-NVFP4`, 8×32k):
+
+- **No regression — a small uplift.** qwen32k on 0.25 benched **c1 235 / c8
+  1156 tok/s** vs the 0.24 baseline ~220 / ~1091 (+6–7%; plausibly the restored
+  NVFP4 swizzled-scale zero-init, vllm#45739, and the sm120 top-K fix vllm#47164).
+- **MARLIN remains the auto-selected NVFP4 MoE kernel on sm120** — 0.25's oracle
+  still picks it for our gated hybrid MoE; the decode ceiling is unchanged.
+- Migration was mechanical: nothing vserve emits was removed or renamed in 0.25
+  (`moe_backend`, `speculative-config: {method: mtp}`, the attention-backend
+  names all survive; the PagedAttention deletion is internal V0 CUDA only).
+
+## flashinfer_b12x measured on sm120 — parity, not a win
+
+0.25 makes the native NVFP4 **gated**-MoE kernel `flashinfer_b12x` selectable on
+sm120 (`--moe-backend flashinfer_b12x`; it is oracle-*excluded* from auto-select).
+The first RTX PRO 5000 (sm120) A/B — identical profile, only the MoE backend
+varied — settles the "one real future lever" flagged in the spec-decode research:
+
+| | MARLIN | flashinfer_b12x |
+|---|---|---|
+| c1 | 235.1 tok/s | 235.9 (parity) |
+| c8 | 1155.9 tok/s | 1120.4 (−3%) |
+
+b12x ties at c1 and is ~3% slower at c8; the reported "+6%" is always vs
+flashinfer-cutlass (which doesn't run on sm120), never vs Marlin. **Keep MARLIN**
+— and it is the auto-pick. Full data:
+`docs/research/2026-07-11-a3b-spec-decode-sweep.md`.
+
+## Host-RAM JIT caps are now vserve-managed
+
+The 0.25 upgrade re-JITs FlashInfer's sm120 kernels on first boot; with the
+`MAX_JOBS`/`NVCC_THREADS` caps missing from the managed `.env`, uncapped parallel
+`cicc` (~4 GB each) drove the boot into the systemd `MemoryMax` guard, which
+OOM-killed the compile. Root cause: the `.env` writer never emitted the caps.
+
+- **`vserve run` now writes `MAX_JOBS`/`NVCC_THREADS` into the managed `.env`**
+  when absent (never clobbering a hand-tuned value) — so the standing host-RAM
+  JIT-storm protection is present by construction, not by hand.
+- **`vserve doctor`** now warns when the `.env` lacks those caps.
+
+The systemd `MemoryMax` stays the backstop; the caps keep the first-boot JIT
+compile under it (validated: capped, the compile peaks ~48 GB transiently and
+completes; uncapped it hit 50 GB and was OOM-killed).
+
+---
+
 # vserve 0.6.8b3 Release Notes (beta)
 
 **Beta.** Closes the measurement loop for speculative decoding and hardens the
